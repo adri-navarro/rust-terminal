@@ -1,0 +1,23 @@
+[package]
+name = "itsadri-terminal"
+version = "0.1.0"
+edition = "2024"
+description = "A lightweight, fast, modern terminal emulator with built-in shell, Fish-style autosuggestions, Tab completion popup, and fuzzy history palette"
+
+[dependencies]
+winit = "0.30"
+softbuffer = "0.4"
+ab_glyph = "0.2"
+vte = "0.15"
+portable-pty = "0.9"
+arboard = "3"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+dirs = "6"
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

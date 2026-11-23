@@ -1,0 +1,95 @@
+mod completer;
+mod config;
+mod history;
+mod monitor;
+mod shell;
+mod terminal;
+mod ui;
+mod usage;
+
+#[cfg(test)]
+mod tests;
+
+use std::env;
+use std::process;
+use ui::AppOptions;
+
+fn print_help() {
+    println!(
+        "\
+itsadri-terminal — lightweight modern terminal emulator & shell in Rust
+
+USAGE:
+    itsadri-terminal [OPTIONS]
+
+OPTIONS:
+    --shell             Run the built-in interactive Rust shell directly in current TTY
+    --exec <COMMAND>    Use an external shell/command inside GUI tabs (e.g. /bin/bash, /bin/zsh)
+    --theme <NAME>      Start with a theme (catppuccin-mocha, tokyo-night, rose-pine, gruvbox-dark, pure-black)
+    -h, --help          Show this help message
+
+KEYBINDINGS:
+    Ctrl+R              Open fuzzy history command palette
+    Tab / Shift+Tab     Open & cycle floating autocomplete popup
+    Right / End         Accept Fish-style inline history autosuggestion
+    Alt+Right           Accept next word of autosuggestion
+    Ctrl+T / Ctrl+W     New / close tab
+    Ctrl+Tab / Alt+1-9  Switch tabs
+    Ctrl+Shift+C / V    Copy / paste clipboard
+    Ctrl+= / - / 0      Zoom font in / out / reset
+    F2                  Cycle color theme live
+    Ctrl+U / F3         Toggle Agent & Model Usage tab
+    Ctrl+M / F4         Toggle System Monitor tab (CPU, RAM, Disks, Processes)
+    Ctrl+Shift+R        Reload ~/.config/itsadri-terminal/config.toml"
+    );
+}
+
+fn main() {
+    let args: Vec<String> = env::args().skip(1).collect();
+    let mut shell_mode = false;
+    let mut shell_override = None;
+    let mut theme_override = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--shell" => {
+                shell_mode = true;
+            }
+            "--exec" | "-e" => {
+                if let Some(cmd) = args.get(i + 1) {
+                    shell_override = Some(cmd.clone());
+                    i += 1;
+                }
+            }
+            "--theme" => {
+                if let Some(t) = args.get(i + 1) {
+                    theme_override = Some(t.clone());
+                    i += 1;
+                }
+            }
+            "-h" | "--help" => {
+                print_help();
+                return;
+            }
+            other => {
+                eprintln!("Unknown option: {other}\nRun with --help for usage.");
+                process::exit(2);
+            }
+        }
+        i += 1;
+    }
+
+    if shell_mode {
+        let code = shell::run_interactive_shell();
+        process::exit(code);
+    }
+
+    if let Err(e) = ui::run_gui(AppOptions {
+        shell_override,
+        theme_override,
+    }) {
+        eprintln!("itsadri-terminal error: {e}");
+        process::exit(1);
+    }
+}
