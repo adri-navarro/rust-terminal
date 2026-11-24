@@ -99,6 +99,7 @@ fn test_terminal_grid_vte_sgr_and_osc777() {
     assert_eq!(popup.items[1].label, "Cargo.toml");
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn test_system_monitor_samples_cpu_ram_disks_and_processes() {
     let mut mon = crate::monitor::SystemMonitor::new();
