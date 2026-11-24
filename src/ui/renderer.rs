@@ -17,6 +17,42 @@ use std::path::Path;
 pub const TAB_BAR_H: usize = 44;
 pub const STATUS_BAR_H: usize = 26;
 
+// macOS unified title bar: physical-pixel left inset for the native traffic lights and the height
+// of the strip reserved at the top when the tab bar is hidden. Both stay 0 on other platforms.
+static TAB_BAR_LEFT_INSET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static TITLEBAR_STRIP_H: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(target_os = "macos")]
+pub fn set_mac_chrome(left_inset: usize, strip_h: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    TAB_BAR_LEFT_INSET.store(left_inset, Relaxed);
+    TITLEBAR_STRIP_H.store(strip_h, Relaxed);
+}
+
+#[cfg(target_os = "macos")]
+pub fn mac_titlebar_strip() -> usize {
+    TITLEBAR_STRIP_H.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn tab_bar_left_inset() -> usize {
+    TAB_BAR_LEFT_INSET.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Tab bar height when shown: at least the macOS title bar zone (strip is 0 elsewhere)
+fn top_reserved_shown() -> usize {
+    TAB_BAR_H.max(TITLEBAR_STRIP_H.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Height of the top area that content must start below: the tab bar, or the macOS title bar strip
+/// when the tab bar is hidden (0 on other platforms).
+pub fn top_reserved(cfg: &Config) -> usize {
+    if cfg.show_tab_bar {
+        top_reserved_shown()
+    } else {
+        TITLEBAR_STRIP_H.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Rect {
     pub x: i32,
@@ -413,7 +449,7 @@ impl<'a> Canvas<'a> {
 }
 
 pub fn viewport_bounds(width: usize, height: usize, cfg: &Config) -> (usize, usize, usize, usize) {
-    let top = if cfg.show_tab_bar { TAB_BAR_H } else { 0 };
+    let top = top_reserved(cfg);
     let bottom = if cfg.show_status_bar { STATUS_BAR_H } else { 0 };
     let vp_x = cfg.padding_x;
     let vp_y = top + cfg.padding_y;
@@ -461,6 +497,10 @@ pub fn render_frame(
             active_commands_count,
         )
     } else {
+        let strip = top_reserved(cfg) as i32;
+        if strip > 0 {
+            canvas.fill_rect(0, 0, width as i32, strip, theme.surface);
+        }
         TabBarHitZones::empty()
     };
 
@@ -538,12 +578,14 @@ fn render_tab_bar(
     active_commands_count: usize,
 ) -> TabBarHitZones {
     let mut zones = TabBarHitZones::empty();
-    let h = TAB_BAR_H as i32;
+    let h = top_reserved_shown() as i32;
+    // Vertical offset that centres the fixed-height content in a taller (macOS) bar
+    let dy = (h - TAB_BAR_H as i32) / 2;
     canvas.fill_rect(0, 0, width as i32, h, theme.surface);
     canvas.fill_rect(0, h - 1, width as i32, 1, theme.border);
 
     let ui_size = 16.5f32;
-    let baseline = 28;
+    let baseline = 28 + dy;
 
     // Top-right corner tab: Settings (Ctrl+, / F6)
     let right_margin = 10;
@@ -553,14 +595,14 @@ fn render_tab_bar(
     let set_rect = if settings_active {
         Rect {
             x: set_x,
-            y: 5,
+            y: 5 + dy,
             w: set_w,
             h: 34,
         }
     } else {
         Rect {
             x: set_x,
-            y: 6,
+            y: 6 + dy,
             w: set_w,
             h: 32,
         }
@@ -601,14 +643,14 @@ fn render_tab_bar(
     let usage_rect = if usage_active {
         Rect {
             x: usage_x,
-            y: 5,
+            y: 5 + dy,
             w: usage_w,
             h: 34,
         }
     } else {
         Rect {
             x: usage_x,
-            y: 6,
+            y: 6 + dy,
             w: usage_w,
             h: 32,
         }
@@ -677,14 +719,14 @@ fn render_tab_bar(
     let mon_rect = if monitor_active {
         Rect {
             x: mon_x,
-            y: 5,
+            y: 5 + dy,
             w: mon_w,
             h: 34,
         }
     } else {
         Rect {
             x: mon_x,
-            y: 6,
+            y: 6 + dy,
             w: mon_w,
             h: 32,
         }
@@ -737,14 +779,14 @@ fn render_tab_bar(
     let cmd_rect = if commands_active {
         Rect {
             x: cmd_x,
-            y: 5,
+            y: 5 + dy,
             w: cmd_w,
             h: 34,
         }
     } else {
         Rect {
             x: cmd_x,
-            y: 6,
+            y: 6 + dy,
             w: cmd_w,
             h: 32,
         }
@@ -806,7 +848,7 @@ fn render_tab_bar(
 
     let max_tabs_right = cmd_x - 46;
 
-    let mut x = 10i32;
+    let mut x = 10i32 + tab_bar_left_inset() as i32;
     let tab_count = tabs.len().max(1) as i32;
     let avail = (max_tabs_right - x).max(120);
     let tab_w = (avail / tab_count).clamp(130, 250);
@@ -820,7 +862,7 @@ fn render_tab_bar(
             !usage_active && !monitor_active && !commands_active && !settings_active && idx == active_tab;
         let rect = Rect {
             x,
-            y: 5,
+            y: 5 + dy,
             w,
             h: 34,
         };
@@ -899,7 +941,7 @@ fn render_tab_bar(
     // New tab "+" button
     let plus_rect = Rect {
         x,
-        y: 6,
+        y: 6 + dy,
         w: 32,
         h: 32,
     };
@@ -1187,7 +1229,7 @@ fn render_completion_popup(
     let y = if below_y + pop_h <= max_y {
         below_y
     } else {
-        (cursor_py - pop_h - 4).max(TAB_BAR_H as i32 + 6)
+        (cursor_py - pop_h - 4).max(top_reserved_shown() as i32 + 6)
     };
     if x + pop_w > width as i32 - 10 {
         x = (width as i32 - pop_w - 10).max(10);
@@ -1294,7 +1336,7 @@ fn render_history_palette(
     let card_h = search_h + 10 + (visible as i32) * row_h + footer_h;
 
     let x = ((width as i32) - card_w) / 2;
-    let y = (((height as i32) - card_h) / 3).max(TAB_BAR_H as i32 + 16);
+    let y = (((height as i32) - card_h) / 3).max(top_reserved_shown() as i32 + 16);
 
     canvas.draw_shadow(x, y, card_w, card_h, 12);
     canvas.fill_rounded_rect(x, y, card_w, card_h, 12, theme.surface, 252);
@@ -1482,7 +1524,7 @@ fn render_usage_view(
     let fs = |base: f32| (base * s).clamp(8.0, 48.0);
     let sc = |v: i32| ((v as f32) * s).round() as i32;
 
-    let top = if cfg.show_tab_bar { TAB_BAR_H as i32 } else { 0 };
+    let top = top_reserved(cfg) as i32;
     let bottom = if cfg.show_status_bar { STATUS_BAR_H as i32 } else { 0 };
     let pad = 22i32;
     let x0 = pad;
@@ -2137,7 +2179,7 @@ fn render_monitor_view(
     let fs = |base: f32| (base * s).clamp(8.0, 48.0);
     let sc = |v: i32| ((v as f32) * s).round() as i32;
 
-    let top = if cfg.show_tab_bar { TAB_BAR_H as i32 } else { 0 };
+    let top = top_reserved(cfg) as i32;
     let bottom = if cfg.show_status_bar { STATUS_BAR_H as i32 } else { 0 };
     let pad = 18i32;
     let content_x = pad;
@@ -2775,7 +2817,7 @@ fn render_commands_view(
     let fs = |base: f32| (base * s).clamp(8.0, 48.0);
     let sc = |v: i32| ((v as f32) * s).round() as i32;
 
-    let top = if cfg.show_tab_bar { TAB_BAR_H as i32 } else { 0 };
+    let top = top_reserved(cfg) as i32;
     let bottom = if cfg.show_status_bar {
         (height.saturating_sub(STATUS_BAR_H)) as i32
     } else {
@@ -3502,7 +3544,7 @@ fn render_settings_view(
     sv: &SettingsViewState<'_>,
     hit_zones: &mut TabBarHitZones,
 ) {
-    let top = if cfg.show_tab_bar { TAB_BAR_H as i32 } else { 0 };
+    let top = top_reserved(cfg) as i32;
     let bottom = if cfg.show_status_bar { STATUS_BAR_H as i32 } else { 0 };
     let pad = 22i32;
     let content_x = pad;

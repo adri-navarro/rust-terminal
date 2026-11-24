@@ -13,8 +13,8 @@ use crate::terminal::TerminalTab;
 use crate::ui::font::FontEngine;
 use crate::ui::renderer::{
     CommandFormField, CommandFormView, CommandsViewState, HistoryPaletteView, MonitorViewState,
-    SettingsFontTarget, SettingsShortcutTarget, SettingsViewState, TAB_BAR_H, TabBarHitZones,
-    TabSummary, UsageViewState, render_frame, viewport_bounds,
+    SettingsFontTarget, SettingsShortcutTarget, SettingsViewState, TabBarHitZones,
+    TabSummary, UsageViewState, render_frame, top_reserved, viewport_bounds,
 };
 use crate::usage::{TimeRange, UsageReport, scan_local_usage};
 use arboard::Clipboard;
@@ -290,6 +290,8 @@ struct TerminalApp {
     selecting: bool,
     selection_pending_copy: bool,
     last_click: Instant,
+    #[cfg(target_os = "macos")]
+    titlebar_last_click: Option<(Instant, f64, f64)>,
     click_count: u8,
 
     palette: HistoryPaletteState,
@@ -337,6 +339,8 @@ impl TerminalApp {
             selecting: false,
             selection_pending_copy: false,
             last_click: Instant::now(),
+            #[cfg(target_os = "macos")]
+            titlebar_last_click: None,
             click_count: 0,
             palette: HistoryPaletteState::new(),
             usage: UsageTabState::new(),
@@ -2149,6 +2153,33 @@ impl TerminalApp {
     }
 }
 
+#[cfg(target_os = "macos")]
+impl TerminalApp {
+    /// Logical width reserved at the tab bar's left edge for the native traffic lights
+    const TRAFFIC_LIGHTS_INSET: f64 = 78.0;
+    /// Logical height of the title bar strip kept free when the tab bar is hidden
+    const TITLEBAR_STRIP: f64 = 28.0;
+
+    /// Recompute the physical-pixel title bar insets; the traffic lights are hidden in fullscreen
+    fn refresh_mac_chrome(&self) -> bool {
+        let Some(window) = self.window.as_ref() else {
+            return false;
+        };
+        let (inset, strip) = if window.fullscreen().is_some() {
+            (0, 0)
+        } else {
+            let scale = window.scale_factor();
+            (
+                (Self::TRAFFIC_LIGHTS_INSET * scale).round() as usize,
+                (Self::TITLEBAR_STRIP * scale).round() as usize,
+            )
+        };
+        let changed = renderer::tab_bar_left_inset() != inset || renderer::mac_titlebar_strip() != strip;
+        renderer::set_mac_chrome(inset, strip);
+        changed
+    }
+}
+
 impl ApplicationHandler<UserEvent> for TerminalApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
@@ -2174,6 +2205,11 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
             // Left Option acts as Alt (readline Alt+b/f/Backspace/arrows); right Option still composes
             // characters such as @ # | \ { } on Spanish/German layouts
             attrs = attrs.with_option_as_alt(OptionAsAlt::OnlyLeft);
+            // Unified title bar: our tab bar draws under the native traffic lights
+            attrs = attrs
+                .with_titlebar_transparent(true)
+                .with_title_hidden(true)
+                .with_fullsize_content_view(true);
         }
 
         let window = Rc::new(
@@ -2197,6 +2233,8 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
 
         self.window = Some(window);
         self.surface = Some(surface);
+        #[cfg(target_os = "macos")]
+        self.refresh_mac_chrome();
 
         // Spawn initial tab
         self.spawn_tab(None);
@@ -2313,12 +2351,21 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
                 let h = new_size.height.max(1) as usize;
                 self.win_w = w;
                 self.win_h = h;
+                #[cfg(target_os = "macos")]
+                self.refresh_mac_chrome();
                 if let Some(ref mut surface) = self.surface {
                     if let (Some(nw), Some(nh)) = (NonZeroU32::new(w as u32), NonZeroU32::new(h as u32))
                     {
                         let _ = surface.resize(nw, nh);
                     }
                 }
+                self.resize_all_tabs();
+                self.request_redraw();
+            }
+            #[cfg(target_os = "macos")]
+            WindowEvent::ScaleFactorChanged { .. } => {
+                // The following Resized event relays out; just refresh the insets here
+                self.refresh_mac_chrome();
                 self.resize_all_tabs();
                 self.request_redraw();
             }
@@ -2368,7 +2415,7 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
                             return;
                         }
                         // Check tab bar clicks
-                        if self.cfg.show_tab_bar && (py as usize) < TAB_BAR_H {
+                        if (py as usize) < top_reserved(&self.cfg) {
                             if let Some(r) = self.hit_zones.settings_btn {
                                 if r.contains(px, py) {
                                     self.toggle_settings_tab();
@@ -2419,6 +2466,25 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
                                     self.settings.close();
                                     self.request_redraw();
                                     return;
+                                }
+                            }
+                            // Empty tab bar / title bar strip: drag the window, double-click zooms
+                            #[cfg(target_os = "macos")]
+                            {
+                                if let Some(window) = self.window.clone() {
+                                    let now = Instant::now();
+                                    let double = self.titlebar_last_click.is_some_and(|(t, lx, ly)| {
+                                        now.duration_since(t) < Duration::from_millis(400)
+                                            && (px - lx).abs() < 4.0
+                                            && (py - ly).abs() < 4.0
+                                    });
+                                    if double {
+                                        self.titlebar_last_click = None;
+                                        window.set_maximized(!window.is_maximized());
+                                    } else {
+                                        self.titlebar_last_click = Some((now, px, py));
+                                        let _ = window.drag_window();
+                                    }
                                 }
                             }
                             return;
@@ -2829,6 +2895,12 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
                 }
             }
             WindowEvent::RedrawRequested => {
+                #[cfg(target_os = "macos")]
+                {
+                    if self.refresh_mac_chrome() {
+                        self.resize_all_tabs();
+                    }
+                }
                 self.redraw();
             }
             _ => {}
