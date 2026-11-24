@@ -16,7 +16,26 @@ A lightweight, fast, modern terminal emulator in Rust with a built-in interactiv
   - **`Ctrl+R` Fuzzy History Command Palette** with live subsequence match highlighting, relative timestamps, and usage counts
 - **Curated Themes & Live Config**: `catppuccin-mocha`, `tokyo-night`, `rose-pine`, `gruvbox-dark`, `pure-black` — cycle anytime with `F2`, customize `~/.config/itsadri-terminal/config.toml` and reload live with `Ctrl+Shift+R`.
 
-## Build & Run
+## Download Prebuilt Binary (No Rust Required)
+
+Prebuilt Linux binaries (`x86_64` and `aarch64`) are built automatically by GitHub Actions on every version tag (`v*`) and uploaded to the [GitHub Releases](https://github.com/adri-navarro/rust-terminal/releases) page (and as downloadable artifacts on every workflow run in the **Actions** tab).
+
+Quick install (Linux `x86_64`):
+
+```bash
+curl -fsSL https://github.com/adri-navarro/rust-terminal/releases/latest/download/itsadri-terminal-x86_64-unknown-linux-gnu.tar.gz | tar -xz
+./itsadri-terminal
+```
+
+Optionally move it into your `PATH`:
+
+```bash
+install -Dm755 itsadri-terminal ~/.local/bin/itsadri-terminal
+```
+
+> For ARM64 (`aarch64`) Linux, replace `x86_64-unknown-linux-gnu` with `aarch64-unknown-linux-gnu`.
+
+## Build & Run (From Source)
 
 ```bash
 cargo build --release
