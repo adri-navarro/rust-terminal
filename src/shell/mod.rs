@@ -816,6 +816,24 @@ fn render_prompt(stdout: &mut io::Stdout, cwd: &Path, last_status: i32) -> usize
     visible_len
 }
 
+fn terminal_cols() -> Option<usize> {
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ as _, &mut ws) };
+    if rc != 0 || ws.ws_col == 0 {
+        None
+    } else {
+        Some(ws.ws_col as usize)
+    }
+}
+
+/// Longest prefix of `ghost` with at most `avail_cols` chars, cut on a char boundary.
+pub(crate) fn clamp_ghost(ghost: &str, avail_cols: usize) -> &str {
+    match ghost.char_indices().nth(avail_cols) {
+        Some((idx, _)) => &ghost[..idx],
+        None => ghost,
+    }
+}
+
 fn redraw_line(
     stdout: &mut io::Stdout,
     prompt_visible_len: usize,
@@ -831,7 +849,15 @@ fn redraw_line(
     // Fish-style inline ghost autosuggestion!
     if !buf.is_empty() {
         if let Some(sugg) = history.suggest_prefix(buf) {
-            let ghost = &sugg[buf.len()..];
+            let mut ghost = &sugg[buf.len()..];
+            // Keep the ghost on one row; a wrapped ghost would survive later redraws.
+            if let Some(cols) = terminal_cols() {
+                let avail = cols
+                    .saturating_sub(prompt_visible_len)
+                    .saturating_sub(buf.chars().count())
+                    .saturating_sub(1);
+                ghost = clamp_ghost(ghost, avail);
+            }
             if !ghost.is_empty() {
                 let _ = write!(frame, "\x1b[38;5;242m{ghost}\x1b[0m");
             }

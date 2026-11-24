@@ -1,6 +1,7 @@
 use crate::completer::{Completer, CompletionKind, longest_common_prefix};
 use crate::config::{Config, Rgb, Theme};
 use crate::history::{HistoryStore, fuzzy_score};
+use crate::shell::clamp_ghost;
 use crate::shell::parser::{LogicalOp, parse_command_line};
 use crate::terminal::grid::{ColorSpec, FLAG_BOLD, FLAG_ITALIC, TerminalGrid};
 use crate::usage::{TimeRange, format_cost, format_tokens, parse_iso8601, scan_usage_from_home};
@@ -562,4 +563,27 @@ fn test_settings_config_font_sizes_and_custom_shortcuts() {
     // Theme prev/next cycle
     assert_eq!(Theme::prev_name("catppuccin-mocha"), "pure-black");
     assert_eq!(Theme::prev_name("tokyo-night"), "catppuccin-mocha");
+}
+
+#[test]
+fn test_clamp_ghost_ascii_truncates() {
+    assert_eq!(clamp_ghost("abcdef", 3), "abc");
+}
+
+#[test]
+fn test_clamp_ghost_zero_is_empty() {
+    assert_eq!(clamp_ghost("abcdef", 0), "");
+}
+
+#[test]
+fn test_clamp_ghost_enough_room_unchanged() {
+    assert_eq!(clamp_ghost("abc", 3), "abc");
+    assert_eq!(clamp_ghost("abc", 10), "abc");
+}
+
+#[test]
+fn test_clamp_ghost_multibyte_char_boundary() {
+    assert_eq!(clamp_ghost("ñé日本", 1), "ñ");
+    assert_eq!(clamp_ghost("ñé日本", 3), "ñé日");
+    assert_eq!(clamp_ghost("ñé日本", 4), "ñé日本");
 }
