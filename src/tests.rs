@@ -4,7 +4,10 @@ use crate::history::{HistoryStore, fuzzy_score};
 use crate::shell::clamp_ghost;
 use crate::shell::parser::{LogicalOp, parse_command_line};
 use crate::terminal::grid::{ColorSpec, FLAG_BOLD, FLAG_ITALIC, TerminalGrid};
-use crate::usage::{TimeRange, format_cost, format_tokens, parse_iso8601, scan_usage_from_home};
+use crate::usage::{
+    ScanCache, TimeRange, format_cost, format_tokens, parse_iso8601, scan_usage_from_home,
+    scan_usage_from_home_cached,
+};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -122,6 +125,52 @@ fn test_themes_and_default_config() {
     assert_eq!(black.bg, Rgb::new(0, 0, 0));
 }
 
+
+#[test]
+fn test_usage_scan_cache_reuses_updates_and_evicts() {
+    let tmp = std::env::temp_dir().join("itsadri_test_usage_cache_home");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let claude_dir = tmp.join(".claude/projects/demo");
+    std::fs::create_dir_all(&claude_dir).unwrap();
+    let file = claude_dir.join("sess1.jsonl");
+    let line1 = "{\"timestamp\":\"2026-11-23T19:00:00Z\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-4-20250514\",\"usage\":{\"input_tokens\":1000,\"output_tokens\":200}}}\n";
+    let line2 = "{\"timestamp\":\"2026-11-23T19:05:00Z\",\"message\":{\"id\":\"msg_2\",\"model\":\"claude-sonnet-4-20250514\",\"usage\":{\"input_tokens\":300,\"output_tokens\":100}}}\n";
+    std::fs::write(&file, line1).unwrap();
+
+    let mut cache = ScanCache::default();
+    let first = scan_usage_from_home_cached(&tmp, &mut cache);
+    let second = scan_usage_from_home_cached(&tmp, &mut cache);
+    assert_eq!(cache.cached_files(), 1);
+    assert_eq!(first.files_scanned, 1);
+    assert_eq!(second.files_scanned, 1);
+    let (a, b) = (first.snapshot(TimeRange::All), second.snapshot(TimeRange::All));
+    assert_eq!(a.total.requests, 1);
+    assert_eq!(a.total.total_tokens(), 1200);
+    assert_eq!(b.total.requests, a.total.requests);
+    assert_eq!(b.total.total_tokens(), a.total.total_tokens());
+    assert_eq!(b.total.sessions, a.total.sessions);
+
+    // Appending changes the file length, so the cached entry must be re-parsed.
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&file).unwrap();
+        f.write_all(line2.as_bytes()).unwrap();
+    }
+    let third = scan_usage_from_home_cached(&tmp, &mut cache);
+    let c = third.snapshot(TimeRange::All);
+    assert_eq!(c.total.requests, 2);
+    assert_eq!(c.total.total_tokens(), 1600);
+    assert_eq!(cache.cached_files(), 1);
+
+    // Deleting the file removes its events and evicts the cache entry.
+    std::fs::remove_file(&file).unwrap();
+    let fourth = scan_usage_from_home_cached(&tmp, &mut cache);
+    assert_eq!(fourth.files_scanned, 0);
+    assert_eq!(fourth.snapshot(TimeRange::All).total.requests, 0);
+    assert_eq!(cache.cached_files(), 0);
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
 
 #[test]
 fn test_usage_scanner_detects_all_four_agents() {

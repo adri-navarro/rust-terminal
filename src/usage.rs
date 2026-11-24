@@ -3,6 +3,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,32 +218,147 @@ impl ScanCollector {
     }
 }
 
+/// Codex `rate_limits` snapshot as found in the log; the reset countdown depends on `now`, so
+/// only the absolute reset timestamps are cached.
+#[derive(Clone)]
+struct RawQuota {
+    five_hour_pct: Option<f64>,
+    five_hour_reset_at: Option<u64>,
+    weekly_pct: Option<f64>,
+    weekly_reset_at: Option<u64>,
+}
+
+/// Everything one session file contributes to a `ScanCollector`.
+#[derive(Clone, Default)]
+struct FileParse {
+    events: Vec<UsageEvent>,
+    codex_quota: Option<RawQuota>,
+}
+
+struct FileCacheEntry {
+    mtime: SystemTime,
+    len: u64,
+    parsed: FileParse,
+}
+
+/// Per-file parse results keyed by path, reused while a file's (mtime, len) is unchanged so the
+/// periodic rescan only re-reads logs that actually changed.
+#[derive(Default)]
+pub struct ScanCache {
+    entries: HashMap<PathBuf, FileCacheEntry>,
+    seen: HashSet<PathBuf>,
+}
+
+impl ScanCache {
+    /// Adds the file's events to `out`, parsing it with `parse` only when it changed since the
+    /// last scan. `parse` returning `None` (unreadable file) is never cached.
+    fn scan_file(
+        &mut self,
+        path: &Path,
+        out: &mut ScanCollector,
+        now: u64,
+        parse: impl FnOnce() -> Option<FileParse>,
+    ) {
+        self.seen.insert(path.to_path_buf());
+        // Stat before parsing: a write racing the parse leaves a stale stamp and forces a re-parse.
+        let stamp = fs::metadata(path)
+            .ok()
+            .and_then(|m| Some((m.modified().ok()?, m.len())));
+        if let (Some((mtime, len)), Some(entry)) = (stamp, self.entries.get(path)) {
+            if entry.mtime == mtime && entry.len == len {
+                apply_file_parse(&entry.parsed, out, now);
+                return;
+            }
+        }
+        let Some(parsed) = parse() else {
+            self.entries.remove(path);
+            return;
+        };
+        apply_file_parse(&parsed, out, now);
+        match stamp {
+            Some((mtime, len)) => {
+                self.entries
+                    .insert(path.to_path_buf(), FileCacheEntry { mtime, len, parsed });
+            }
+            None => {
+                self.entries.remove(path);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub fn cached_files(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Drops entries for files that were not visited by the scan that just finished.
+    fn finish_scan(&mut self) {
+        let seen = std::mem::take(&mut self.seen);
+        self.entries.retain(|path, _| seen.contains(path));
+    }
+}
+
+fn apply_file_parse(parsed: &FileParse, out: &mut ScanCollector, now: u64) {
+    for ev in &parsed.events {
+        out.push(ev.clone());
+    }
+    if let Some(q) = &parsed.codex_quota {
+        out.live_quotas.insert(
+            "codex",
+            LiveAgentQuotas {
+                five_hour_pct: q.five_hour_pct,
+                five_hour_reset_secs: q.five_hour_reset_at.map(|t| t.saturating_sub(now)),
+                weekly_pct: q.weekly_pct,
+                weekly_reset_secs: q.weekly_reset_at.map(|t| t.saturating_sub(now)),
+            },
+        );
+    }
+}
+
+static SCAN_CACHE: OnceLock<Mutex<ScanCache>> = OnceLock::new();
+
 pub fn scan_local_usage() -> UsageReport {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    scan_usage_from_home_inner(&home, true)
+    let mut cache = SCAN_CACHE
+        .get_or_init(|| Mutex::new(ScanCache::default()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    scan_usage_from_home_inner(&home, true, &mut cache)
 }
 
 pub fn scan_usage_from_home(home: &Path) -> UsageReport {
-    scan_usage_from_home_inner(home, false)
+    scan_usage_from_home_inner(home, false, &mut ScanCache::default())
 }
 
-fn scan_usage_from_home_inner(home: &Path, allow_network: bool) -> UsageReport {
+/// Like `scan_usage_from_home` but reusing `cache` across calls.
+#[cfg(test)]
+pub fn scan_usage_from_home_cached(home: &Path, cache: &mut ScanCache) -> UsageReport {
+    scan_usage_from_home_inner(home, false, cache)
+}
+
+fn scan_usage_from_home_inner(
+    home: &Path,
+    allow_network: bool,
+    cache: &mut ScanCache,
+) -> UsageReport {
     let t0 = Instant::now();
     let now = unix_now();
     let mut collector = ScanCollector::new();
 
-    scan_claude(home, &mut collector, now);
+    cache.seen.clear();
+    scan_claude(home, &mut collector, cache, now);
     if let Some(live) = fetch_claude_oauth_usage(home, now, allow_network) {
         collector.detected_agents.insert("claude");
         collector.live_quotas.insert("claude", live);
     }
-    scan_codex(home, &mut collector, now);
-    scan_gemini_antigravity(home, &mut collector, now);
+    scan_codex(home, &mut collector, cache, now);
+    scan_gemini_antigravity(home, &mut collector, cache, now);
     if let Some(live) = fetch_agy_usage(home, now, allow_network) {
         collector.detected_agents.insert("gemini");
         collector.live_quotas.insert("gemini", live);
     }
-    scan_opencode(home, &mut collector, now);
+    scan_opencode(home, &mut collector, cache, now);
+    cache.finish_scan();
 
     let five_hours = build_snapshot(&collector, TimeRange::FiveHours, now);
     let today = build_snapshot(&collector, TimeRange::Today, now);
@@ -268,7 +384,6 @@ fn scan_usage_from_home_inner(home: &Path, allow_network: bool) -> UsageReport {
 fn fetch_claude_oauth_usage(home: &Path, now: u64, allow_network: bool) -> Option<LiveAgentQuotas> {
     const CACHE_TTL_SECS: u64 = 120;
     let cache_path = home.join(".cache").join("claude-usage.json");
-    let creds_path = home.join(".claude").join(".credentials.json");
 
     // 1. Reuse fresh cache (shared with Quickshell!)
     let cached_val = fs::metadata(&cache_path)
@@ -286,9 +401,13 @@ fn fetch_claude_oauth_usage(home: &Path, now: u64, allow_network: bool) -> Optio
 
     let data = if let Some(v) = cached_val {
         v
+    } else if allow_network && claude_fetch_backoff_active(CACHE_TTL_SECS) {
+        // Recent attempt already failed or went stale: don't re-spawn `security`/curl yet.
+        let stale = fs::read_to_string(&cache_path).ok()?;
+        parse_json(&stale)?
     } else if allow_network {
-        // 2. Read OAuth access token from ~/.claude/.credentials.json
-        let creds_str = fs::read_to_string(&creds_path).ok()?;
+        // 2. Read OAuth access token from ~/.claude/.credentials.json (or the macOS Keychain)
+        let creds_str = read_claude_credentials_json(home)?;
         let creds = parse_json(&creds_str)?;
         let oauth = creds.get("claudeAiOauth")?;
         let token = oauth.get_str("accessToken")?;
@@ -359,6 +478,66 @@ fn fetch_claude_oauth_usage(home: &Path, now: u64, allow_network: bool) -> Optio
         weekly_pct: week_pct,
         weekly_reset_secs: week_reset,
     })
+}
+
+static LAST_CLAUDE_FETCH_ATTEMPT: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// True if a credentials/network attempt happened less than `ttl_secs` ago; otherwise records
+/// "now" as the latest attempt and returns false. Failed attempts never write the cache file,
+/// so this in-memory timestamp is what keeps the Keychain and network from being hit every refresh.
+fn claude_fetch_backoff_active(ttl_secs: u64) -> bool {
+    let mut last = LAST_CLAUDE_FETCH_ATTEMPT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if last.is_some_and(|t| t.elapsed().as_secs() < ttl_secs) {
+        return true;
+    }
+    *last = Some(Instant::now());
+    false
+}
+
+/// Returns the Claude Code credentials JSON: `~/.claude/.credentials.json` if present,
+/// otherwise (macOS only) the login Keychain item "Claude Code-credentials".
+/// The returned text contains the OAuth token and must never be logged.
+fn read_claude_credentials_json(home: &Path) -> Option<String> {
+    let creds_path = home.join(".claude").join(".credentials.json");
+    if let Ok(s) = fs::read_to_string(&creds_path) {
+        return Some(s);
+    }
+
+    read_claude_keychain_json()
+}
+
+#[cfg(target_os = "macos")]
+fn read_claude_keychain_json() -> Option<String> {
+    use std::process::Stdio;
+    let mut cmd = Command::new("/usr/bin/security");
+    cmd.args(["find-generic-password", "-s", "Claude Code-credentials"]);
+    if let Some(user) = std::env::var_os("USER").filter(|u| !u.is_empty()) {
+        cmd.arg("-a").arg(user);
+    }
+    let output = cmd
+        .arg("-w")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    keychain_output_to_json(&String::from_utf8(output.stdout).ok()?)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn read_claude_keychain_json() -> Option<String> {
+    None
+}
+
+/// Accepts the `security -w` output only when it is the plain JSON object (not hex-encoded).
+#[cfg(any(target_os = "macos", test))]
+fn keychain_output_to_json(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    trimmed.starts_with('{').then(|| trimmed.to_string())
 }
 
 /// Fetches exact Gemini / Antigravity subscription quota (5h + weekly remaining %)
@@ -657,7 +836,7 @@ fn build_snapshot(collector: &ScanCollector, range: TimeRange, now: u64) -> Usag
 // 1. Claude Code (~/.claude/projects/**/*.jsonl, ~/.config/claude/projects/**/*.jsonl)
 // ============================================================================
 
-fn scan_claude(home: &Path, out: &mut ScanCollector, now: u64) {
+fn scan_claude(home: &Path, out: &mut ScanCollector, cache: &mut ScanCache, now: u64) {
     let roots = [
         home.join(".claude").join("projects"),
         home.join(".config").join("claude").join("projects"),
@@ -672,104 +851,105 @@ fn scan_claude(home: &Path, out: &mut ScanCollector, now: u64) {
 
     for path in files {
         out.files_scanned += 1;
-        let fallback_ts = file_mtime_secs(&path).unwrap_or(now);
-        let session_key = path.to_string_lossy().into_owned();
-        let Ok(file) = File::open(&path) else {
+        cache.scan_file(&path, out, now, || parse_claude_file(&path, now));
+    }
+}
+
+fn parse_claude_file(path: &Path, now: u64) -> Option<FileParse> {
+    let fallback_ts = file_mtime_secs(path).unwrap_or(now);
+    let session_key = path.to_string_lossy().into_owned();
+    let file = File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    // Deduplicate streaming chunks by message.id or requestId
+    let mut by_msg_id: HashMap<String, UsageEvent> = HashMap::new();
+    let mut anon_events: Vec<UsageEvent> = Vec::new();
+
+    for line in reader.lines().map_while(Result::ok) {
+        if !line.contains("usage") && !line.contains("tokens") {
+            continue;
+        }
+        let Some(val) = parse_json(&line) else {
             continue;
         };
-        let reader = BufReader::new(file);
+        let msg = val.get("message");
+        let usage = msg
+            .and_then(|m| m.get("usage"))
+            .or_else(|| val.get("usage"));
+        let Some(u) = usage else {
+            continue;
+        };
 
-        // Deduplicate streaming chunks by message.id or requestId
-        let mut by_msg_id: HashMap<String, UsageEvent> = HashMap::new();
-        let mut anon_events: Vec<UsageEvent> = Vec::new();
-
-        for line in reader.lines().map_while(Result::ok) {
-            if !line.contains("usage") && !line.contains("tokens") {
-                continue;
-            }
-            let Some(val) = parse_json(&line) else {
-                continue;
-            };
-            let msg = val.get("message");
-            let usage = msg
-                .and_then(|m| m.get("usage"))
-                .or_else(|| val.get("usage"));
-            let Some(u) = usage else {
-                continue;
-            };
-
-            let input = u.get_u64("input_tokens");
-            let output = u.get_u64("output_tokens");
-            let cache_read = u.get_u64("cache_read_input_tokens");
-            let cache_write = u.get_u64("cache_creation_input_tokens");
-            if input == 0 && output == 0 && cache_read == 0 && cache_write == 0 {
-                continue;
-            }
-
-            let model = msg
-                .and_then(|m| m.get_str("model"))
-                .or_else(|| val.get_str("model"))
-                .unwrap_or("claude-unknown")
-                .to_string();
-            if model == "<synthetic>" {
-                continue;
-            }
-
-            let ts = val
-                .get("timestamp")
-                .and_then(parse_timestamp)
-                .unwrap_or(fallback_ts);
-            let cost = val
-                .get_f64("costUSD")
-                .or_else(|| val.get_f64("cost_usd"))
-                .unwrap_or(0.0);
-
-            let ev = UsageEvent {
-                agent_id: "claude",
-                agent_name: "Claude Code",
-                model,
-                session_key: session_key.clone(),
-                timestamp: ts,
-                input_tokens: input,
-                output_tokens: output,
-                cache_read_tokens: cache_read,
-                cache_write_tokens: cache_write,
-                reasoning_tokens: 0,
-                requests: 1,
-                cost_usd: cost,
-            };
-
-            let dedup_key = msg
-                .and_then(|m| m.get_str("id"))
-                .or_else(|| val.get_str("requestId"));
-
-            if let Some(key) = dedup_key {
-                let entry = by_msg_id.entry(key.to_string()).or_insert_with(|| ev.clone());
-                entry.input_tokens = entry.input_tokens.max(ev.input_tokens);
-                entry.output_tokens = entry.output_tokens.max(ev.output_tokens);
-                entry.cache_read_tokens = entry.cache_read_tokens.max(ev.cache_read_tokens);
-                entry.cache_write_tokens = entry.cache_write_tokens.max(ev.cache_write_tokens);
-                entry.cost_usd = entry.cost_usd.max(ev.cost_usd);
-                entry.timestamp = entry.timestamp.max(ev.timestamp);
-            } else {
-                anon_events.push(ev);
-            }
+        let input = u.get_u64("input_tokens");
+        let output = u.get_u64("output_tokens");
+        let cache_read = u.get_u64("cache_read_input_tokens");
+        let cache_write = u.get_u64("cache_creation_input_tokens");
+        if input == 0 && output == 0 && cache_read == 0 && cache_write == 0 {
+            continue;
         }
 
-        for (_, ev) in by_msg_id {
-            out.push(ev);
+        let model = msg
+            .and_then(|m| m.get_str("model"))
+            .or_else(|| val.get_str("model"))
+            .unwrap_or("claude-unknown")
+            .to_string();
+        if model == "<synthetic>" {
+            continue;
         }
-        for ev in anon_events {
-            out.push(ev);
+
+        let ts = val
+            .get("timestamp")
+            .and_then(parse_timestamp)
+            .unwrap_or(fallback_ts);
+        let cost = val
+            .get_f64("costUSD")
+            .or_else(|| val.get_f64("cost_usd"))
+            .unwrap_or(0.0);
+
+        let ev = UsageEvent {
+            agent_id: "claude",
+            agent_name: "Claude Code",
+            model,
+            session_key: session_key.clone(),
+            timestamp: ts,
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_tokens: cache_read,
+            cache_write_tokens: cache_write,
+            reasoning_tokens: 0,
+            requests: 1,
+            cost_usd: cost,
+        };
+
+        let dedup_key = msg
+            .and_then(|m| m.get_str("id"))
+            .or_else(|| val.get_str("requestId"));
+
+        if let Some(key) = dedup_key {
+            let entry = by_msg_id.entry(key.to_string()).or_insert_with(|| ev.clone());
+            entry.input_tokens = entry.input_tokens.max(ev.input_tokens);
+            entry.output_tokens = entry.output_tokens.max(ev.output_tokens);
+            entry.cache_read_tokens = entry.cache_read_tokens.max(ev.cache_read_tokens);
+            entry.cache_write_tokens = entry.cache_write_tokens.max(ev.cache_write_tokens);
+            entry.cost_usd = entry.cost_usd.max(ev.cost_usd);
+            entry.timestamp = entry.timestamp.max(ev.timestamp);
+        } else {
+            anon_events.push(ev);
         }
     }
+
+    let mut events: Vec<UsageEvent> = by_msg_id.into_values().collect();
+    events.extend(anon_events);
+    Some(FileParse {
+        events,
+        codex_quota: None,
+    })
 }
 
 // ============================================================================
 // 2. Codex CLI (~/.codex/sessions/**/*.jsonl)
 // ============================================================================
 
-fn scan_codex(home: &Path, out: &mut ScanCollector, now: u64) {
+fn scan_codex(home: &Path, out: &mut ScanCollector, cache: &mut ScanCache, now: u64) {
     let root = home.join(".codex").join("sessions");
     if !root.is_dir() {
         return;
@@ -780,147 +960,150 @@ fn scan_codex(home: &Path, out: &mut ScanCollector, now: u64) {
 
     for path in files {
         out.files_scanned += 1;
-        let fallback_ts = file_mtime_secs(&path).unwrap_or(now);
-        let session_key = path.to_string_lossy().into_owned();
-        let Ok(file) = File::open(&path) else {
+        cache.scan_file(&path, out, now, || parse_codex_file(&path, now));
+    }
+}
+
+fn parse_codex_file(path: &Path, now: u64) -> Option<FileParse> {
+    let fallback_ts = file_mtime_secs(path).unwrap_or(now);
+    let session_key = path.to_string_lossy().into_owned();
+    let file = File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    let mut events: Vec<UsageEvent> = Vec::new();
+    // Last rate_limits snapshot in the file; the `now`-relative reset is applied on every scan.
+    let mut quota: Option<RawQuota> = None;
+    let mut current_model = "codex-unknown".to_string();
+    let mut had_per_turn = false;
+    let mut max_total: Option<(u64, u64, u64, u64, u64, String)> = None;
+
+    for line in reader.lines().map_while(Result::ok) {
+        if !line.contains("token_count")
+            && !line.contains("turn_context")
+            && !line.contains("session_meta")
+            && !line.contains("model")
+        {
+            continue;
+        }
+        let Some(val) = parse_json(&line) else {
             continue;
         };
-        let reader = BufReader::new(file);
+        let typ = val.get_str("type").unwrap_or("");
+        let payload = val.get("payload");
 
-        let mut current_model = "codex-unknown".to_string();
-        let mut had_per_turn = false;
-        let mut max_total: Option<(u64, u64, u64, u64, u64, String)> = None;
-
-        for line in reader.lines().map_while(Result::ok) {
-            if !line.contains("token_count")
-                && !line.contains("turn_context")
-                && !line.contains("session_meta")
-                && !line.contains("model")
+        if typ == "turn_context" || typ == "session_meta" {
+            if let Some(m) = payload
+                .and_then(|p| p.get_str("model"))
+                .or_else(|| val.get_str("model"))
             {
-                continue;
-            }
-            let Some(val) = parse_json(&line) else {
-                continue;
-            };
-            let typ = val.get_str("type").unwrap_or("");
-            let payload = val.get("payload");
-
-            if typ == "turn_context" || typ == "session_meta" {
-                if let Some(m) = payload
-                    .and_then(|p| p.get_str("model"))
-                    .or_else(|| val.get_str("model"))
-                {
-                    if !m.is_empty() {
-                        current_model = m.to_string();
-                    }
-                }
-                continue;
-            }
-
-            if typ == "event_msg" {
-                let Some(p) = payload else { continue };
-                if p.get_str("type") != Some("token_count") {
-                    continue;
-                }
-                let ts = val
-                    .get("timestamp")
-                    .and_then(parse_timestamp)
-                    .unwrap_or(fallback_ts);
-
-                // Extract real server-side Codex rate_limits if present (primary=5h, secondary=7d)
-                if let Some(rl) = p.get("rate_limits") {
-                    let primary = rl.get("primary");
-                    let secondary = rl.get("secondary");
-                    let p_pct = primary.and_then(|x| x.get_f64("used_percent"));
-                    let s_pct = secondary.and_then(|x| x.get_f64("used_percent"));
-                    if p_pct.is_some() || s_pct.is_some() {
-                        let p_reset = primary
-                            .and_then(|x| x.get("resets_at"))
-                            .and_then(parse_timestamp)
-                            .map(|t| t.saturating_sub(now));
-                        let s_reset = secondary
-                            .and_then(|x| x.get("resets_at"))
-                            .and_then(parse_timestamp)
-                            .map(|t| t.saturating_sub(now));
-                        out.live_quotas.insert(
-                            "codex",
-                            LiveAgentQuotas {
-                                five_hour_pct: p_pct,
-                                five_hour_reset_secs: p_reset,
-                                weekly_pct: s_pct,
-                                weekly_reset_secs: s_reset,
-                            },
-                        );
-                    }
-                }
-
-                let Some(info) = p.get("info") else { continue };
-
-                if let Some(last) = info.get("last_token_usage") {
-                    let input = last.get_u64("input_tokens");
-                    let cached = last.get_u64("cached_input_tokens");
-                    let output = last.get_u64("output_tokens");
-                    let reasoning = last.get_u64("reasoning_output_tokens");
-                    if input > 0 || cached > 0 || output > 0 || reasoning > 0 {
-                        had_per_turn = true;
-                        out.push(UsageEvent {
-                            agent_id: "codex",
-                            agent_name: "Codex",
-                            model: current_model.clone(),
-                            session_key: session_key.clone(),
-                            timestamp: ts,
-                            input_tokens: input.saturating_sub(cached),
-                            output_tokens: output,
-                            cache_read_tokens: cached,
-                            cache_write_tokens: 0,
-                            reasoning_tokens: reasoning,
-                            requests: 1,
-                            cost_usd: 0.0,
-                        });
-                    }
-                } else if let Some(tot) = info.get("total_token_usage") {
-                    let input = tot.get_u64("input_tokens");
-                    let cached = tot.get_u64("cached_input_tokens");
-                    let output = tot.get_u64("output_tokens");
-                    let reasoning = tot.get_u64("reasoning_output_tokens");
-                    let sum = input + output + reasoning;
-                    let prev_sum = max_total
-                        .as_ref()
-                        .map(|t| t.0 + t.2 + t.3)
-                        .unwrap_or(0);
-                    if sum > prev_sum {
-                        max_total = Some((input, cached, output, reasoning, ts, current_model.clone()));
-                    }
+                if !m.is_empty() {
+                    current_model = m.to_string();
                 }
             }
+            continue;
         }
 
-        if !had_per_turn {
-            if let Some((input, cached, output, reasoning, ts, model)) = max_total {
-                out.push(UsageEvent {
-                    agent_id: "codex",
-                    agent_name: "Codex",
-                    model,
-                    session_key,
-                    timestamp: ts,
-                    input_tokens: input.saturating_sub(cached),
-                    output_tokens: output,
-                    cache_read_tokens: cached,
-                    cache_write_tokens: 0,
-                    reasoning_tokens: reasoning,
-                    requests: 1,
-                    cost_usd: 0.0,
-                });
+        if typ == "event_msg" {
+            let Some(p) = payload else { continue };
+            if p.get_str("type") != Some("token_count") {
+                continue;
+            }
+            let ts = val
+                .get("timestamp")
+                .and_then(parse_timestamp)
+                .unwrap_or(fallback_ts);
+
+            // Extract real server-side Codex rate_limits if present (primary=5h, secondary=7d)
+            if let Some(rl) = p.get("rate_limits") {
+                let primary = rl.get("primary");
+                let secondary = rl.get("secondary");
+                let p_pct = primary.and_then(|x| x.get_f64("used_percent"));
+                let s_pct = secondary.and_then(|x| x.get_f64("used_percent"));
+                if p_pct.is_some() || s_pct.is_some() {
+                    let p_reset_at = primary
+                        .and_then(|x| x.get("resets_at"))
+                        .and_then(parse_timestamp);
+                    let s_reset_at = secondary
+                        .and_then(|x| x.get("resets_at"))
+                        .and_then(parse_timestamp);
+                    quota = Some(RawQuota {
+                        five_hour_pct: p_pct,
+                        five_hour_reset_at: p_reset_at,
+                        weekly_pct: s_pct,
+                        weekly_reset_at: s_reset_at,
+                    });
+                }
+            }
+
+            let Some(info) = p.get("info") else { continue };
+
+            if let Some(last) = info.get("last_token_usage") {
+                let input = last.get_u64("input_tokens");
+                let cached = last.get_u64("cached_input_tokens");
+                let output = last.get_u64("output_tokens");
+                let reasoning = last.get_u64("reasoning_output_tokens");
+                if input > 0 || cached > 0 || output > 0 || reasoning > 0 {
+                    had_per_turn = true;
+                    events.push(UsageEvent {
+                        agent_id: "codex",
+                        agent_name: "Codex",
+                        model: current_model.clone(),
+                        session_key: session_key.clone(),
+                        timestamp: ts,
+                        input_tokens: input.saturating_sub(cached),
+                        output_tokens: output,
+                        cache_read_tokens: cached,
+                        cache_write_tokens: 0,
+                        reasoning_tokens: reasoning,
+                        requests: 1,
+                        cost_usd: 0.0,
+                    });
+                }
+            } else if let Some(tot) = info.get("total_token_usage") {
+                let input = tot.get_u64("input_tokens");
+                let cached = tot.get_u64("cached_input_tokens");
+                let output = tot.get_u64("output_tokens");
+                let reasoning = tot.get_u64("reasoning_output_tokens");
+                let sum = input + output + reasoning;
+                let prev_sum = max_total
+                    .as_ref()
+                    .map(|t| t.0 + t.2 + t.3)
+                    .unwrap_or(0);
+                if sum > prev_sum {
+                    max_total = Some((input, cached, output, reasoning, ts, current_model.clone()));
+                }
             }
         }
     }
+
+    if !had_per_turn {
+        if let Some((input, cached, output, reasoning, ts, model)) = max_total {
+            events.push(UsageEvent {
+                agent_id: "codex",
+                agent_name: "Codex",
+                model,
+                session_key,
+                timestamp: ts,
+                input_tokens: input.saturating_sub(cached),
+                output_tokens: output,
+                cache_read_tokens: cached,
+                cache_write_tokens: 0,
+                reasoning_tokens: reasoning,
+                requests: 1,
+                cost_usd: 0.0,
+            });
+        }
+    }
+    Some(FileParse {
+        events,
+        codex_quota: quota,
+    })
 }
 
 // ============================================================================
 // 3. Gemini CLI & Antigravity CLI (~/.gemini/tmp/**, ~/.gemini/antigravity-cli/**)
 // ============================================================================
 
-fn scan_gemini_antigravity(home: &Path, out: &mut ScanCollector, now: u64) {
+fn scan_gemini_antigravity(home: &Path, out: &mut ScanCollector, cache: &mut ScanCache, now: u64) {
     // 3a. Gemini CLI session JSON files: ~/.gemini/tmp/*/chats/session-*.json
     let gemini_tmp = home.join(".gemini").join("tmp");
     if gemini_tmp.is_dir() {
@@ -933,60 +1116,76 @@ fn scan_gemini_antigravity(home: &Path, out: &mut ScanCollector, now: u64) {
                 continue;
             }
             out.files_scanned += 1;
-            let fallback_ts = file_mtime_secs(&path).unwrap_or(now);
-            let session_key = path.to_string_lossy().into_owned();
-            let Ok(content) = fs::read_to_string(&path) else {
-                continue;
-            };
-            let Some(root) = parse_json(&content) else {
-                continue;
-            };
-            let session_ts = root
-                .get("lastUpdated")
-                .or_else(|| root.get("startTime"))
-                .and_then(parse_timestamp)
-                .unwrap_or(fallback_ts);
-
-            if let Some(messages) = root.get("messages").and_then(JsonVal::as_array) {
-                for msg in messages {
-                    let Some(tokens) = msg.get("tokens") else {
-                        continue;
-                    };
-                    let input = tokens.get_u64("input");
-                    let output = tokens.get_u64("output");
-                    let cached = tokens.get_u64("cached");
-                    let thoughts = tokens.get_u64("thoughts");
-                    if input == 0 && output == 0 && cached == 0 && thoughts == 0 {
-                        continue;
-                    }
-                    let model = msg
-                        .get_str("model")
-                        .unwrap_or("gemini-unknown")
-                        .to_string();
-                    let ts = msg
-                        .get("timestamp")
-                        .and_then(parse_timestamp)
-                        .unwrap_or(session_ts);
-                    out.push(UsageEvent {
-                        agent_id: "gemini",
-                        agent_name: "Gemini / Antigravity",
-                        model,
-                        session_key: session_key.clone(),
-                        timestamp: ts,
-                        input_tokens: input,
-                        output_tokens: output,
-                        cache_read_tokens: cached,
-                        cache_write_tokens: 0,
-                        reasoning_tokens: thoughts,
-                        requests: 1,
-                        cost_usd: 0.0,
-                    });
-                }
-            }
+            cache.scan_file(&path, out, now, || parse_gemini_session_file(&path, now));
         }
     }
 
     // 3b. Antigravity CLI transcripts: ~/.gemini/antigravity-cli/brain/*/
+    scan_antigravity_transcripts(home, out, cache, now);
+}
+
+fn parse_gemini_session_file(path: &Path, now: u64) -> Option<FileParse> {
+    let fallback_ts = file_mtime_secs(path).unwrap_or(now);
+    let session_key = path.to_string_lossy().into_owned();
+    let content = fs::read_to_string(path).ok()?;
+    let mut events: Vec<UsageEvent> = Vec::new();
+    let Some(root) = parse_json(&content) else {
+        return Some(FileParse::default());
+    };
+    let session_ts = root
+        .get("lastUpdated")
+        .or_else(|| root.get("startTime"))
+        .and_then(parse_timestamp)
+        .unwrap_or(fallback_ts);
+
+    if let Some(messages) = root.get("messages").and_then(JsonVal::as_array) {
+        for msg in messages {
+            let Some(tokens) = msg.get("tokens") else {
+                continue;
+            };
+            let input = tokens.get_u64("input");
+            let output = tokens.get_u64("output");
+            let cached = tokens.get_u64("cached");
+            let thoughts = tokens.get_u64("thoughts");
+            if input == 0 && output == 0 && cached == 0 && thoughts == 0 {
+                continue;
+            }
+            let model = msg
+                .get_str("model")
+                .unwrap_or("gemini-unknown")
+                .to_string();
+            let ts = msg
+                .get("timestamp")
+                .and_then(parse_timestamp)
+                .unwrap_or(session_ts);
+            events.push(UsageEvent {
+                agent_id: "gemini",
+                agent_name: "Gemini / Antigravity",
+                model,
+                session_key: session_key.clone(),
+                timestamp: ts,
+                input_tokens: input,
+                output_tokens: output,
+                cache_read_tokens: cached,
+                cache_write_tokens: 0,
+                reasoning_tokens: thoughts,
+                requests: 1,
+                cost_usd: 0.0,
+            });
+        }
+    }
+    Some(FileParse {
+        events,
+        codex_quota: None,
+    })
+}
+
+fn scan_antigravity_transcripts(
+    home: &Path,
+    out: &mut ScanCollector,
+    cache: &mut ScanCache,
+    now: u64,
+) {
     let agy_roots = [
         home.join(".gemini").join("antigravity-cli").join("brain"),
         home.join(".gemini").join("antigravity").join("brain"),
@@ -1004,128 +1203,135 @@ fn scan_gemini_antigravity(home: &Path, out: &mut ScanCollector, now: u64) {
                 continue;
             }
             out.files_scanned += 1;
-            let fallback_ts = file_mtime_secs(&path).unwrap_or(now);
-            let session_key = path.to_string_lossy().into_owned();
-            let Ok(file) = File::open(&path) else {
-                continue;
-            };
-            let reader = BufReader::new(file);
-            let mut session_model = "antigravity".to_string();
-            let mut found_token_event = false;
-            let mut assistant_turns = 0u64;
-            let mut last_ts = fallback_ts;
-
-            for line in reader.lines().map_while(Result::ok) {
-                // Fast skip for huge tool-output lines that have no token/usage fields
-                if !line.contains("input_tokens")
-                    && !line.contains("output_tokens")
-                    && !line.contains("promptTokenCount")
-                    && !line.contains("usageMetadata")
-                    && !line.contains("tokenUsage")
-                    && !line.contains("PLANNER_RESPONSE")
-                {
-                    continue;
-                }
-                let Some(val) = parse_json(&line) else {
-                    continue;
-                };
-                if let Some(ts) = val
-                    .get("timestamp")
-                    .or_else(|| val.get("created_at"))
-                    .and_then(parse_timestamp)
-                {
-                    last_ts = last_ts.max(ts);
-                }
-                if let Some(m) = val
-                    .get_str("model")
-                    .or_else(|| val.get("metadata").and_then(|md| md.get_str("model")))
-                {
-                    if !m.is_empty() {
-                        session_model = m.to_string();
-                    }
-                }
-                let typ = val.get_str("type").unwrap_or("");
-                let role = val.get_str("role").or_else(|| val.get_str("source")).unwrap_or("");
-                if typ == "PLANNER_RESPONSE"
-                    || role.eq_ignore_ascii_case("assistant")
-                    || role.eq_ignore_ascii_case("model")
-                {
-                    assistant_turns += 1;
-                }
-
-                // Support both top-level token fields (Antigravity PLANNER_RESPONSE)
-                // and nested usageMetadata / usage / tokenUsage objects
-                let u = val
-                    .get("usageMetadata")
-                    .or_else(|| val.get("usage"))
-                    .or_else(|| val.get("tokenUsage"))
-                    .unwrap_or(&val);
-
-                let input = u
-                    .get_u64("promptTokenCount")
-                    .max(u.get_u64("input_tokens"))
-                    .max(u.get_u64("input"));
-                let output = u
-                    .get_u64("candidatesTokenCount")
-                    .max(u.get_u64("output_tokens"))
-                    .max(u.get_u64("output"));
-                let cached = u
-                    .get_u64("cachedContentTokenCount")
-                    .max(u.get_u64("cache_read_tokens"))
-                    .max(u.get_u64("cache_read_input_tokens"))
-                    .max(u.get_u64("cached"));
-                let cache_write = u
-                    .get_u64("cache_write_tokens")
-                    .max(u.get_u64("cache_creation_input_tokens"));
-                let thoughts = u
-                    .get_u64("thoughtsTokenCount")
-                    .max(u.get_u64("reasoning_tokens"))
-                    .max(u.get_u64("thinking_tokens"));
-
-                if input > 0 || output > 0 || cached > 0 || cache_write > 0 || thoughts > 0 {
-                    found_token_event = true;
-                    out.push(UsageEvent {
-                        agent_id: "gemini",
-                        agent_name: "Gemini / Antigravity",
-                        model: session_model.clone(),
-                        session_key: session_key.clone(),
-                        timestamp: last_ts,
-                        input_tokens: input,
-                        output_tokens: output,
-                        cache_read_tokens: cached,
-                        cache_write_tokens: cache_write,
-                        reasoning_tokens: thoughts,
-                        requests: 1,
-                        cost_usd: 0.0,
-                    });
-                }
-            }
-
-            if !found_token_event && assistant_turns > 0 {
-                out.push(UsageEvent {
-                    agent_id: "gemini",
-                    agent_name: "Gemini / Antigravity",
-                    model: session_model,
-                    session_key,
-                    timestamp: last_ts,
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    cache_read_tokens: 0,
-                    cache_write_tokens: 0,
-                    reasoning_tokens: 0,
-                    requests: assistant_turns,
-                    cost_usd: 0.0,
-                });
-            }
+            cache.scan_file(&path, out, now, || parse_antigravity_transcript(&path, now));
         }
     }
+}
+
+fn parse_antigravity_transcript(path: &Path, now: u64) -> Option<FileParse> {
+    let fallback_ts = file_mtime_secs(path).unwrap_or(now);
+    let session_key = path.to_string_lossy().into_owned();
+    let file = File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    let mut events: Vec<UsageEvent> = Vec::new();
+    let mut session_model = "antigravity".to_string();
+    let mut found_token_event = false;
+    let mut assistant_turns = 0u64;
+    let mut last_ts = fallback_ts;
+
+    for line in reader.lines().map_while(Result::ok) {
+        // Fast skip for huge tool-output lines that have no token/usage fields
+        if !line.contains("input_tokens")
+            && !line.contains("output_tokens")
+            && !line.contains("promptTokenCount")
+            && !line.contains("usageMetadata")
+            && !line.contains("tokenUsage")
+            && !line.contains("PLANNER_RESPONSE")
+        {
+            continue;
+        }
+        let Some(val) = parse_json(&line) else {
+            continue;
+        };
+        if let Some(ts) = val
+            .get("timestamp")
+            .or_else(|| val.get("created_at"))
+            .and_then(parse_timestamp)
+        {
+            last_ts = last_ts.max(ts);
+        }
+        if let Some(m) = val
+            .get_str("model")
+            .or_else(|| val.get("metadata").and_then(|md| md.get_str("model")))
+        {
+            if !m.is_empty() {
+                session_model = m.to_string();
+            }
+        }
+        let typ = val.get_str("type").unwrap_or("");
+        let role = val.get_str("role").or_else(|| val.get_str("source")).unwrap_or("");
+        if typ == "PLANNER_RESPONSE"
+            || role.eq_ignore_ascii_case("assistant")
+            || role.eq_ignore_ascii_case("model")
+        {
+            assistant_turns += 1;
+        }
+
+        // Support both top-level token fields (Antigravity PLANNER_RESPONSE)
+        // and nested usageMetadata / usage / tokenUsage objects
+        let u = val
+            .get("usageMetadata")
+            .or_else(|| val.get("usage"))
+            .or_else(|| val.get("tokenUsage"))
+            .unwrap_or(&val);
+
+        let input = u
+            .get_u64("promptTokenCount")
+            .max(u.get_u64("input_tokens"))
+            .max(u.get_u64("input"));
+        let output = u
+            .get_u64("candidatesTokenCount")
+            .max(u.get_u64("output_tokens"))
+            .max(u.get_u64("output"));
+        let cached = u
+            .get_u64("cachedContentTokenCount")
+            .max(u.get_u64("cache_read_tokens"))
+            .max(u.get_u64("cache_read_input_tokens"))
+            .max(u.get_u64("cached"));
+        let cache_write = u
+            .get_u64("cache_write_tokens")
+            .max(u.get_u64("cache_creation_input_tokens"));
+        let thoughts = u
+            .get_u64("thoughtsTokenCount")
+            .max(u.get_u64("reasoning_tokens"))
+            .max(u.get_u64("thinking_tokens"));
+
+        if input > 0 || output > 0 || cached > 0 || cache_write > 0 || thoughts > 0 {
+            found_token_event = true;
+            events.push(UsageEvent {
+                agent_id: "gemini",
+                agent_name: "Gemini / Antigravity",
+                model: session_model.clone(),
+                session_key: session_key.clone(),
+                timestamp: last_ts,
+                input_tokens: input,
+                output_tokens: output,
+                cache_read_tokens: cached,
+                cache_write_tokens: cache_write,
+                reasoning_tokens: thoughts,
+                requests: 1,
+                cost_usd: 0.0,
+            });
+        }
+    }
+
+    if !found_token_event && assistant_turns > 0 {
+        events.push(UsageEvent {
+            agent_id: "gemini",
+            agent_name: "Gemini / Antigravity",
+            model: session_model,
+            session_key,
+            timestamp: last_ts,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+            requests: assistant_turns,
+            cost_usd: 0.0,
+        });
+    }
+    Some(FileParse {
+        events,
+        codex_quota: None,
+    })
 }
 
 // ============================================================================
 // 4. OpenCode (~/.local/share/opencode/storage/message/**/*.json)
 // ============================================================================
 
-fn scan_opencode(home: &Path, out: &mut ScanCollector, now: u64) {
+fn scan_opencode(home: &Path, out: &mut ScanCollector, cache: &mut ScanCache, now: u64) {
     let roots = [
         home.join(".local")
             .join("share")
@@ -1144,69 +1350,76 @@ fn scan_opencode(home: &Path, out: &mut ScanCollector, now: u64) {
 
     for path in files {
         out.files_scanned += 1;
-        let fallback_ts = file_mtime_secs(&path).unwrap_or(now);
-        let Ok(content) = fs::read_to_string(&path) else {
-            continue;
-        };
-        if !content.contains("tokens") {
-            continue;
-        }
-        let Some(val) = parse_json(&content) else {
-            continue;
-        };
-        if let Some(role) = val.get_str("role") {
-            if role != "assistant" {
-                continue;
-            }
-        }
-        let Some(tokens) = val.get("tokens") else {
-            continue;
-        };
-        let input = tokens.get_u64("input");
-        let output = tokens.get_u64("output");
-        let reasoning = tokens.get_u64("reasoning");
-        let cache = tokens.get("cache");
-        let cache_read = cache.map(|c| c.get_u64("read")).unwrap_or(0);
-        let cache_write = cache.map(|c| c.get_u64("write")).unwrap_or(0);
-        if input == 0 && output == 0 && reasoning == 0 && cache_read == 0 && cache_write == 0 {
-            continue;
-        }
-
-        let model = val
-            .get_str("modelID")
-            .or_else(|| val.get_str("model"))
-            .unwrap_or("opencode-unknown")
-            .to_string();
-        let session_key = val
-            .get_str("sessionID")
-            .map(str::to_string)
-            .unwrap_or_else(|| {
-                path.parent()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_default()
-            });
-        let ts = val
-            .get("time")
-            .and_then(|t| t.get("completed").or_else(|| t.get("created")))
-            .and_then(parse_timestamp)
-            .unwrap_or(fallback_ts);
-        let cost = val.get_f64("cost").unwrap_or(0.0);
-
-        out.push(UsageEvent {
-            agent_id: "opencode",
-            agent_name: "OpenCode",
-            model,
-            session_key,
-            timestamp: ts,
-            input_tokens: input,
-            output_tokens: output,
-            cache_read_tokens: cache_read,
-            cache_write_tokens: cache_write,
-            reasoning_tokens: reasoning,
-            requests: 1,
-            cost_usd: cost,
-        });
+        cache.scan_file(&path, out, now, || parse_opencode_file(&path, now));
     }
+}
+
+fn parse_opencode_file(path: &Path, now: u64) -> Option<FileParse> {
+    let fallback_ts = file_mtime_secs(path).unwrap_or(now);
+    let content = fs::read_to_string(path).ok()?;
+    let mut events = Vec::new();
+    if !content.contains("tokens") {
+        return Some(FileParse::default());
+    }
+    let Some(val) = parse_json(&content) else {
+        return Some(FileParse::default());
+    };
+    if let Some(role) = val.get_str("role") {
+        if role != "assistant" {
+            return Some(FileParse::default());
+        }
+    }
+    let Some(tokens) = val.get("tokens") else {
+        return Some(FileParse::default());
+    };
+    let input = tokens.get_u64("input");
+    let output = tokens.get_u64("output");
+    let reasoning = tokens.get_u64("reasoning");
+    let cache = tokens.get("cache");
+    let cache_read = cache.map(|c| c.get_u64("read")).unwrap_or(0);
+    let cache_write = cache.map(|c| c.get_u64("write")).unwrap_or(0);
+    if input == 0 && output == 0 && reasoning == 0 && cache_read == 0 && cache_write == 0 {
+        return Some(FileParse::default());
+    }
+
+    let model = val
+        .get_str("modelID")
+        .or_else(|| val.get_str("model"))
+        .unwrap_or("opencode-unknown")
+        .to_string();
+    let session_key = val
+        .get_str("sessionID")
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            path.parent()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        });
+    let ts = val
+        .get("time")
+        .and_then(|t| t.get("completed").or_else(|| t.get("created")))
+        .and_then(parse_timestamp)
+        .unwrap_or(fallback_ts);
+    let cost = val.get_f64("cost").unwrap_or(0.0);
+
+    events.push(UsageEvent {
+        agent_id: "opencode",
+        agent_name: "OpenCode",
+        model,
+        session_key,
+        timestamp: ts,
+        input_tokens: input,
+        output_tokens: output,
+        cache_read_tokens: cache_read,
+        cache_write_tokens: cache_write,
+        reasoning_tokens: reasoning,
+        requests: 1,
+        cost_usd: cost,
+    });
+    Some(FileParse {
+        events,
+        codex_quota: None,
+    })
 }
 
 // ============================================================================
@@ -1656,5 +1869,22 @@ impl<'a> JsonParser<'a> {
         }
         let s = std::str::from_utf8(&self.bytes[start..self.pos]).ok()?;
         s.parse::<f64>().ok()
+    }
+}
+
+#[cfg(test)]
+mod keychain_tests {
+    use super::keychain_output_to_json;
+
+    #[test]
+    fn keychain_output_accepts_plain_json_and_trims() {
+        let out = keychain_output_to_json("  {\"claudeAiOauth\":{}}\n").unwrap();
+        assert_eq!(out, "{\"claudeAiOauth\":{}}");
+    }
+
+    #[test]
+    fn keychain_output_rejects_non_json() {
+        assert!(keychain_output_to_json("7b2263").is_none());
+        assert!(keychain_output_to_json("").is_none());
     }
 }
