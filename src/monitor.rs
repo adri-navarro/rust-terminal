@@ -1,7 +1,17 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
+#[cfg(not(target_os = "macos"))]
+use std::collections::HashSet;
+#[cfg(not(target_os = "macos"))]
 use std::ffi::CString;
+#[cfg(not(target_os = "macos"))]
 use std::fs;
 use std::time::Instant;
+
+#[cfg(target_os = "macos")]
+#[path = "monitor_macos.rs"]
+mod macos;
+#[cfg(target_os = "macos")]
+use macos::{read_disks, read_loadavg, read_memory, read_uptime};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessSort {
@@ -70,6 +80,7 @@ pub struct SystemSnapshot {
     pub running_processes: usize,
 }
 
+#[cfg(not(target_os = "macos"))]
 #[derive(Debug, Clone, Copy, Default)]
 struct CpuTicks {
     total: u64,
@@ -77,19 +88,26 @@ struct CpuTicks {
 }
 
 pub struct SystemMonitor {
+    #[cfg(not(target_os = "macos"))]
     prev_total_cpu: Option<CpuTicks>,
+    #[cfg(not(target_os = "macos"))]
     prev_core_cpu: Vec<CpuTicks>,
     prev_proc_ticks: HashMap<i32, u64>,
     prev_sample_time: Option<Instant>,
     cpu_history: VecDeque<f32>,
     ram_history: VecDeque<f32>,
+    #[cfg(not(target_os = "macos"))]
     page_size: u64,
+    /// Total CPU % computed by the previous `read_processes` (macOS has no cheap system-wide counter).
+    #[cfg(target_os = "macos")]
+    last_cpu_total: f32,
     clk_tck: f64,
     num_cpus: usize,
 }
 
 impl SystemMonitor {
     pub fn new() -> Self {
+        #[cfg(not(target_os = "macos"))]
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as u64;
         let clk_tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(100) as f64;
         let num_cpus = std::thread::available_parallelism()
@@ -97,13 +115,18 @@ impl SystemMonitor {
             .unwrap_or(1);
 
         Self {
+            #[cfg(not(target_os = "macos"))]
             prev_total_cpu: None,
+            #[cfg(not(target_os = "macos"))]
             prev_core_cpu: Vec::new(),
             prev_proc_ticks: HashMap::new(),
             prev_sample_time: None,
             cpu_history: VecDeque::with_capacity(48),
             ram_history: VecDeque::with_capacity(48),
+            #[cfg(not(target_os = "macos"))]
             page_size,
+            #[cfg(target_os = "macos")]
+            last_cpu_total: 0.0,
             clk_tck,
             num_cpus,
         }
@@ -152,7 +175,10 @@ impl SystemMonitor {
             running_processes,
         }
     }
+}
 
+#[cfg(not(target_os = "macos"))]
+impl SystemMonitor {
     fn read_cpu(&mut self) -> (f32, Vec<f32>) {
         let Ok(content) = fs::read_to_string("/proc/stat") else {
             return (0.0, Vec::new());
@@ -319,6 +345,7 @@ pub fn send_process_signal(pid: i32, sig: i32) -> Result<(), String> {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn parse_cpu_ticks(rest: &str) -> CpuTicks {
     let nums: Vec<u64> = rest
         .split_whitespace()
@@ -329,6 +356,7 @@ fn parse_cpu_ticks(rest: &str) -> CpuTicks {
     CpuTicks { total, idle }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn calc_cpu_pct(prev: CpuTicks, cur: CpuTicks) -> f32 {
     let dt = cur.total.saturating_sub(prev.total);
     if dt == 0 {
@@ -339,6 +367,7 @@ fn calc_cpu_pct(prev: CpuTicks, cur: CpuTicks) -> f32 {
     ((busy as f64 / dt as f64) * 100.0).clamp(0.0, 100.0) as f32
 }
 
+#[cfg(not(target_os = "macos"))]
 fn read_memory() -> MemoryInfo {
     let mut mem_total = 0u64;
     let mut mem_free = 0u64;
@@ -390,6 +419,7 @@ fn read_memory() -> MemoryInfo {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn read_disks() -> Vec<DiskInfo> {
     let mut disks = Vec::new();
     let mut seen_devices = HashSet::new();
@@ -488,6 +518,7 @@ fn read_disks() -> Vec<DiskInfo> {
     disks
 }
 
+#[cfg(not(target_os = "macos"))]
 fn read_loadavg() -> (f32, f32, f32) {
     if let Ok(text) = fs::read_to_string("/proc/loadavg") {
         let mut parts = text.split_whitespace();
@@ -499,6 +530,7 @@ fn read_loadavg() -> (f32, f32, f32) {
     (0.0, 0.0, 0.0)
 }
 
+#[cfg(not(target_os = "macos"))]
 fn read_uptime() -> u64 {
     if let Ok(text) = fs::read_to_string("/proc/uptime") {
         if let Some(first) = text.split_whitespace().next() {
