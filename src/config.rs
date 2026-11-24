@@ -97,6 +97,14 @@ impl Theme {
         Self::ALL_NAMES[(idx + 1) % Self::ALL_NAMES.len()]
     }
 
+    pub fn prev_name(current: &str) -> &'static str {
+        let idx = Self::ALL_NAMES
+            .iter()
+            .position(|n| n.eq_ignore_ascii_case(current))
+            .unwrap_or(0);
+        Self::ALL_NAMES[(idx + Self::ALL_NAMES.len() - 1) % Self::ALL_NAMES.len()]
+    }
+
     pub fn catppuccin_mocha() -> Self {
         Self {
             name: "catppuccin-mocha",
@@ -304,11 +312,113 @@ impl Theme {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShortcutKey {
+    Char(char),
+    Function(u8),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Shortcut {
+    pub ctrl: bool,
+    pub shift: bool,
+    pub alt: bool,
+    pub key: ShortcutKey,
+}
+
+impl Shortcut {
+    pub fn parse(input: &str) -> Option<Self> {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let mut ctrl = false;
+        let mut shift = false;
+        let mut alt = false;
+        let mut key: Option<ShortcutKey> = None;
+
+        for raw in trimmed.split('+') {
+            let part = raw.trim();
+            if part.is_empty() {
+                continue;
+            }
+            match part.to_ascii_lowercase().as_str() {
+                "ctrl" | "control" => ctrl = true,
+                "shift" => shift = true,
+                "alt" | "opt" | "option" => alt = true,
+                other => {
+                    if key.is_some() {
+                        return None;
+                    }
+                    if let Some(rest) = other.strip_prefix('f') {
+                        if let Ok(n) = rest.parse::<u8>() {
+                            if (1..=12).contains(&n) {
+                                key = Some(ShortcutKey::Function(n));
+                                continue;
+                            }
+                        }
+                    }
+                    let mut chars = other.chars();
+                    let ch = chars.next()?;
+                    if chars.next().is_some() || ch.is_control() || ch.is_whitespace() {
+                        return None;
+                    }
+                    key = Some(ShortcutKey::Char(ch.to_ascii_lowercase()));
+                }
+            }
+        }
+
+        let key = key?;
+        // Require Ctrl or Alt for non-function keys so normal typing isn't hijacked
+        if matches!(key, ShortcutKey::Char(_)) && !ctrl && !alt {
+            return None;
+        }
+        Some(Self {
+            ctrl,
+            shift,
+            alt,
+            key,
+        })
+    }
+
+    pub fn format(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if self.ctrl {
+            parts.push("Ctrl".to_string());
+        }
+        if self.shift {
+            parts.push("Shift".to_string());
+        }
+        if self.alt {
+            parts.push("Alt".to_string());
+        }
+        match self.key {
+            ShortcutKey::Char(ch) => parts.push(ch.to_ascii_uppercase().to_string()),
+            ShortcutKey::Function(n) => parts.push(format!("F{n}")),
+        }
+        parts.join("+")
+    }
+}
+
+pub const DEFAULT_TERMINAL_FONT_SIZE: f32 = 19.0;
+pub const DEFAULT_COMMANDS_FONT_SIZE: f32 = 18.0;
+pub const DEFAULT_MONITOR_FONT_SIZE: f32 = 18.0;
+pub const DEFAULT_USAGE_FONT_SIZE: f32 = 18.0;
+pub const DEFAULT_SHORTCUT_COMMANDS: &str = "Ctrl+P";
+pub const DEFAULT_SHORTCUT_MONITOR: &str = "Ctrl+M";
+pub const DEFAULT_SHORTCUT_USAGE: &str = "Ctrl+U";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub theme: String,
     pub font_size: f32,
+    pub commands_font_size: f32,
+    pub monitor_font_size: f32,
+    pub usage_font_size: f32,
+    pub shortcut_commands: String,
+    pub shortcut_monitor: String,
+    pub shortcut_usage: String,
     pub font_path: Option<String>,
     pub line_height: f32,
     pub padding_x: usize,
@@ -327,7 +437,13 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             theme: "catppuccin-mocha".to_string(),
-            font_size: 15.0,
+            font_size: DEFAULT_TERMINAL_FONT_SIZE,
+            commands_font_size: DEFAULT_COMMANDS_FONT_SIZE,
+            monitor_font_size: DEFAULT_MONITOR_FONT_SIZE,
+            usage_font_size: DEFAULT_USAGE_FONT_SIZE,
+            shortcut_commands: DEFAULT_SHORTCUT_COMMANDS.to_string(),
+            shortcut_monitor: DEFAULT_SHORTCUT_MONITOR.to_string(),
+            shortcut_usage: DEFAULT_SHORTCUT_USAGE.to_string(),
             font_path: None,
             line_height: 1.25,
             padding_x: 14,
@@ -345,6 +461,21 @@ impl Default for Config {
 }
 
 impl Config {
+    pub fn commands_shortcut(&self) -> Shortcut {
+        Shortcut::parse(&self.shortcut_commands)
+            .unwrap_or_else(|| Shortcut::parse(DEFAULT_SHORTCUT_COMMANDS).unwrap())
+    }
+
+    pub fn monitor_shortcut(&self) -> Shortcut {
+        Shortcut::parse(&self.shortcut_monitor)
+            .unwrap_or_else(|| Shortcut::parse(DEFAULT_SHORTCUT_MONITOR).unwrap())
+    }
+
+    pub fn usage_shortcut(&self) -> Shortcut {
+        Shortcut::parse(&self.shortcut_usage)
+            .unwrap_or_else(|| Shortcut::parse(DEFAULT_SHORTCUT_USAGE).unwrap())
+    }
+
     pub fn config_path() -> PathBuf {
         dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))

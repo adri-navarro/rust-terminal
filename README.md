@@ -45,11 +45,13 @@ Run only the built-in interactive shell inside your current terminal:
 | `Alt+Right` | Accept next word of inline autosuggestion |
 | `Ctrl+T` / `Ctrl+W` | New tab (inherits CWD) / close tab |
 | `Ctrl+Tab` / `Alt+1..9` | Switch tabs |
+| `Ctrl+C` / `Ctrl+V` | Copy active selection (sends `SIGINT` if no selection) / paste clipboard |
 | `Ctrl+Shift+C` / `V` | Copy / paste clipboard |
 | `Ctrl+=` / `-` / `0` | Font zoom in / out / reset |
 | `F2` / `Ctrl+Shift+K` | Cycle color theme live |
 | `Ctrl+U` / `F3` | Toggle top-right Agent & Model Usage tab |
 | `Ctrl+M` / `F4` | Toggle btop-style System Monitor tab (CPU, RAM, Disks, Processes) |
+| `Ctrl+P` / `F5` | Toggle Commands tab (launch, stop & edit commands in any directory) |
 | `Ctrl+Shift+R` | Live-reload `~/.config/itsadri-terminal/config.toml` |
 | `Shift+PageUp/Down/End` | Scroll through scrollback buffer |
 

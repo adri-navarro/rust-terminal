@@ -1,34 +1,109 @@
 pub mod font;
 pub mod renderer;
 
-use crate::config::{Config, Theme};
+use crate::commands::{CommandEvent, CommandManager, CommandStatus, expand_directory};
+use crate::config::{
+    Config, DEFAULT_COMMANDS_FONT_SIZE, DEFAULT_MONITOR_FONT_SIZE, DEFAULT_SHORTCUT_COMMANDS,
+    DEFAULT_SHORTCUT_MONITOR, DEFAULT_SHORTCUT_USAGE, DEFAULT_TERMINAL_FONT_SIZE,
+    DEFAULT_USAGE_FONT_SIZE, Shortcut, ShortcutKey, Theme,
+};
 use crate::history::{FuzzyMatch, HistoryStore};
 use crate::monitor::{ProcessSort, SystemMonitor, SystemSnapshot, send_process_signal, sort_processes};
 use crate::terminal::TerminalTab;
 use crate::ui::font::FontEngine;
 use crate::ui::renderer::{
-    HistoryPaletteView, MonitorViewState, TAB_BAR_H, TabBarHitZones, TabSummary, UsageViewState,
-    render_frame, viewport_bounds,
+    CommandFormField, CommandFormView, CommandsViewState, HistoryPaletteView, MonitorViewState,
+    SettingsFontTarget, SettingsShortcutTarget, SettingsViewState, TAB_BAR_H, TabBarHitZones,
+    TabSummary, UsageViewState, render_frame, viewport_bounds,
 };
 use crate::usage::{TimeRange, UsageReport, scan_local_usage};
 use arboard::Clipboard;
 use softbuffer::{Context, Surface};
+use std::io::Write;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 #[derive(Debug)]
 pub enum UserEvent {
     PtyWake,
     UsageUpdated(UsageReport),
+    CommandEvent(CommandEvent),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandFormMode {
+    Add,
+    Edit(u64),
+}
+
+struct CommandFormState {
+    mode: CommandFormMode,
+    command_input: String,
+    directory_input: String,
+    active_field: CommandFormField,
+    error: Option<String>,
+}
+
+struct CommandsTabState {
+    open: bool,
+    manager: CommandManager,
+    selected: usize,
+    scroll: usize,
+    log_scroll: usize,
+    form: Option<CommandFormState>,
+}
+
+impl CommandsTabState {
+    fn new() -> Self {
+        Self {
+            open: false,
+            manager: CommandManager::load(),
+            selected: 0,
+            scroll: 0,
+            log_scroll: 0,
+            form: None,
+        }
+    }
+
+    fn clamp_selection(&mut self) {
+        let len = self.manager.entries.len();
+        if len == 0 {
+            self.selected = 0;
+            self.scroll = 0;
+        } else {
+            self.selected = self.selected.min(len - 1);
+            self.scroll = self.scroll.min(len - 1);
+        }
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        let len = self.manager.entries.len();
+        if len == 0 {
+            return;
+        }
+        if delta < 0 {
+            self.selected = self.selected.saturating_sub((-delta) as usize);
+        } else {
+            self.selected = (self.selected + delta as usize).min(len - 1);
+        }
+        self.log_scroll = 0;
+        if self.selected < self.scroll {
+            self.scroll = self.selected;
+        } else if self.selected >= self.scroll + 6 {
+            self.scroll = self.selected.saturating_sub(5);
+        }
+    }
 }
 
 struct MonitorTabState {
@@ -91,6 +166,42 @@ impl MonitorTabState {
             self.scroll = self.selected;
         } else if self.selected >= self.scroll + 12 {
             self.scroll = self.selected.saturating_sub(11);
+        }
+    }
+}
+
+struct SettingsTabState {
+    open: bool,
+    selected: usize,
+    recording_shortcut: Option<SettingsShortcutTarget>,
+    error: Option<String>,
+    scroll: usize,
+}
+
+impl SettingsTabState {
+    const ROW_COUNT: usize = 8;
+
+    fn new() -> Self {
+        Self {
+            open: false,
+            selected: 0,
+            recording_shortcut: None,
+            error: None,
+            scroll: 0,
+        }
+    }
+
+    fn close(&mut self) {
+        self.open = false;
+        self.recording_shortcut = None;
+        self.error = None;
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        if delta < 0 {
+            self.selected = self.selected.saturating_sub((-delta) as usize);
+        } else {
+            self.selected = (self.selected + delta as usize).min(Self::ROW_COUNT - 1);
         }
     }
 }
@@ -183,6 +294,8 @@ struct TerminalApp {
     palette: HistoryPaletteState,
     usage: UsageTabState,
     monitor: MonitorTabState,
+    commands: CommandsTabState,
+    settings: SettingsTabState,
     toast: Option<(String, Instant)>,
 
     cursor_blink_on: bool,
@@ -226,6 +339,8 @@ impl TerminalApp {
             palette: HistoryPaletteState::new(),
             usage: UsageTabState::new(),
             monitor: MonitorTabState::new(),
+            commands: CommandsTabState::new(),
+            settings: SettingsTabState::new(),
             toast: None,
             cursor_blink_on: true,
             last_blink: Instant::now(),
@@ -310,6 +425,66 @@ impl TerminalApp {
         Some((row.min(rows - 1), col.min(cols - 1)))
     }
 
+    fn set_clipboard_text(&mut self, text: &str) -> bool {
+        #[cfg(target_os = "linux")]
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            if let Ok(mut child) = Command::new("wl-copy")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                let wrote = child
+                    .stdin
+                    .take()
+                    .map(|mut stdin| stdin.write_all(text.as_bytes()).is_ok())
+                    .unwrap_or(false);
+                if let Ok(status) = child.wait() {
+                    if wrote && status.success() {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        if self.clipboard.is_none() {
+            self.clipboard = Clipboard::new().ok();
+        }
+        if let Some(ref mut cb) = self.clipboard {
+            if cb.set_text(text.to_string()).is_ok() {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn get_clipboard_text(&mut self) -> Option<String> {
+        #[cfg(target_os = "linux")]
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            if let Ok(out) = Command::new("wl-paste")
+                .arg("--no-newline")
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+            {
+                if out.status.success() {
+                    let s = String::from_utf8_lossy(&out.stdout).into_owned();
+                    if !s.is_empty() {
+                        return Some(s);
+                    }
+                }
+            }
+        }
+
+        if self.clipboard.is_none() {
+            self.clipboard = Clipboard::new().ok();
+        }
+        self.clipboard
+            .as_mut()
+            .and_then(|c| c.get_text().ok())
+            .filter(|t| !t.is_empty())
+    }
+
     fn copy_selection(&mut self) {
         let Some(tab) = self.tabs.get(self.active_tab) else {
             return;
@@ -322,19 +497,14 @@ impl TerminalApp {
         } else {
             String::new()
         };
-        if !text.is_empty() {
-            if let Some(ref mut cb) = self.clipboard {
-                if cb.set_text(text).is_ok() {
-                    self.show_toast("Copied to clipboard");
-                }
-            }
+        if !text.is_empty() && self.set_clipboard_text(&text) {
+            self.show_toast("Copied to clipboard");
         }
     }
 
     fn paste_clipboard(&mut self) {
-        let text = match self.clipboard.as_mut().and_then(|c| c.get_text().ok()) {
-            Some(t) if !t.is_empty() => t,
-            _ => return,
+        let Some(text) = self.get_clipboard_text() else {
+            return;
         };
         if self.palette.open {
             let clean = text.replace(['\r', '\n'], " ");
@@ -343,8 +513,28 @@ impl TerminalApp {
             self.request_redraw();
             return;
         }
-        if let Some(tab) = self.tabs.get(self.active_tab) {
-            let bracketed = tab.grid.lock().map(|g| g.bracketed_paste).unwrap_or(false);
+        if self.commands.open {
+            if let Some(ref mut form) = self.commands.form {
+                let clean = text.replace(['\r', '\n'], " ");
+                match form.active_field {
+                    CommandFormField::Command => form.command_input.push_str(&clean),
+                    CommandFormField::Directory => form.directory_input.push_str(&clean),
+                }
+                form.error = None;
+                self.request_redraw();
+            }
+            return;
+        }
+        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            tab.selection = None;
+            let bracketed = tab
+                .grid
+                .lock()
+                .map(|mut g| {
+                    g.reset_scroll();
+                    g.bracketed_paste
+                })
+                .unwrap_or(false);
             if bracketed {
                 tab.write_bytes(b"\x1b[200~");
                 tab.write_bytes(text.as_bytes());
@@ -352,6 +542,9 @@ impl TerminalApp {
             } else {
                 tab.write_bytes(text.as_bytes());
             }
+            self.last_input = Instant::now();
+            self.cursor_blink_on = true;
+            self.request_redraw();
         }
     }
 
@@ -406,6 +599,8 @@ impl TerminalApp {
         if self.usage.open {
             self.palette.open = false;
             self.monitor.open = false;
+            self.commands.open = false;
+            self.settings.close();
             let stale = self
                 .usage
                 .last_scan
@@ -423,26 +618,611 @@ impl TerminalApp {
         if self.monitor.open {
             self.palette.open = false;
             self.usage.open = false;
+            self.commands.open = false;
+            self.settings.close();
             self.monitor.refresh();
         }
         self.request_redraw();
     }
 
-    fn handle_monitor_key(&mut self, key: &Key, event_loop: &ActiveEventLoop) {
+    fn toggle_commands_tab(&mut self) {
+        self.commands.open = !self.commands.open;
+        if self.commands.open {
+            self.palette.open = false;
+            self.usage.open = false;
+            self.monitor.open = false;
+            self.settings.close();
+            self.commands.clamp_selection();
+        }
+        self.request_redraw();
+    }
+
+    fn toggle_settings_tab(&mut self) {
+        self.settings.open = !self.settings.open;
+        self.settings.recording_shortcut = None;
+        self.settings.error = None;
+        if self.settings.open {
+            self.palette.open = false;
+            self.usage.open = false;
+            self.monitor.open = false;
+            self.commands.open = false;
+        }
+        self.request_redraw();
+    }
+
+    fn set_theme(&mut self, name: &str) {
+        let new_theme = Theme::by_name(name);
+        let canonical = new_theme.name;
+        self.theme = new_theme;
+        self.cfg.theme = canonical.to_string();
+        let _ = self.cfg.save();
+        self.show_toast(format!("Theme: {canonical}"));
+    }
+
+    fn adjust_view_font_size(&mut self, target: SettingsFontTarget, delta: f32) {
+        let (label, next) = match target {
+            SettingsFontTarget::Terminal => {
+                let v = if delta == 0.0 {
+                    DEFAULT_TERMINAL_FONT_SIZE
+                } else {
+                    (self.cfg.font_size + delta).clamp(9.0, 36.0)
+                };
+                self.cfg.font_size = v;
+                self.font.set_size(v, self.cfg.line_height);
+                self.resize_all_tabs();
+                ("Terminal", v)
+            }
+            SettingsFontTarget::Commands => {
+                let v = if delta == 0.0 {
+                    DEFAULT_COMMANDS_FONT_SIZE
+                } else {
+                    (self.cfg.commands_font_size + delta).clamp(9.0, 36.0)
+                };
+                self.cfg.commands_font_size = v;
+                ("Commands", v)
+            }
+            SettingsFontTarget::Monitor => {
+                let v = if delta == 0.0 {
+                    DEFAULT_MONITOR_FONT_SIZE
+                } else {
+                    (self.cfg.monitor_font_size + delta).clamp(9.0, 36.0)
+                };
+                self.cfg.monitor_font_size = v;
+                ("Monitor", v)
+            }
+            SettingsFontTarget::Usage => {
+                let v = if delta == 0.0 {
+                    DEFAULT_USAGE_FONT_SIZE
+                } else {
+                    (self.cfg.usage_font_size + delta).clamp(9.0, 36.0)
+                };
+                self.cfg.usage_font_size = v;
+                ("Usage", v)
+            }
+        };
+        let _ = self.cfg.save();
+        self.show_toast(format!("{label} font: {}px", next.round() as i32));
+    }
+
+    fn assign_shortcut(&mut self, target: SettingsShortcutTarget, sc: Shortcut) {
+        // Check for duplicate bindings across the 3 customizable tab shortcuts
+        let others: [(SettingsShortcutTarget, &str, Shortcut); 3] = [
+            (SettingsShortcutTarget::Commands, "Commands", self.cfg.commands_shortcut()),
+            (SettingsShortcutTarget::Monitor, "Monitor", self.cfg.monitor_shortcut()),
+            (SettingsShortcutTarget::Usage, "Usage", self.cfg.usage_shortcut()),
+        ];
+        for (other_t, other_name, other_sc) in others {
+            if other_t != target && other_sc == sc {
+                self.settings.error = Some(format!(
+                    "{} is already assigned to {other_name}.",
+                    sc.format()
+                ));
+                self.request_redraw();
+                return;
+            }
+        }
+
+        let formatted = sc.format();
+        let label = match target {
+            SettingsShortcutTarget::Commands => {
+                self.cfg.shortcut_commands = formatted.clone();
+                "Commands"
+            }
+            SettingsShortcutTarget::Monitor => {
+                self.cfg.shortcut_monitor = formatted.clone();
+                "Monitor"
+            }
+            SettingsShortcutTarget::Usage => {
+                self.cfg.shortcut_usage = formatted.clone();
+                "Usage"
+            }
+        };
+        self.settings.recording_shortcut = None;
+        self.settings.error = None;
+        let _ = self.cfg.save();
+        self.show_toast(format!("{label} shortcut: {formatted}"));
+    }
+
+    fn reset_shortcut(&mut self, target: SettingsShortcutTarget) {
+        let (label, def) = match target {
+            SettingsShortcutTarget::Commands => {
+                self.cfg.shortcut_commands = DEFAULT_SHORTCUT_COMMANDS.to_string();
+                ("Commands", DEFAULT_SHORTCUT_COMMANDS)
+            }
+            SettingsShortcutTarget::Monitor => {
+                self.cfg.shortcut_monitor = DEFAULT_SHORTCUT_MONITOR.to_string();
+                ("Monitor", DEFAULT_SHORTCUT_MONITOR)
+            }
+            SettingsShortcutTarget::Usage => {
+                self.cfg.shortcut_usage = DEFAULT_SHORTCUT_USAGE.to_string();
+                ("Usage", DEFAULT_SHORTCUT_USAGE)
+            }
+        };
+        self.settings.recording_shortcut = None;
+        self.settings.error = None;
+        let _ = self.cfg.save();
+        self.show_toast(format!("{label} shortcut reset to {def}"));
+    }
+
+    fn reset_all_settings(&mut self) {
+        let def = Config::default();
+        self.cfg.font_size = def.font_size;
+        self.cfg.commands_font_size = def.commands_font_size;
+        self.cfg.monitor_font_size = def.monitor_font_size;
+        self.cfg.usage_font_size = def.usage_font_size;
+        self.cfg.theme = def.theme.clone();
+        self.cfg.shortcut_commands = def.shortcut_commands;
+        self.cfg.shortcut_monitor = def.shortcut_monitor;
+        self.cfg.shortcut_usage = def.shortcut_usage;
+        self.theme = Theme::by_name(&self.cfg.theme);
+        self.font.set_size(self.cfg.font_size, self.cfg.line_height);
+        self.resize_all_tabs();
+        self.settings.recording_shortcut = None;
+        self.settings.error = None;
+        let _ = self.cfg.save();
+        self.show_toast("Settings reset to defaults");
+    }
+
+    fn try_handle_global_tab_shortcut(&mut self, key: &Key, physical_key: PhysicalKey) -> bool {
         let ctrl = self.modifiers.control_key();
         let shift = self.modifiers.shift_key();
         let alt = self.modifiers.alt_key();
 
+        // Configured tab shortcuts take highest priority
+        if matches_configured_shortcut(self.cfg.commands_shortcut(), key, physical_key, ctrl, shift, alt) {
+            self.toggle_commands_tab();
+            return true;
+        }
+        if matches_configured_shortcut(self.cfg.monitor_shortcut(), key, physical_key, ctrl, shift, alt) {
+            self.toggle_monitor_tab();
+            return true;
+        }
+        if matches_configured_shortcut(self.cfg.usage_shortcut(), key, physical_key, ctrl, shift, alt) {
+            self.toggle_usage_tab();
+            return true;
+        }
+
+        // Settings tab shortcut: Ctrl+, or F6
+        if (ctrl && !alt && !shift && matches!(key, Key::Character(c) if c.as_str() == ","))
+            || (!ctrl && !alt && !shift && matches!(key, Key::Named(NamedKey::F6)))
+        {
+            self.toggle_settings_tab();
+            return true;
+        }
+
+        // Default F-key fallbacks when not overridden by a custom shortcut above
+        if !ctrl && !alt && !shift {
+            match key {
+                Key::Named(NamedKey::F3) => {
+                    self.toggle_usage_tab();
+                    return true;
+                }
+                Key::Named(NamedKey::F4) => {
+                    self.toggle_monitor_tab();
+                    return true;
+                }
+                Key::Named(NamedKey::F5) => {
+                    self.toggle_commands_tab();
+                    return true;
+                }
+                _ => {}
+            }
+        }
+
+        false
+    }
+
+    fn command_event_cb(&self) -> Arc<dyn Fn(CommandEvent) + Send + Sync> {
+        let proxy = self.proxy.clone();
+        Arc::new(move |ev| {
+            let _ = proxy.send_event(UserEvent::CommandEvent(ev));
+        })
+    }
+
+    fn open_add_command_form(&mut self) {
+        let default_dir = self
+            .tabs
+            .get(self.active_tab)
+            .and_then(|t| t.cwd_path())
+            .or_else(|| std::env::current_dir().ok())
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "~".to_string());
+        self.commands.form = Some(CommandFormState {
+            mode: CommandFormMode::Add,
+            command_input: String::new(),
+            directory_input: default_dir,
+            active_field: CommandFormField::Command,
+            error: None,
+        });
+        self.last_input = Instant::now();
+        self.cursor_blink_on = true;
+        self.request_redraw();
+    }
+
+    fn open_edit_command_form(&mut self, id: u64) {
+        if let Some(entry) = self.commands.manager.find_by_id(id) {
+            self.commands.form = Some(CommandFormState {
+                mode: CommandFormMode::Edit(id),
+                command_input: entry.command.clone(),
+                directory_input: entry.directory.clone(),
+                active_field: CommandFormField::Command,
+                error: None,
+            });
+            self.last_input = Instant::now();
+            self.cursor_blink_on = true;
+            self.request_redraw();
+        }
+    }
+
+    fn submit_command_form(&mut self, run_after: bool) {
+        let Some(ref mut form) = self.commands.form else {
+            return;
+        };
+        let cmd = form.command_input.trim().to_string();
+        let dir = form.directory_input.trim().to_string();
+        if cmd.is_empty() {
+            form.error = Some("Command cannot be empty.".to_string());
+            form.active_field = CommandFormField::Command;
+            self.request_redraw();
+            return;
+        }
+        if dir.is_empty() {
+            form.error = Some("Working directory cannot be empty.".to_string());
+            form.active_field = CommandFormField::Directory;
+            self.request_redraw();
+            return;
+        }
+        let resolved = expand_directory(&dir);
+        if !resolved.is_dir() {
+            form.error = Some(format!("Directory does not exist: {}", resolved.display()));
+            form.active_field = CommandFormField::Directory;
+            self.request_redraw();
+            return;
+        }
+
+        let mode = form.mode;
+        self.commands.form = None;
+        let cb = self.command_event_cb();
+
+        match mode {
+            CommandFormMode::Add => {
+                let id = self.commands.manager.add(cmd.clone(), dir);
+                self.commands.selected = self.commands.manager.entries.len().saturating_sub(1);
+                self.commands.log_scroll = 0;
+                if run_after {
+                    match self.commands.manager.start(id, cb) {
+                        Ok(()) => self.show_toast(format!("Launched: {cmd}")),
+                        Err(e) => self.show_toast(e),
+                    }
+                } else {
+                    self.show_toast("Command saved");
+                }
+            }
+            CommandFormMode::Edit(id) => {
+                let was_running = self
+                    .commands
+                    .manager
+                    .find_by_id(id)
+                    .map(|e| e.status.can_stop())
+                    .unwrap_or(false);
+                if run_after && was_running {
+                    let _ = self.commands.manager.stop(id, cb.clone());
+                }
+                self.commands.manager.update(id, cmd.clone(), dir);
+                if run_after {
+                    // If it was stopped or idle, launch immediately; if it was running, reset status and launch new command
+                    if let Some(entry) = self.commands.manager.find_by_id_mut(id) {
+                        if entry.status == CommandStatus::Stopping {
+                            entry.status = CommandStatus::Stopped;
+                            entry.pid = None;
+                        }
+                    }
+                    match self.commands.manager.start(id, cb) {
+                        Ok(()) => self.show_toast(format!("Restarted: {cmd}")),
+                        Err(e) => self.show_toast(e),
+                    }
+                } else if was_running {
+                    self.show_toast("Saved (restart to apply changes)");
+                } else {
+                    self.show_toast("Command updated");
+                }
+            }
+        }
+        self.request_redraw();
+    }
+
+    fn toggle_command_run(&mut self, id: u64) {
+        let cb = self.command_event_cb();
+        let can_stop = self
+            .commands
+            .manager
+            .find_by_id(id)
+            .map(|e| e.status.can_stop())
+            .unwrap_or(false);
+        if can_stop {
+            match self.commands.manager.stop(id, cb) {
+                Ok(msg) => self.show_toast(msg),
+                Err(e) => self.show_toast(e),
+            }
+        } else {
+            match self.commands.manager.start(id, cb) {
+                Ok(()) => self.show_toast("Command started"),
+                Err(e) => self.show_toast(e),
+            }
+        }
+        self.request_redraw();
+    }
+
+    fn delete_command(&mut self, id: u64) {
+        let cb = self.command_event_cb();
+        if self.commands.manager.remove(id, cb) {
+            self.commands.clamp_selection();
+            self.commands.log_scroll = 0;
+            self.show_toast("Command removed");
+        }
+        self.request_redraw();
+    }
+
+    fn handle_commands_key(
+        &mut self,
+        key: &Key,
+        physical_key: PhysicalKey,
+        text: Option<&str>,
+        event_loop: &ActiveEventLoop,
+    ) {
+        let ctrl = self.modifiers.control_key();
+        let shift = self.modifiers.shift_key();
+        let alt = self.modifiers.alt_key();
+
+        // When Add/Edit form is open, route keys to form inputs
+        if self.commands.form.is_some() {
+            match key {
+                Key::Named(NamedKey::Escape) => {
+                    self.commands.form = None;
+                    self.request_redraw();
+                }
+                Key::Named(NamedKey::Tab)
+                | Key::Named(NamedKey::ArrowUp)
+                | Key::Named(NamedKey::ArrowDown) => {
+                    if let Some(ref mut form) = self.commands.form {
+                        form.active_field = match form.active_field {
+                            CommandFormField::Command => CommandFormField::Directory,
+                            CommandFormField::Directory => CommandFormField::Command,
+                        };
+                    }
+                    self.request_redraw();
+                }
+                Key::Named(NamedKey::Enter) => {
+                    let is_add = self
+                        .commands
+                        .form
+                        .as_ref()
+                        .map(|f| matches!(f.mode, CommandFormMode::Add))
+                        .unwrap_or(false);
+                    self.submit_command_form(is_add);
+                }
+                Key::Named(NamedKey::Backspace) => {
+                    if let Some(ref mut form) = self.commands.form {
+                        match form.active_field {
+                            CommandFormField::Command => {
+                                form.command_input.pop();
+                            }
+                            CommandFormField::Directory => {
+                                form.directory_input.pop();
+                            }
+                        }
+                        form.error = None;
+                    }
+                    self.last_input = Instant::now();
+                    self.cursor_blink_on = true;
+                    self.request_redraw();
+                }
+                Key::Named(NamedKey::Space) => {
+                    if let Some(ref mut form) = self.commands.form {
+                        match form.active_field {
+                            CommandFormField::Command => form.command_input.push(' '),
+                            CommandFormField::Directory => form.directory_input.push(' '),
+                        }
+                        form.error = None;
+                    }
+                    self.last_input = Instant::now();
+                    self.cursor_blink_on = true;
+                    self.request_redraw();
+                }
+                _ if ctrl && !alt && matches_shortcut_key(key, physical_key, 'v', KeyCode::KeyV) => {
+                    self.paste_clipboard();
+                }
+                Key::Character(c) if ctrl && c.eq_ignore_ascii_case("u") => {
+                    if let Some(ref mut form) = self.commands.form {
+                        match form.active_field {
+                            CommandFormField::Command => form.command_input.clear(),
+                            CommandFormField::Directory => form.directory_input.clear(),
+                        }
+                        form.error = None;
+                    }
+                    self.request_redraw();
+                }
+                _ => {
+                    if !ctrl && !alt {
+                        if let Some(t) = text {
+                            let filtered: String = t.chars().filter(|c| !c.is_control()).collect();
+                            if !filtered.is_empty() {
+                                if let Some(ref mut form) = self.commands.form {
+                                    match form.active_field {
+                                        CommandFormField::Command => form.command_input.push_str(&filtered),
+                                        CommandFormField::Directory => form.directory_input.push_str(&filtered),
+                                    }
+                                    form.error = None;
+                                }
+                                self.last_input = Instant::now();
+                                self.cursor_blink_on = true;
+                                self.request_redraw();
+                            }
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        // Commands list navigation & actions
+        if self.try_handle_global_tab_shortcut(key, physical_key) {
+            return;
+        }
         match key {
-            Key::Named(NamedKey::Escape) | Key::Named(NamedKey::F4) => {
-                self.monitor.open = false;
+            Key::Named(NamedKey::Escape) => {
+                self.commands.open = false;
                 self.request_redraw();
             }
             Key::Named(NamedKey::F2) => {
                 self.cycle_theme();
             }
-            Key::Named(NamedKey::F3) => {
-                self.toggle_usage_tab();
+            Key::Named(NamedKey::ArrowUp) => {
+                self.commands.move_selection(-1);
+                self.request_redraw();
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                self.commands.move_selection(1);
+                self.request_redraw();
+            }
+            Key::Named(NamedKey::PageUp) => {
+                self.commands.log_scroll = self.commands.log_scroll.saturating_add(5);
+                self.request_redraw();
+            }
+            Key::Named(NamedKey::PageDown) => {
+                self.commands.log_scroll = self.commands.log_scroll.saturating_sub(5);
+                self.request_redraw();
+            }
+            Key::Named(NamedKey::Enter) => {
+                if let Some(entry) = self.commands.manager.entries.get(self.commands.selected) {
+                    let id = entry.id;
+                    self.open_edit_command_form(id);
+                } else {
+                    self.open_add_command_form();
+                }
+            }
+            Key::Named(NamedKey::Space) => {
+                if let Some(entry) = self.commands.manager.entries.get(self.commands.selected) {
+                    let id = entry.id;
+                    self.toggle_command_run(id);
+                }
+            }
+            Key::Named(NamedKey::Delete) => {
+                if let Some(entry) = self.commands.manager.entries.get(self.commands.selected) {
+                    let id = entry.id;
+                    self.delete_command(id);
+                }
+            }
+            Key::Character(c) if ctrl && !alt => match c.to_ascii_lowercase().as_str() {
+                "t" => {
+                    self.commands.open = false;
+                    let cwd = self.tabs.get(self.active_tab).and_then(|t| t.cwd_path());
+                    self.spawn_tab(cwd);
+                }
+                "w" => {
+                    self.close_tab(self.active_tab, event_loop);
+                }
+                "k" if shift => {
+                    self.cycle_theme();
+                }
+                "r" if shift => {
+                    self.reload_config();
+                }
+                _ => {}
+            },
+            Key::Character(c) if alt && !ctrl => {
+                if let Some(d) = c.chars().next().and_then(|ch| ch.to_digit(10)) {
+                    if d >= 1 && (d as usize) <= self.tabs.len() {
+                        self.active_tab = (d as usize) - 1;
+                        self.commands.open = false;
+                        self.request_redraw();
+                    }
+                }
+            }
+            Key::Character(c) if !ctrl && !alt => match c.as_str() {
+                "a" | "A" | "n" | "N" => {
+                    self.open_add_command_form();
+                }
+                "e" | "E" => {
+                    if let Some(entry) = self.commands.manager.entries.get(self.commands.selected) {
+                        let id = entry.id;
+                        self.open_edit_command_form(id);
+                    }
+                }
+                "s" => {
+                    if let Some(entry) = self.commands.manager.entries.get(self.commands.selected) {
+                        let id = entry.id;
+                        self.toggle_command_run(id);
+                    }
+                }
+                "S" => {
+                    let cb = self.command_event_cb();
+                    let n = self.commands.manager.stop_all(cb);
+                    if n > 0 {
+                        self.show_toast(format!("Stopping {n} command(s)..."));
+                    }
+                }
+                "x" | "X" => {
+                    if let Some(entry) = self.commands.manager.entries.get(self.commands.selected) {
+                        let id = entry.id;
+                        self.delete_command(id);
+                    }
+                }
+                "j" => {
+                    self.commands.move_selection(1);
+                    self.request_redraw();
+                }
+                "k" => {
+                    self.commands.move_selection(-1);
+                    self.request_redraw();
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    fn handle_monitor_key(
+        &mut self,
+        key: &Key,
+        physical_key: PhysicalKey,
+        event_loop: &ActiveEventLoop,
+    ) {
+        let ctrl = self.modifiers.control_key();
+        let shift = self.modifiers.shift_key();
+        let alt = self.modifiers.alt_key();
+
+        if self.try_handle_global_tab_shortcut(key, physical_key) {
+            return;
+        }
+
+        match key {
+            Key::Named(NamedKey::Escape) => {
+                self.monitor.open = false;
+                self.request_redraw();
+            }
+            Key::Named(NamedKey::F2) => {
+                self.cycle_theme();
             }
             Key::Named(NamedKey::ArrowUp) => {
                 self.monitor.move_selection(-1);
@@ -464,17 +1244,6 @@ impl TerminalApp {
                 self.kill_selected_process(libc::SIGTERM);
             }
             Key::Character(c) if ctrl && !alt => match c.to_ascii_lowercase().as_str() {
-                "u" => {
-                    self.toggle_usage_tab();
-                }
-                "m" => {
-                    self.monitor.open = false;
-                    self.request_redraw();
-                }
-                "p" if shift => {
-                    self.monitor.open = false;
-                    self.request_redraw();
-                }
                 "t" => {
                     self.monitor.open = false;
                     let cwd = self.tabs.get(self.active_tab).and_then(|t| t.cwd_path());
@@ -558,13 +1327,22 @@ impl TerminalApp {
         }
     }
 
-    fn handle_usage_key(&mut self, key: &Key, event_loop: &ActiveEventLoop) {
+    fn handle_usage_key(
+        &mut self,
+        key: &Key,
+        physical_key: PhysicalKey,
+        event_loop: &ActiveEventLoop,
+    ) {
         let ctrl = self.modifiers.control_key();
         let shift = self.modifiers.shift_key();
         let alt = self.modifiers.alt_key();
 
+        if self.try_handle_global_tab_shortcut(key, physical_key) {
+            return;
+        }
+
         match key {
-            Key::Named(NamedKey::Escape) | Key::Named(NamedKey::F3) => {
+            Key::Named(NamedKey::Escape) => {
                 self.usage.open = false;
                 self.request_redraw();
                 return;
@@ -594,15 +1372,6 @@ impl TerminalApp {
                 return;
             }
             Key::Character(c) if ctrl && !alt => match c.to_ascii_lowercase().as_str() {
-                "u" => {
-                    self.usage.open = false;
-                    self.request_redraw();
-                    return;
-                }
-                "m" => {
-                    self.toggle_monitor_tab();
-                    return;
-                }
                 "t" => {
                     self.usage.open = false;
                     let cwd = self.tabs.get(self.active_tab).and_then(|t| t.cwd_path());
@@ -677,8 +1446,172 @@ impl TerminalApp {
         }
     }
 
-    fn handle_palette_key(&mut self, key: &Key, text: Option<&str>) {
+    fn handle_settings_key(
+        &mut self,
+        key: &Key,
+        physical_key: PhysicalKey,
+        event_loop: &ActiveEventLoop,
+    ) {
         let ctrl = self.modifiers.control_key();
+        let shift = self.modifiers.shift_key();
+        let alt = self.modifiers.alt_key();
+
+        // Recording mode: capture the next non-modifier key combo as the new shortcut
+        if let Some(target) = self.settings.recording_shortcut {
+            if is_modifier_key(key) {
+                return;
+            }
+            if !ctrl && !alt && !shift && matches!(key, Key::Named(NamedKey::Escape)) {
+                self.settings.recording_shortcut = None;
+                self.settings.error = None;
+                self.request_redraw();
+                return;
+            }
+            if let Some(sc) = shortcut_from_winit(key, physical_key, ctrl, shift, alt) {
+                self.assign_shortcut(target, sc);
+            } else {
+                self.settings.error =
+                    Some("Use Ctrl, Alt, or F1–F12 for tab shortcuts (Esc to cancel).".to_string());
+                self.request_redraw();
+            }
+            return;
+        }
+
+        if self.try_handle_global_tab_shortcut(key, physical_key) {
+            return;
+        }
+
+        match key {
+            Key::Named(NamedKey::Escape) => {
+                self.settings.close();
+                self.request_redraw();
+            }
+            Key::Named(NamedKey::F2) => {
+                self.cycle_theme();
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                self.settings.move_selection(-1);
+                self.request_redraw();
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                self.settings.move_selection(1);
+                self.request_redraw();
+            }
+            Key::Named(NamedKey::ArrowLeft) => {
+                match self.settings.selected {
+                    0 => self.adjust_view_font_size(SettingsFontTarget::Terminal, -1.0),
+                    1 => self.adjust_view_font_size(SettingsFontTarget::Commands, -1.0),
+                    2 => self.adjust_view_font_size(SettingsFontTarget::Monitor, -1.0),
+                    3 => self.adjust_view_font_size(SettingsFontTarget::Usage, -1.0),
+                    4 => {
+                        let prev = Theme::prev_name(self.theme.name);
+                        self.set_theme(prev);
+                    }
+                    _ => {}
+                }
+            }
+            Key::Named(NamedKey::ArrowRight) => {
+                match self.settings.selected {
+                    0 => self.adjust_view_font_size(SettingsFontTarget::Terminal, 1.0),
+                    1 => self.adjust_view_font_size(SettingsFontTarget::Commands, 1.0),
+                    2 => self.adjust_view_font_size(SettingsFontTarget::Monitor, 1.0),
+                    3 => self.adjust_view_font_size(SettingsFontTarget::Usage, 1.0),
+                    4 => self.cycle_theme(),
+                    _ => {}
+                }
+            }
+            Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Space) => match self.settings.selected {
+                4 => self.cycle_theme(),
+                5 => {
+                    self.settings.recording_shortcut = Some(SettingsShortcutTarget::Commands);
+                    self.settings.error = None;
+                    self.request_redraw();
+                }
+                6 => {
+                    self.settings.recording_shortcut = Some(SettingsShortcutTarget::Monitor);
+                    self.settings.error = None;
+                    self.request_redraw();
+                }
+                7 => {
+                    self.settings.recording_shortcut = Some(SettingsShortcutTarget::Usage);
+                    self.settings.error = None;
+                    self.request_redraw();
+                }
+                _ => {}
+            },
+            Key::Named(NamedKey::Backspace) | Key::Named(NamedKey::Delete) => {
+                match self.settings.selected {
+                    5 => self.reset_shortcut(SettingsShortcutTarget::Commands),
+                    6 => self.reset_shortcut(SettingsShortcutTarget::Monitor),
+                    7 => self.reset_shortcut(SettingsShortcutTarget::Usage),
+                    _ => {}
+                }
+            }
+            Key::Character(c) if ctrl && !alt => match c.to_ascii_lowercase().as_str() {
+                "t" => {
+                    self.settings.close();
+                    let cwd = self.tabs.get(self.active_tab).and_then(|t| t.cwd_path());
+                    self.spawn_tab(cwd);
+                }
+                "w" => {
+                    self.close_tab(self.active_tab, event_loop);
+                }
+                "k" if shift => {
+                    self.cycle_theme();
+                }
+                "r" if shift => {
+                    self.reload_config();
+                }
+                _ => {}
+            },
+            Key::Character(c) if alt && !ctrl => {
+                if let Some(d) = c.chars().next().and_then(|ch| ch.to_digit(10)) {
+                    if d >= 1 && (d as usize) <= self.tabs.len() {
+                        self.active_tab = (d as usize) - 1;
+                        self.settings.close();
+                        self.request_redraw();
+                    }
+                }
+            }
+            Key::Character(c) if !ctrl && !alt => match c.as_str() {
+                "j" => {
+                    self.settings.move_selection(1);
+                    self.request_redraw();
+                }
+                "k" => {
+                    self.settings.move_selection(-1);
+                    self.request_redraw();
+                }
+                "-" | "_" => match self.settings.selected {
+                    0 => self.adjust_view_font_size(SettingsFontTarget::Terminal, -1.0),
+                    1 => self.adjust_view_font_size(SettingsFontTarget::Commands, -1.0),
+                    2 => self.adjust_view_font_size(SettingsFontTarget::Monitor, -1.0),
+                    3 => self.adjust_view_font_size(SettingsFontTarget::Usage, -1.0),
+                    _ => {}
+                },
+                "+" | "=" => match self.settings.selected {
+                    0 => self.adjust_view_font_size(SettingsFontTarget::Terminal, 1.0),
+                    1 => self.adjust_view_font_size(SettingsFontTarget::Commands, 1.0),
+                    2 => self.adjust_view_font_size(SettingsFontTarget::Monitor, 1.0),
+                    3 => self.adjust_view_font_size(SettingsFontTarget::Usage, 1.0),
+                    _ => {}
+                },
+                "0" => match self.settings.selected {
+                    0 => self.adjust_view_font_size(SettingsFontTarget::Terminal, 0.0),
+                    1 => self.adjust_view_font_size(SettingsFontTarget::Commands, 0.0),
+                    2 => self.adjust_view_font_size(SettingsFontTarget::Monitor, 0.0),
+                    3 => self.adjust_view_font_size(SettingsFontTarget::Usage, 0.0),
+                    _ => {}
+                },
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    fn handle_palette_key(&mut self, key: &Key, physical_key: PhysicalKey, text: Option<&str>) {
+        let ctrl = self.modifiers.control_key();
+        let alt = self.modifiers.alt_key();
         match key {
             Key::Named(NamedKey::Escape) => {
                 self.palette.open = false;
@@ -743,6 +1676,9 @@ impl TerminalApp {
             Key::Character(c) if ctrl && (c.eq_ignore_ascii_case("c") || c.eq_ignore_ascii_case("g")) => {
                 self.palette.open = false;
             }
+            _ if ctrl && !alt && matches_shortcut_key(key, physical_key, 'v', KeyCode::KeyV) => {
+                self.paste_clipboard();
+            }
             Key::Character(c) if ctrl && c.eq_ignore_ascii_case("u") => {
                 self.palette.query.clear();
                 self.palette.selected = 0;
@@ -772,6 +1708,7 @@ impl TerminalApp {
     fn handle_terminal_key(
         &mut self,
         key: &Key,
+        physical_key: PhysicalKey,
         text: Option<&str>,
         event_loop: &ActiveEventLoop,
     ) {
@@ -784,12 +1721,7 @@ impl TerminalApp {
             self.cycle_theme();
             return;
         }
-        if matches!(key, Key::Named(NamedKey::F3)) {
-            self.toggle_usage_tab();
-            return;
-        }
-        if matches!(key, Key::Named(NamedKey::F4)) {
-            self.toggle_monitor_tab();
+        if self.try_handle_global_tab_shortcut(key, physical_key) {
             return;
         }
 
@@ -811,7 +1743,7 @@ impl TerminalApp {
             }
         }
 
-        // Ctrl+T / Ctrl+W / Ctrl+U / Ctrl+M -> new tab / close tab / usage tab / monitor tab
+        // Ctrl+T / Ctrl+W -> new tab / close tab
         if ctrl && !alt {
             if let Key::Character(c) = key {
                 match c.to_ascii_lowercase().as_str() {
@@ -824,12 +1756,33 @@ impl TerminalApp {
                         self.close_tab(self.active_tab, event_loop);
                         return;
                     }
-                    "u" => {
-                        self.toggle_usage_tab();
-                        return;
+                    _ => {}
+                }
+            }
+        }
+
+        // Ctrl+C (when text is selected) -> copy; otherwise falls through to PTY as SIGINT
+        // Ctrl+V -> paste clipboard
+        if ctrl && !shift && !alt {
+            if let Key::Character(c) = key {
+                match c.to_ascii_lowercase().as_str() {
+                    "c" => {
+                        let has_selection = self
+                            .tabs
+                            .get(self.active_tab)
+                            .and_then(|t| t.selection)
+                            .is_some();
+                        if has_selection {
+                            self.copy_selection();
+                            if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                                tab.selection = None;
+                            }
+                            self.request_redraw();
+                            return;
+                        }
                     }
-                    "m" => {
-                        self.toggle_monitor_tab();
+                    "v" => {
+                        self.paste_clipboard();
                         return;
                     }
                     _ => {}
@@ -838,17 +1791,21 @@ impl TerminalApp {
         }
 
         // Ctrl+Shift shortcuts
-        if ctrl && shift {
+        if ctrl && shift && !alt {
+            if matches_shortcut_key(key, physical_key, 'c', KeyCode::KeyC) {
+                self.copy_selection();
+                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                    tab.selection = None;
+                }
+                self.request_redraw();
+                return;
+            }
+            if matches_shortcut_key(key, physical_key, 'v', KeyCode::KeyV) {
+                self.paste_clipboard();
+                return;
+            }
             if let Key::Character(c) = key {
                 match c.to_ascii_lowercase().as_str() {
-                    "c" => {
-                        self.copy_selection();
-                        return;
-                    }
-                    "v" => {
-                        self.paste_clipboard();
-                        return;
-                    }
                     "r" => {
                         self.reload_config();
                         return;
@@ -859,6 +1816,10 @@ impl TerminalApp {
                     }
                     "p" => {
                         self.toggle_monitor_tab();
+                        return;
+                    }
+                    "s" => {
+                        self.toggle_commands_tab();
                         return;
                     }
                     _ => {}
@@ -950,23 +1911,25 @@ impl TerminalApp {
         }
 
         // --- Forward key to active PTY ---
-        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+        let Some(tab) = self.tabs.get(self.active_tab) else {
             return;
         };
-        tab.selection = None;
 
-        let app_cursor = {
-            if let Ok(mut g) = tab.grid.lock() {
-                g.reset_scroll();
-                g.app_cursor_keys
-            } else {
-                false
-            }
-        };
+        let app_cursor = tab
+            .grid
+            .lock()
+            .map(|g| g.app_cursor_keys)
+            .unwrap_or(false);
 
         let bytes = encode_key(key, text, ctrl, shift, alt, app_cursor);
         if !bytes.is_empty() {
-            tab.write_bytes(&bytes);
+            if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                tab.selection = None;
+                if let Ok(mut g) = tab.grid.lock() {
+                    g.reset_scroll();
+                }
+                tab.write_bytes(&bytes);
+            }
             self.last_input = Instant::now();
             self.cursor_blink_on = true;
             self.request_redraw();
@@ -1066,6 +2029,37 @@ impl TerminalApp {
         } else {
             None
         };
+        let cursor_on =
+            self.cursor_blink_on || self.last_input.elapsed() < Duration::from_millis(450);
+        let commands_view = if self.commands.open {
+            Some(CommandsViewState {
+                entries: &self.commands.manager.entries,
+                selected: self.commands.selected,
+                scroll: self.commands.scroll,
+                log_scroll: self.commands.log_scroll,
+                form: self.commands.form.as_ref().map(|f| CommandFormView {
+                    is_edit: matches!(f.mode, CommandFormMode::Edit(_)),
+                    command_input: &f.command_input,
+                    directory_input: &f.directory_input,
+                    active_field: f.active_field,
+                    error: f.error.as_deref(),
+                }),
+                cursor_blink_on: cursor_on,
+            })
+        } else {
+            None
+        };
+        let settings_view = if self.settings.open {
+            Some(SettingsViewState {
+                selected: self.settings.selected,
+                recording_shortcut: self.settings.recording_shortcut,
+                error: self.settings.error.as_deref(),
+                scroll: self.settings.scroll,
+            })
+        } else {
+            None
+        };
+        let active_commands_count = self.commands.manager.active_count();
         let toast_str = self.toast.as_ref().map(|(s, _)| s.as_str());
 
         if let Ok(grid) = tab.grid.lock() {
@@ -1080,10 +2074,13 @@ impl TerminalApp {
                 self.active_tab,
                 &grid,
                 selection,
-                self.cursor_blink_on || self.last_input.elapsed() < Duration::from_millis(450),
+                cursor_on,
                 pal_view.as_ref(),
                 usage_view.as_ref(),
                 monitor_view.as_ref(),
+                commands_view.as_ref(),
+                settings_view.as_ref(),
+                active_commands_count,
                 toast_str,
             );
         }
@@ -1163,6 +2160,10 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
                 self.usage.last_scan = Some(Instant::now());
                 self.request_redraw();
             }
+            UserEvent::CommandEvent(ev) => {
+                self.commands.manager.apply_event(ev);
+                self.request_redraw();
+            }
         }
     }
 
@@ -1224,12 +2225,18 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
             }
         }
 
+        // Live uptime tick while Commands tab is open with active commands
+        if self.commands.open && self.commands.manager.active_count() > 0 {
+            next_wake = next_wake.min(now + Duration::from_secs(1));
+        }
+
         event_loop.set_control_flow(ControlFlow::WaitUntil(next_wake));
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
+                self.commands.manager.shutdown_foreground();
                 event_loop.exit();
             }
             WindowEvent::Resized(new_size) => {
@@ -1255,13 +2262,17 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
                 }
                 let text = event.text.as_deref();
                 if self.palette.open {
-                    self.handle_palette_key(&event.logical_key, text);
+                    self.handle_palette_key(&event.logical_key, event.physical_key, text);
+                } else if self.settings.open {
+                    self.handle_settings_key(&event.logical_key, event.physical_key, event_loop);
+                } else if self.commands.open {
+                    self.handle_commands_key(&event.logical_key, event.physical_key, text, event_loop);
                 } else if self.monitor.open {
-                    self.handle_monitor_key(&event.logical_key, event_loop);
+                    self.handle_monitor_key(&event.logical_key, event.physical_key, event_loop);
                 } else if self.usage.open {
-                    self.handle_usage_key(&event.logical_key, event_loop);
+                    self.handle_usage_key(&event.logical_key, event.physical_key, event_loop);
                 } else {
-                    self.handle_terminal_key(&event.logical_key, text, event_loop);
+                    self.handle_terminal_key(&event.logical_key, event.physical_key, text, event_loop);
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -1289,6 +2300,12 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
                         }
                         // Check tab bar clicks
                         if self.cfg.show_tab_bar && (py as usize) < TAB_BAR_H {
+                            if let Some(r) = self.hit_zones.settings_btn {
+                                if r.contains(px, py) {
+                                    self.toggle_settings_tab();
+                                    return;
+                                }
+                            }
                             if let Some(r) = self.hit_zones.usage_btn {
                                 if r.contains(px, py) {
                                     self.toggle_usage_tab();
@@ -1301,10 +2318,18 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
                                     return;
                                 }
                             }
+                            if let Some(r) = self.hit_zones.commands_btn {
+                                if r.contains(px, py) {
+                                    self.toggle_commands_tab();
+                                    return;
+                                }
+                            }
                             if let Some(r) = self.hit_zones.new_tab_btn {
                                 if r.contains(px, py) {
                                     self.usage.open = false;
                                     self.monitor.open = false;
+                                    self.commands.open = false;
+                                    self.settings.close();
                                     let cwd =
                                         self.tabs.get(self.active_tab).and_then(|t| t.cwd_path());
                                     self.spawn_tab(cwd);
@@ -1315,6 +2340,8 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
                                 if r.contains(px, py) {
                                     self.usage.open = false;
                                     self.monitor.open = false;
+                                    self.commands.open = false;
+                                    self.settings.close();
                                     self.palette.open(&mut self.history);
                                     self.request_redraw();
                                     return;
@@ -1336,6 +2363,183 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
                                     self.active_tab = idx;
                                     self.usage.open = false;
                                     self.monitor.open = false;
+                                    self.commands.open = false;
+                                    self.settings.close();
+                                    self.request_redraw();
+                                    return;
+                                }
+                            }
+                            return;
+                        }
+
+                        // Clicks inside full-screen Settings view
+                        if self.settings.open {
+                            if let Some(r) = self.hit_zones.settings_reset_all_btn {
+                                if r.contains(px, py) {
+                                    self.reset_all_settings();
+                                    return;
+                                }
+                            }
+                            let font_btns = self.hit_zones.settings_font_btns.clone();
+                            for (idx, (target, row_r, minus_r, plus_r)) in font_btns.into_iter().enumerate() {
+                                if minus_r.contains(px, py) {
+                                    self.settings.selected = idx;
+                                    self.settings.recording_shortcut = None;
+                                    self.settings.error = None;
+                                    self.adjust_view_font_size(target, -1.0);
+                                    return;
+                                }
+                                if plus_r.contains(px, py) {
+                                    self.settings.selected = idx;
+                                    self.settings.recording_shortcut = None;
+                                    self.settings.error = None;
+                                    self.adjust_view_font_size(target, 1.0);
+                                    return;
+                                }
+                                if row_r.contains(px, py) {
+                                    self.settings.selected = idx;
+                                    self.settings.recording_shortcut = None;
+                                    self.settings.error = None;
+                                    self.request_redraw();
+                                    return;
+                                }
+                            }
+                            let theme_btns = self.hit_zones.settings_theme_btns.clone();
+                            for (tname, r) in theme_btns {
+                                if r.contains(px, py) {
+                                    self.settings.selected = 4;
+                                    self.settings.recording_shortcut = None;
+                                    self.settings.error = None;
+                                    self.set_theme(tname);
+                                    return;
+                                }
+                            }
+                            let sc_btns = self.hit_zones.settings_shortcut_btns.clone();
+                            for (i, (target, row_r, change_r, reset_r)) in sc_btns.into_iter().enumerate() {
+                                let row_idx = 5 + i;
+                                if reset_r.contains(px, py) {
+                                    self.settings.selected = row_idx;
+                                    self.reset_shortcut(target);
+                                    return;
+                                }
+                                if change_r.contains(px, py) {
+                                    self.settings.selected = row_idx;
+                                    if self.settings.recording_shortcut == Some(target) {
+                                        self.settings.recording_shortcut = None;
+                                    } else {
+                                        self.settings.recording_shortcut = Some(target);
+                                    }
+                                    self.settings.error = None;
+                                    self.request_redraw();
+                                    return;
+                                }
+                                if row_r.contains(px, py) {
+                                    self.settings.selected = row_idx;
+                                    self.settings.recording_shortcut = Some(target);
+                                    self.settings.error = None;
+                                    self.request_redraw();
+                                    return;
+                                }
+                            }
+                            if self.settings.recording_shortcut.is_some() {
+                                self.settings.recording_shortcut = None;
+                                self.settings.error = None;
+                                self.request_redraw();
+                            }
+                            return;
+                        }
+
+                        // Clicks inside full-screen Commands view
+                        if self.commands.open {
+                            if let Some(r) = self.hit_zones.cmd_add_btn {
+                                if r.contains(px, py) {
+                                    self.open_add_command_form();
+                                    return;
+                                }
+                            }
+                            if let Some(r) = self.hit_zones.cmd_stop_all_btn {
+                                if r.contains(px, py) {
+                                    let cb = self.command_event_cb();
+                                    let n = self.commands.manager.stop_all(cb);
+                                    if n > 0 {
+                                        self.show_toast(format!("Stopping {n} command(s)..."));
+                                    }
+                                    return;
+                                }
+                            }
+                            if self.commands.form.is_some() {
+                                if let Some(r) = self.hit_zones.cmd_form_cmd_field {
+                                    if r.contains(px, py) {
+                                        if let Some(ref mut f) = self.commands.form {
+                                            f.active_field = CommandFormField::Command;
+                                        }
+                                        self.request_redraw();
+                                        return;
+                                    }
+                                }
+                                if let Some(r) = self.hit_zones.cmd_form_dir_field {
+                                    if r.contains(px, py) {
+                                        if let Some(ref mut f) = self.commands.form {
+                                            f.active_field = CommandFormField::Directory;
+                                        }
+                                        self.request_redraw();
+                                        return;
+                                    }
+                                }
+                                if let Some(r) = self.hit_zones.cmd_form_primary_btn {
+                                    if r.contains(px, py) {
+                                        let is_add = self
+                                            .commands
+                                            .form
+                                            .as_ref()
+                                            .map(|f| matches!(f.mode, CommandFormMode::Add))
+                                            .unwrap_or(false);
+                                        self.submit_command_form(is_add);
+                                        return;
+                                    }
+                                }
+                                if let Some(r) = self.hit_zones.cmd_form_secondary_btn {
+                                    if r.contains(px, py) {
+                                        let is_edit = self
+                                            .commands
+                                            .form
+                                            .as_ref()
+                                            .map(|f| matches!(f.mode, CommandFormMode::Edit(_)))
+                                            .unwrap_or(false);
+                                        // In Add mode: "Save Only" (run_after = false)
+                                        // In Edit mode: "Save & Run" (run_after = true)
+                                        self.submit_command_form(is_edit);
+                                        return;
+                                    }
+                                }
+                                if let Some(r) = self.hit_zones.cmd_form_cancel_btn {
+                                    if r.contains(px, py) {
+                                        self.commands.form = None;
+                                        self.request_redraw();
+                                        return;
+                                    }
+                                }
+                            }
+                            let cmd_rows = self.hit_zones.cmd_rows.clone();
+                            for row in cmd_rows {
+                                if row.toggle_btn.contains(px, py) {
+                                    self.commands.selected = row.index;
+                                    self.commands.log_scroll = 0;
+                                    self.toggle_command_run(row.id);
+                                    return;
+                                }
+                                if row.edit_btn.contains(px, py) {
+                                    self.commands.selected = row.index;
+                                    self.open_edit_command_form(row.id);
+                                    return;
+                                }
+                                if row.delete_btn.contains(px, py) {
+                                    self.delete_command(row.id);
+                                    return;
+                                }
+                                if row.row_rect.contains(px, py) {
+                                    self.commands.selected = row.index;
+                                    self.commands.log_scroll = 0;
                                     self.request_redraw();
                                     return;
                                 }
@@ -1465,6 +2669,54 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
                     }
                     return;
                 }
+                if self.settings.open {
+                    let lines = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => y as isize,
+                        MouseScrollDelta::PixelDelta(p) => (p.y / 24.0).round() as isize,
+                    };
+                    if lines > 0 {
+                        self.settings.scroll = self.settings.scroll.saturating_sub(lines as usize);
+                        self.request_redraw();
+                    } else if lines < 0 {
+                        self.settings.scroll =
+                            (self.settings.scroll.saturating_add((-lines) as usize)).min(12);
+                        self.request_redraw();
+                    }
+                    return;
+                }
+                if self.commands.open {
+                    let lines = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => y as isize,
+                        MouseScrollDelta::PixelDelta(p) => (p.y / 24.0).round() as isize,
+                    };
+                    let (px, py) = self.cursor_pos;
+                    let over_logs = self
+                        .hit_zones
+                        .cmd_log_area
+                        .map(|r| r.contains(px, py))
+                        .unwrap_or(false);
+                    if over_logs {
+                        if lines > 0 {
+                            self.commands.log_scroll =
+                                self.commands.log_scroll.saturating_add(lines as usize);
+                        } else if lines < 0 {
+                            self.commands.log_scroll =
+                                self.commands.log_scroll.saturating_sub((-lines) as usize);
+                        }
+                    } else {
+                        let max_scroll = self.commands.manager.entries.len().saturating_sub(1);
+                        if lines > 0 {
+                            self.commands.scroll =
+                                self.commands.scroll.saturating_sub(lines as usize);
+                        } else if lines < 0 {
+                            self.commands.scroll =
+                                (self.commands.scroll.saturating_add((-lines) as usize))
+                                    .min(max_scroll);
+                        }
+                    }
+                    self.request_redraw();
+                    return;
+                }
                 if self.monitor.open {
                     let lines = match delta {
                         MouseScrollDelta::LineDelta(_, y) => y as isize,
@@ -1521,7 +2773,242 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
     }
 }
 
-fn encode_key(
+pub(crate) fn matches_shortcut_key(
+    key: &Key,
+    physical_key: PhysicalKey,
+    letter: char,
+    code: KeyCode,
+) -> bool {
+    let lower = letter.to_ascii_lowercase();
+    if let Key::Character(c) = key {
+        if let Some(ch) = c.chars().next() {
+            if c.chars().count() == 1 {
+                if ch.eq_ignore_ascii_case(&lower) {
+                    return true;
+                }
+                if ch.is_ascii_alphabetic() {
+                    return false;
+                }
+                if lower.is_ascii_lowercase() && ch as u32 == (lower as u32 - 'a' as u32 + 1) {
+                    return true;
+                }
+            }
+        }
+    }
+    matches!(physical_key, PhysicalKey::Code(k) if k == code)
+}
+
+fn is_modifier_key(key: &Key) -> bool {
+    matches!(
+        key,
+        Key::Named(
+            NamedKey::Control
+                | NamedKey::Shift
+                | NamedKey::Alt
+                | NamedKey::AltGraph
+                | NamedKey::Super
+                | NamedKey::Meta
+                | NamedKey::CapsLock
+                | NamedKey::NumLock
+                | NamedKey::ScrollLock
+        )
+    )
+}
+
+fn winit_function_key(key: &Key) -> Option<u8> {
+    match key {
+        Key::Named(NamedKey::F1) => Some(1),
+        Key::Named(NamedKey::F2) => Some(2),
+        Key::Named(NamedKey::F3) => Some(3),
+        Key::Named(NamedKey::F4) => Some(4),
+        Key::Named(NamedKey::F5) => Some(5),
+        Key::Named(NamedKey::F6) => Some(6),
+        Key::Named(NamedKey::F7) => Some(7),
+        Key::Named(NamedKey::F8) => Some(8),
+        Key::Named(NamedKey::F9) => Some(9),
+        Key::Named(NamedKey::F10) => Some(10),
+        Key::Named(NamedKey::F11) => Some(11),
+        Key::Named(NamedKey::F12) => Some(12),
+        _ => None,
+    }
+}
+
+fn char_to_keycode(ch: char) -> Option<KeyCode> {
+    match ch.to_ascii_lowercase() {
+        'a' => Some(KeyCode::KeyA),
+        'b' => Some(KeyCode::KeyB),
+        'c' => Some(KeyCode::KeyC),
+        'd' => Some(KeyCode::KeyD),
+        'e' => Some(KeyCode::KeyE),
+        'f' => Some(KeyCode::KeyF),
+        'g' => Some(KeyCode::KeyG),
+        'h' => Some(KeyCode::KeyH),
+        'i' => Some(KeyCode::KeyI),
+        'j' => Some(KeyCode::KeyJ),
+        'k' => Some(KeyCode::KeyK),
+        'l' => Some(KeyCode::KeyL),
+        'm' => Some(KeyCode::KeyM),
+        'n' => Some(KeyCode::KeyN),
+        'o' => Some(KeyCode::KeyO),
+        'p' => Some(KeyCode::KeyP),
+        'q' => Some(KeyCode::KeyQ),
+        'r' => Some(KeyCode::KeyR),
+        's' => Some(KeyCode::KeyS),
+        't' => Some(KeyCode::KeyT),
+        'u' => Some(KeyCode::KeyU),
+        'v' => Some(KeyCode::KeyV),
+        'w' => Some(KeyCode::KeyW),
+        'x' => Some(KeyCode::KeyX),
+        'y' => Some(KeyCode::KeyY),
+        'z' => Some(KeyCode::KeyZ),
+        '0' => Some(KeyCode::Digit0),
+        '1' => Some(KeyCode::Digit1),
+        '2' => Some(KeyCode::Digit2),
+        '3' => Some(KeyCode::Digit3),
+        '4' => Some(KeyCode::Digit4),
+        '5' => Some(KeyCode::Digit5),
+        '6' => Some(KeyCode::Digit6),
+        '7' => Some(KeyCode::Digit7),
+        '8' => Some(KeyCode::Digit8),
+        '9' => Some(KeyCode::Digit9),
+        ',' => Some(KeyCode::Comma),
+        '.' => Some(KeyCode::Period),
+        '/' => Some(KeyCode::Slash),
+        ';' => Some(KeyCode::Semicolon),
+        '[' => Some(KeyCode::BracketLeft),
+        ']' => Some(KeyCode::BracketRight),
+        '-' => Some(KeyCode::Minus),
+        '=' => Some(KeyCode::Equal),
+        _ => None,
+    }
+}
+
+fn keycode_to_char(code: KeyCode) -> Option<char> {
+    match code {
+        KeyCode::KeyA => Some('a'),
+        KeyCode::KeyB => Some('b'),
+        KeyCode::KeyC => Some('c'),
+        KeyCode::KeyD => Some('d'),
+        KeyCode::KeyE => Some('e'),
+        KeyCode::KeyF => Some('f'),
+        KeyCode::KeyG => Some('g'),
+        KeyCode::KeyH => Some('h'),
+        KeyCode::KeyI => Some('i'),
+        KeyCode::KeyJ => Some('j'),
+        KeyCode::KeyK => Some('k'),
+        KeyCode::KeyL => Some('l'),
+        KeyCode::KeyM => Some('m'),
+        KeyCode::KeyN => Some('n'),
+        KeyCode::KeyO => Some('o'),
+        KeyCode::KeyP => Some('p'),
+        KeyCode::KeyQ => Some('q'),
+        KeyCode::KeyR => Some('r'),
+        KeyCode::KeyS => Some('s'),
+        KeyCode::KeyT => Some('t'),
+        KeyCode::KeyU => Some('u'),
+        KeyCode::KeyV => Some('v'),
+        KeyCode::KeyW => Some('w'),
+        KeyCode::KeyX => Some('x'),
+        KeyCode::KeyY => Some('y'),
+        KeyCode::KeyZ => Some('z'),
+        KeyCode::Digit0 => Some('0'),
+        KeyCode::Digit1 => Some('1'),
+        KeyCode::Digit2 => Some('2'),
+        KeyCode::Digit3 => Some('3'),
+        KeyCode::Digit4 => Some('4'),
+        KeyCode::Digit5 => Some('5'),
+        KeyCode::Digit6 => Some('6'),
+        KeyCode::Digit7 => Some('7'),
+        KeyCode::Digit8 => Some('8'),
+        KeyCode::Digit9 => Some('9'),
+        KeyCode::Comma => Some(','),
+        KeyCode::Period => Some('.'),
+        KeyCode::Slash => Some('/'),
+        KeyCode::Semicolon => Some(';'),
+        KeyCode::BracketLeft => Some('['),
+        KeyCode::BracketRight => Some(']'),
+        KeyCode::Minus => Some('-'),
+        KeyCode::Equal => Some('='),
+        _ => None,
+    }
+}
+
+pub(crate) fn shortcut_from_winit(
+    key: &Key,
+    physical_key: PhysicalKey,
+    ctrl: bool,
+    shift: bool,
+    alt: bool,
+) -> Option<Shortcut> {
+    if let Some(n) = winit_function_key(key) {
+        return Some(Shortcut {
+            ctrl,
+            shift,
+            alt,
+            key: ShortcutKey::Function(n),
+        });
+    }
+    if !ctrl && !alt {
+        return None;
+    }
+    let ch = if let Key::Character(c) = key {
+        if c.chars().count() == 1 {
+            let ch = c.chars().next().unwrap();
+            if (1..=26).contains(&(ch as u32)) {
+                Some(((ch as u8 - 1) + b'a') as char)
+            } else if !ch.is_control() && !ch.is_whitespace() && ch.is_ascii() {
+                Some(ch.to_ascii_lowercase())
+            } else if let PhysicalKey::Code(code) = physical_key {
+                keycode_to_char(code)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else if let PhysicalKey::Code(code) = physical_key {
+        keycode_to_char(code)
+    } else {
+        None
+    }?;
+    Some(Shortcut {
+        ctrl,
+        shift,
+        alt,
+        key: ShortcutKey::Char(ch),
+    })
+}
+
+pub(crate) fn matches_configured_shortcut(
+    sc: Shortcut,
+    key: &Key,
+    physical_key: PhysicalKey,
+    ctrl: bool,
+    shift: bool,
+    alt: bool,
+) -> bool {
+    if sc.ctrl != ctrl || sc.shift != shift || sc.alt != alt {
+        return false;
+    }
+    match sc.key {
+        ShortcutKey::Function(n) => winit_function_key(key) == Some(n),
+        ShortcutKey::Char(ch) => {
+            if let Some(code) = char_to_keycode(ch) {
+                matches_shortcut_key(key, physical_key, ch, code)
+            } else if let Key::Character(c) = key {
+                c.chars().count() == 1
+                    && c.chars()
+                        .next()
+                        .map(|k| k.eq_ignore_ascii_case(&ch))
+                        .unwrap_or(false)
+            } else {
+                false
+            }
+        }
+    }
+}
+
+pub(crate) fn encode_key(
     key: &Key,
     text: Option<&str>,
     ctrl: bool,

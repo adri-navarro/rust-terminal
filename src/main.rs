@@ -1,3 +1,4 @@
+mod commands;
 mod completer;
 mod config;
 mod history;
@@ -35,11 +36,14 @@ KEYBINDINGS:
     Alt+Right           Accept next word of autosuggestion
     Ctrl+T / Ctrl+W     New / close tab
     Ctrl+Tab / Alt+1-9  Switch tabs
+    Ctrl+C / Ctrl+V     Copy selection (or SIGINT if none) / paste clipboard
     Ctrl+Shift+C / V    Copy / paste clipboard
     Ctrl+= / - / 0      Zoom font in / out / reset
     F2                  Cycle color theme live
-    Ctrl+U / F3         Toggle Agent & Model Usage tab
-    Ctrl+M / F4         Toggle System Monitor tab (CPU, RAM, Disks, Processes)
+    Ctrl+U / F3         Toggle Agent & Model Usage tab (customizable in Settings)
+    Ctrl+M / F4         Toggle System Monitor tab (customizable in Settings)
+    Ctrl+P / F5         Toggle Commands tab (customizable in Settings)
+    Ctrl+, / F6         Toggle Settings tab (font sizes, theme, shortcuts)
     Ctrl+Shift+R        Reload ~/.config/itsadri-terminal/config.toml"
     );
 }

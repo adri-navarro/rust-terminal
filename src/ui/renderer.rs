@@ -1,3 +1,4 @@
+use crate::commands::{CommandStatus, ManagedCommand, format_elapsed};
 use crate::completer::CompletionKind;
 use crate::config::{Config, Rgb, Theme};
 use crate::history::{FuzzyMatch, format_relative_time};
@@ -45,6 +46,53 @@ pub struct TabBarHitZones {
     pub monitor_sort_btns: Vec<(ProcessSort, Rect)>,
     pub monitor_refresh_btn: Option<Rect>,
     pub monitor_proc_rows: Vec<(usize, Rect)>,
+    pub commands_btn: Option<Rect>,
+    pub cmd_add_btn: Option<Rect>,
+    pub cmd_stop_all_btn: Option<Rect>,
+    pub cmd_rows: Vec<CommandRowHitZone>,
+    pub cmd_form_cmd_field: Option<Rect>,
+    pub cmd_form_dir_field: Option<Rect>,
+    pub cmd_form_primary_btn: Option<Rect>,
+    pub cmd_form_secondary_btn: Option<Rect>,
+    pub cmd_form_cancel_btn: Option<Rect>,
+    pub cmd_log_area: Option<Rect>,
+    pub settings_btn: Option<Rect>,
+    pub settings_reset_all_btn: Option<Rect>,
+    pub settings_font_btns: Vec<(SettingsFontTarget, Rect, Rect, Rect)>, // (target, row, minus, plus)
+    pub settings_theme_btns: Vec<(&'static str, Rect)>,
+    pub settings_shortcut_btns: Vec<(SettingsShortcutTarget, Rect, Rect, Rect)>, // (target, row, change, reset)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsFontTarget {
+    Terminal,
+    Commands,
+    Monitor,
+    Usage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsShortcutTarget {
+    Commands,
+    Monitor,
+    Usage,
+}
+
+pub struct SettingsViewState<'a> {
+    pub selected: usize,
+    pub recording_shortcut: Option<SettingsShortcutTarget>,
+    pub error: Option<&'a str>,
+    pub scroll: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CommandRowHitZone {
+    pub index: usize,
+    pub id: u64,
+    pub row_rect: Rect,
+    pub toggle_btn: Rect,
+    pub edit_btn: Rect,
+    pub delete_btn: Rect,
 }
 
 impl TabBarHitZones {
@@ -61,8 +109,46 @@ impl TabBarHitZones {
             monitor_sort_btns: Vec::new(),
             monitor_refresh_btn: None,
             monitor_proc_rows: Vec::new(),
+            commands_btn: None,
+            cmd_add_btn: None,
+            cmd_stop_all_btn: None,
+            cmd_rows: Vec::new(),
+            cmd_form_cmd_field: None,
+            cmd_form_dir_field: None,
+            cmd_form_primary_btn: None,
+            cmd_form_secondary_btn: None,
+            cmd_form_cancel_btn: None,
+            cmd_log_area: None,
+            settings_btn: None,
+            settings_reset_all_btn: None,
+            settings_font_btns: Vec::new(),
+            settings_theme_btns: Vec::new(),
+            settings_shortcut_btns: Vec::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandFormField {
+    Command,
+    Directory,
+}
+
+pub struct CommandFormView<'a> {
+    pub is_edit: bool,
+    pub command_input: &'a str,
+    pub directory_input: &'a str,
+    pub active_field: CommandFormField,
+    pub error: Option<&'a str>,
+}
+
+pub struct CommandsViewState<'a> {
+    pub entries: &'a [ManagedCommand],
+    pub selected: usize,
+    pub scroll: usize,
+    pub log_scroll: usize,
+    pub form: Option<CommandFormView<'a>>,
+    pub cursor_blink_on: bool,
 }
 
 pub struct UsageViewState<'a> {
@@ -356,6 +442,9 @@ pub fn render_frame(
     history_palette: Option<&HistoryPaletteView<'_>>,
     usage_view: Option<&UsageViewState<'_>>,
     monitor_view: Option<&MonitorViewState<'_>>,
+    commands_view: Option<&CommandsViewState<'_>>,
+    settings_view: Option<&SettingsViewState<'_>>,
+    active_commands_count: usize,
     toast: Option<&str>,
 ) -> TabBarHitZones {
     let mut canvas = Canvas::new(buf, width, height);
@@ -371,12 +460,19 @@ pub fn render_frame(
             active_tab,
             usage_view.is_some(),
             monitor_view.is_some(),
+            commands_view.is_some(),
+            settings_view.is_some(),
+            active_commands_count,
         )
     } else {
         TabBarHitZones::empty()
     };
 
-    if let Some(mv) = monitor_view {
+    if let Some(sv) = settings_view {
+        render_settings_view(&mut canvas, width, height, cfg, theme, font, sv, &mut hit_zones);
+    } else if let Some(cv) = commands_view {
+        render_commands_view(&mut canvas, width, height, cfg, theme, font, cv, &mut hit_zones);
+    } else if let Some(mv) = monitor_view {
         render_monitor_view(&mut canvas, width, height, cfg, theme, font, mv, &mut hit_zones);
     } else if let Some(uv) = usage_view {
         render_usage_view(&mut canvas, width, height, cfg, theme, font, uv, &mut hit_zones);
@@ -441,6 +537,9 @@ fn render_tab_bar(
     active_tab: usize,
     usage_active: bool,
     monitor_active: bool,
+    commands_active: bool,
+    settings_active: bool,
+    active_commands_count: usize,
 ) -> TabBarHitZones {
     let mut zones = TabBarHitZones::empty();
     let h = TAB_BAR_H as i32;
@@ -450,11 +549,59 @@ fn render_tab_bar(
     let ui_size = 12.5f32;
     let baseline = 22;
 
-    // Top-right corner tab: Agent & Model Usage
+    // Top-right corner tab: Settings (Ctrl+, / F6)
     let right_margin = 10;
+    let set_label = "Settings";
+    let set_w = font.measure_text(set_label, ui_size) + 30;
+    let set_x = (width as i32) - right_margin - set_w;
+    let set_rect = if settings_active {
+        Rect {
+            x: set_x,
+            y: 5,
+            w: set_w,
+            h: 26,
+        }
+    } else {
+        Rect {
+            x: set_x,
+            y: 6,
+            w: set_w,
+            h: 24,
+        }
+    };
+    if settings_active {
+        canvas.fill_rounded_rect(set_rect.x, set_rect.y, set_rect.w, set_rect.h, 7, theme.bg, 255);
+        canvas.stroke_rounded_rect(set_rect.x, set_rect.y, set_rect.w, set_rect.h, 7, theme.border, 190);
+        canvas.fill_rounded_rect(
+            set_rect.x + 8,
+            set_rect.y + set_rect.h - 2,
+            set_rect.w - 16,
+            2,
+            1,
+            theme.warning,
+            255,
+        );
+    } else {
+        canvas.fill_rounded_rect(set_rect.x, set_rect.y, set_rect.w, set_rect.h, 6, theme.surface_alt, 255);
+    }
+    let set_dot = if settings_active { theme.warning } else { theme.fg_muted };
+    canvas.fill_rounded_rect(set_rect.x + 10, set_rect.y + (set_rect.h / 2) - 3, 6, 6, 3, set_dot, 255);
+    canvas.draw_text_clipped(
+        font,
+        set_label,
+        FontStyle::Bold,
+        ui_size,
+        set_rect.x + 21,
+        baseline,
+        set_rect.x + set_rect.w - 6,
+        if settings_active { theme.fg } else { theme.fg_muted },
+    );
+    zones.settings_btn = Some(set_rect);
+
+    // Next to Settings tab: Agent & Model Usage
     let usage_label = "Usage";
     let usage_w = font.measure_text(usage_label, ui_size) + 30;
-    let usage_x = (width as i32) - right_margin - usage_w;
+    let usage_x = set_x - 6 - usage_w;
     let usage_rect = if usage_active {
         Rect {
             x: usage_x,
@@ -583,10 +730,88 @@ fn render_tab_bar(
     );
     zones.monitor_btn = Some(mon_rect);
 
-    // Right-side utility pills (left of Monitor tab): Theme (F2) & History (Ctrl+R)
+    // Next to Monitor tab: Commands Runner tab (Ctrl+P / F5)
+    let cmd_label = if active_commands_count > 0 {
+        format!("Commands ({active_commands_count})")
+    } else {
+        "Commands".to_string()
+    };
+    let cmd_w = font.measure_text(&cmd_label, ui_size) + 30;
+    let cmd_x = mon_x - 6 - cmd_w;
+    let cmd_rect = if commands_active {
+        Rect {
+            x: cmd_x,
+            y: 5,
+            w: cmd_w,
+            h: 26,
+        }
+    } else {
+        Rect {
+            x: cmd_x,
+            y: 6,
+            w: cmd_w,
+            h: 24,
+        }
+    };
+    if commands_active {
+        canvas.fill_rounded_rect(cmd_rect.x, cmd_rect.y, cmd_rect.w, cmd_rect.h, 7, theme.bg, 255);
+        canvas.stroke_rounded_rect(cmd_rect.x, cmd_rect.y, cmd_rect.w, cmd_rect.h, 7, theme.border, 190);
+        canvas.fill_rounded_rect(
+            cmd_rect.x + 8,
+            cmd_rect.y + cmd_rect.h - 2,
+            cmd_rect.w - 16,
+            2,
+            1,
+            theme.success,
+            255,
+        );
+    } else {
+        canvas.fill_rounded_rect(
+            cmd_rect.x,
+            cmd_rect.y,
+            cmd_rect.w,
+            cmd_rect.h,
+            6,
+            theme.surface_alt,
+            255,
+        );
+    }
+    let cmd_dot = if active_commands_count > 0 || commands_active {
+        theme.success
+    } else {
+        theme.fg_muted
+    };
+    canvas.fill_rounded_rect(
+        cmd_rect.x + 10,
+        cmd_rect.y + (cmd_rect.h / 2) - 3,
+        6,
+        6,
+        3,
+        cmd_dot,
+        255,
+    );
+    canvas.draw_text_clipped(
+        font,
+        &cmd_label,
+        FontStyle::Bold,
+        ui_size,
+        cmd_rect.x + 21,
+        baseline,
+        cmd_rect.x + cmd_rect.w - 6,
+        if commands_active {
+            theme.fg
+        } else if active_commands_count > 0 {
+            theme.success
+        } else {
+            theme.fg_muted
+        },
+    );
+    zones.commands_btn = Some(cmd_rect);
+
+    // Right-side utility pills (left of Commands tab): Theme (F2) & History (Ctrl+R)
     let theme_label = "F2 Theme";
     let theme_w = font.measure_text(theme_label, ui_size) + 18;
-    let theme_x = mon_x - 8 - theme_w;
+    let theme_x = cmd_x - 8 - theme_w;
     let theme_rect = Rect {
         x: theme_x,
         y: 6,
@@ -653,7 +878,7 @@ fn render_tab_bar(
     } else if zones.theme_btn.is_some() {
         theme_x - 42
     } else {
-        mon_x - 42
+        cmd_x - 42
     };
 
     let mut x = 10i32;
@@ -666,7 +891,8 @@ fn render_tab_bar(
             break;
         }
         let w = tab_w.min(max_tabs_right - x);
-        let is_active = !usage_active && !monitor_active && idx == active_tab;
+        let is_active =
+            !usage_active && !monitor_active && !commands_active && !settings_active && idx == active_tab;
         let rect = Rect {
             x,
             y: 5,
@@ -1326,6 +1552,10 @@ fn render_usage_view(
     uv: &UsageViewState<'_>,
     hit_zones: &mut TabBarHitZones,
 ) {
+    let s = (cfg.usage_font_size.clamp(9.0, 36.0)) / 18.0;
+    let fs = |base: f32| (base * s).clamp(8.0, 48.0);
+    let sc = |v: i32| ((v as f32) * s).round() as i32;
+
     let top = if cfg.show_tab_bar { TAB_BAR_H as i32 } else { 0 };
     let bottom = if cfg.show_status_bar { STATUS_BAR_H as i32 } else { 0 };
     let pad = 22i32;
@@ -1334,49 +1564,14 @@ fn render_usage_view(
     let content_w = (width as i32 - pad * 2).max(240);
     let max_y = (height as i32) - bottom - 14;
 
-    // --- Header Row ---
-    canvas.draw_text_clipped(
-        font,
-        "Agent & Model Usage",
-        FontStyle::Bold,
-        18.0,
-        x0,
-        y0 + 18,
-        x0 + content_w - 280,
-        theme.fg,
-    );
-
-    let subtitle = if uv.scanning && uv.report.is_none() {
-        "Scanning local AI CLI logs (~/.claude, ~/.codex, ~/.gemini, opencode)...".to_string()
-    } else if let Some(rep) = uv.report {
-        format!(
-            "Live · 5s auto-refresh  ·  {} files ({}ms)  ·  updated {}",
-            rep.files_scanned,
-            rep.scan_duration_ms,
-            format_relative_time(rep.generated_at),
-        )
-    } else {
-        "Auto-detecting local AI CLI logs...".to_string()
-    };
-    canvas.draw_text_clipped(
-        font,
-        &subtitle,
-        FontStyle::Regular,
-        11.5,
-        x0,
-        y0 + 36,
-        x0 + content_w - 280,
-        theme.fg_muted,
-    );
-
-    // Right-aligned controls: [24h] [7d] [30d] [All]  [↻ Refresh]
+    // Right-aligned controls: [5h] [24h] [7d] [30d] [All]  [Refresh]
     let btn_y = y0 + 4;
-    let btn_h = 26i32;
-    let btn_base = btn_y + 17;
+    let btn_h = sc(36).max(24);
+    let btn_base = btn_y + sc(24).max(16);
     let mut rx = x0 + content_w;
 
     let refresh_label = if uv.scanning { "Scanning..." } else { "Refresh" };
-    let ref_w = font.measure_text(refresh_label, 12.0) + 18;
+    let ref_w = font.measure_text(refresh_label, fs(17.5)) + 22;
     rx -= ref_w;
     let ref_rect = Rect {
         x: rx,
@@ -1390,8 +1585,8 @@ fn render_usage_view(
         font,
         refresh_label,
         FontStyle::Bold,
-        12.0,
-        ref_rect.x + 9,
+        fs(17.5),
+        ref_rect.x + 11,
         btn_base,
         ref_rect.x + ref_rect.w - 4,
         if uv.scanning { theme.fg_muted } else { theme.accent },
@@ -1401,7 +1596,7 @@ fn render_usage_view(
     rx -= 10;
     for &range in TimeRange::ALL.iter().rev() {
         let lbl = range.label();
-        let rw = font.measure_text(lbl, 12.0) + 18;
+        let rw = font.measure_text(lbl, fs(17.5)) + 22;
         rx -= rw;
         let rect = Rect {
             x: rx,
@@ -1421,8 +1616,8 @@ fn render_usage_view(
             font,
             lbl,
             if active { FontStyle::Bold } else { FontStyle::Regular },
-            12.0,
-            rect.x + 9,
+            fs(17.5),
+            rect.x + 11,
             btn_base,
             rect.x + rect.w - 4,
             if active { theme.accent } else { theme.fg_muted },
@@ -1431,22 +1626,58 @@ fn render_usage_view(
         rx -= 6;
     }
 
-    let mut cur_y = y0 + 52;
+    // --- Header Row ---
+    let header_max_x = (rx - 12).max(x0 + 180);
+    canvas.draw_text_clipped(
+        font,
+        "Agent & Model Usage",
+        FontStyle::Bold,
+        fs(25.0),
+        x0,
+        y0 + sc(24),
+        header_max_x,
+        theme.fg,
+    );
+
+    let subtitle = if uv.scanning && uv.report.is_none() {
+        "Scanning local AI CLI logs (~/.claude, ~/.codex, ~/.gemini, opencode)...".to_string()
+    } else if let Some(rep) = uv.report {
+        format!(
+            "Live · 5s auto-refresh  ·  {} files ({}ms)  ·  updated {}",
+            rep.files_scanned,
+            rep.scan_duration_ms,
+            format_relative_time(rep.generated_at),
+        )
+    } else {
+        "Auto-detecting local AI CLI logs...".to_string()
+    };
+    canvas.draw_text_clipped(
+        font,
+        &subtitle,
+        FontStyle::Regular,
+        fs(17.5),
+        x0,
+        y0 + sc(47),
+        header_max_x,
+        theme.fg_muted,
+    );
+
+    let mut cur_y = y0 + sc(62).max(btn_h + 14);
     canvas.fill_rect(x0, cur_y, content_w, 1, theme.border);
     cur_y += 14;
 
     let Some(report) = uv.report else {
         // Initial scanning state
-        let card_h = 90i32;
+        let card_h = sc(116).max(80);
         canvas.fill_rounded_rect(x0, cur_y, content_w, card_h, 10, theme.surface, 255);
         canvas.stroke_rounded_rect(x0, cur_y, content_w, card_h, 10, theme.border, 200);
         canvas.draw_text_clipped(
             font,
             "Scanning local AI CLI logs...",
             FontStyle::Bold,
-            14.5,
+            fs(20.5),
             x0 + 20,
-            cur_y + 38,
+            cur_y + sc(46),
             x0 + content_w - 20,
             theme.accent,
         );
@@ -1454,9 +1685,9 @@ fn render_usage_view(
             font,
             "Checking ~/.claude/projects, ~/.codex/sessions, ~/.gemini/tmp, ~/.gemini/antigravity-cli, and ~/.local/share/opencode",
             FontStyle::Regular,
-            12.0,
+            fs(18.0),
             x0 + 20,
-            cur_y + 62,
+            cur_y + sc(78),
             x0 + content_w - 20,
             theme.fg_muted,
         );
@@ -1467,7 +1698,7 @@ fn render_usage_view(
 
     // --- KPI Summary Cards (4 columns) ---
     let kpi_gap = 12i32;
-    let kpi_h = 74i32;
+    let kpi_h = sc(106).max(74);
     let kpi_w = (content_w - kpi_gap * 3) / 4;
     let tot = &snap.total;
     let kpis = [
@@ -1502,15 +1733,15 @@ fn render_usage_view(
         canvas.fill_rounded_rect(kx, cur_y, kpi_w, kpi_h, 9, theme.surface, 255);
         canvas.stroke_rounded_rect(kx, cur_y, kpi_w, kpi_h, 9, theme.border, 190);
         // Subtle left accent stripe
-        canvas.fill_rounded_rect(kx + 1, cur_y + 12, 3, kpi_h - 24, 1, *color, 255);
+        canvas.fill_rounded_rect(kx + 1, cur_y + 12, 3, (kpi_h - 24).max(8), 1, *color, 255);
 
         canvas.draw_text_clipped(
             font,
             label,
             FontStyle::Bold,
-            10.5,
+            fs(16.5),
             kx + 14,
-            cur_y + 20,
+            cur_y + sc(26),
             kx + kpi_w - 10,
             theme.fg_muted,
         );
@@ -1518,9 +1749,9 @@ fn render_usage_view(
             font,
             value,
             FontStyle::Bold,
-            20.0,
+            fs(28.0),
             kx + 14,
-            cur_y + 45,
+            cur_y + sc(62),
             kx + kpi_w - 10,
             theme.fg,
         );
@@ -1528,9 +1759,9 @@ fn render_usage_view(
             font,
             sub,
             FontStyle::Regular,
-            11.0,
+            fs(17.0),
             kx + 14,
-            cur_y + 63,
+            cur_y + sc(90),
             kx + kpi_w - 10,
             theme.fg_muted,
         );
@@ -1543,13 +1774,13 @@ fn render_usage_view(
         font,
         "AGENTS  (5H & WEEKLY USAGE PER AGENT)",
         FontStyle::Bold,
-        10.5,
+        fs(16.5),
         x0,
-        cur_y + 10,
+        cur_y + sc(16),
         x0 + content_w,
         theme.fg_muted,
     );
-    cur_y += 18;
+    cur_y += sc(26).max(18);
 
     let agent_gap = 12i32;
     let cols = if content_w >= 860 {
@@ -1558,7 +1789,7 @@ fn render_usage_view(
         2
     };
     let agent_w = (content_w - agent_gap * (cols - 1)) / cols;
-    let agent_h = 124i32;
+    let agent_h = sc(176).max(120);
     let rows_count = ((snap.agents.len() as i32) + cols - 1) / cols;
 
     for (i, agent) in snap.agents.iter().enumerate() {
@@ -1578,19 +1809,19 @@ fn render_usage_view(
         } else {
             theme.fg_muted
         };
-        canvas.fill_rounded_rect(ax + 12, ay + 14, 7, 7, 3, dot, 255);
+        canvas.fill_rounded_rect(ax + 12, ay + sc(16), 7, 7, 3, dot, 255);
         let active_ago = agent.last_active.map(format_relative_time);
         let name_max_x = if let Some(ref ago) = active_ago {
-            let aw = font.measure_text(ago, 10.0);
+            let aw = font.measure_text(ago, fs(16.0));
             let ago_x = ax + agent_w - aw - 10;
             if ago_x > ax + 110 {
                 canvas.draw_text_clipped(
                     font,
                     ago,
                     FontStyle::Regular,
-                    10.0,
+                    fs(16.0),
                     ago_x,
-                    ay + 21,
+                    ay + sc(26),
                     ax + agent_w - 8,
                     theme.fg_muted,
                 );
@@ -1605,9 +1836,9 @@ fn render_usage_view(
             font,
             agent.name,
             FontStyle::Bold,
-            12.5,
+            fs(18.5),
             ax + 24,
-            ay + 22,
+            ay + sc(27),
             name_max_x,
             if active_in_range || agent.detected { theme.fg } else { theme.fg_muted },
         );
@@ -1627,9 +1858,9 @@ fn render_usage_view(
             font,
             &stat_line,
             FontStyle::Regular,
-            11.0,
+            fs(17.0),
             ax + 12,
-            ay + 39,
+            ay + sc(51),
             ax + agent_w - 10,
             if active_in_range { theme.fg } else { theme.fg_muted },
         );
@@ -1639,9 +1870,9 @@ fn render_usage_view(
             font,
             model_sub,
             FontStyle::Italic,
-            10.5,
+            fs(16.5),
             ax + 12,
-            ay + 53,
+            ay + sc(73),
             ax + agent_w - 10,
             theme.fg_muted,
         );
@@ -1650,26 +1881,28 @@ fn render_usage_view(
         render_agent_quota_row(
             canvas,
             ax + 12,
-            ay + 63,
+            ay + sc(88),
             agent_w - 24,
             "5h",
             &agent.quota_5h,
             accent,
             theme,
             font,
+            s,
         );
 
         // Weekly (7d) quota row inside this agent card
         render_agent_quota_row(
             canvas,
             ax + 12,
-            ay + 92,
+            ay + sc(128),
             agent_w - 24,
             "7d",
             &agent.quota_weekly,
             accent,
             theme,
             font,
+            s,
         );
     }
 
@@ -1681,23 +1914,27 @@ fn render_usage_view(
         font,
         &models_hdr,
         FontStyle::Bold,
-        11.0,
+        fs(17.0),
         x0,
-        cur_y + 10,
-        x0 + 240,
+        cur_y + sc(16),
+        x0 + 280,
         theme.fg_muted,
     );
-    canvas.draw_text_clipped(
-        font,
-        "1-5 range  ·  R refresh  ·  ↑↓ scroll  ·  Esc close",
-        FontStyle::Regular,
-        11.0,
-        x0 + content_w - 310,
-        cur_y + 10,
-        x0 + content_w,
-        theme.fg_muted,
-    );
-    cur_y += 18;
+    let usage_hint = "1-5 range  ·  R refresh  ·  ↑↓ scroll  ·  Esc close";
+    let uhw = font.measure_text(usage_hint, fs(16.5));
+    if content_w > uhw + 280 {
+        canvas.draw_text_clipped(
+            font,
+            usage_hint,
+            FontStyle::Regular,
+            fs(16.5),
+            x0 + content_w - uhw,
+            cur_y + sc(16),
+            x0 + content_w,
+            theme.fg_muted,
+        );
+    }
+    cur_y += sc(26).max(18);
 
     let table_h = (max_y - cur_y).max(80);
     canvas.fill_rounded_rect(x0, cur_y, content_w, table_h, 10, theme.surface, 255);
@@ -1708,9 +1945,9 @@ fn render_usage_view(
             font,
             "No agent or model usage found for this time range.",
             FontStyle::Bold,
-            13.5,
+            fs(19.5),
             x0 + 20,
-            cur_y + 36,
+            cur_y + sc(42),
             x0 + content_w - 20,
             theme.fg,
         );
@@ -1718,9 +1955,9 @@ fn render_usage_view(
             font,
             "Auto-scanned: ~/.claude/projects  ·  ~/.codex/sessions  ·  ~/.gemini/tmp  ·  ~/.gemini/antigravity-cli  ·  ~/.local/share/opencode",
             FontStyle::Regular,
-            11.5,
+            fs(17.5),
             x0 + 20,
-            cur_y + 58,
+            cur_y + sc(74),
             x0 + content_w - 20,
             theme.fg_muted,
         );
@@ -1737,8 +1974,8 @@ fn render_usage_view(
     let col_total = x0 + (content_w * 84 / 100);
     let col_cost = x0 + (content_w * 92 / 100);
 
-    let hdr_h = 30i32;
-    let hdr_base = cur_y + 20;
+    let hdr_h = sc(40).max(26);
+    let hdr_base = cur_y + sc(27).max(18);
     for (cx, title) in [
         (col_model, "MODEL"),
         (col_agent, "AGENT"),
@@ -1753,7 +1990,7 @@ fn render_usage_view(
             font,
             title,
             FontStyle::Bold,
-            10.5,
+            fs(16.5),
             cx,
             hdr_base,
             x0 + content_w - 10,
@@ -1762,7 +1999,7 @@ fn render_usage_view(
     }
     canvas.fill_rect(x0 + 10, cur_y + hdr_h, content_w - 20, 1, theme.border);
 
-    let row_h = 34i32;
+    let row_h = sc(48).max(30);
     let list_y = cur_y + hdr_h + 6;
     let visible_rows = ((table_h - hdr_h - 12) / row_h).max(1) as usize;
     let max_scroll = snap.models.len().saturating_sub(visible_rows);
@@ -1774,7 +2011,7 @@ fn render_usage_view(
         if vi % 2 == 1 {
             canvas.fill_rounded_rect(x0 + 8, ry, content_w - 16, row_h - 2, 6, theme.surface_alt, 110);
         }
-        let base = ry + 18;
+        let base = ry + sc(28).max(18);
         let accent = agent_color(m.agent_id, theme);
 
         // Model name
@@ -1782,7 +2019,7 @@ fn render_usage_view(
             font,
             &m.model,
             FontStyle::Bold,
-            12.5,
+            fs(18.5),
             col_model,
             base,
             col_agent - 12,
@@ -1794,20 +2031,22 @@ fn render_usage_view(
         let bar_max = (col_agent - col_model - 20).max(40);
         let bar_w = ((bar_max as f64) * share).round() as i32;
         if bar_w > 0 {
-            canvas.fill_rounded_rect(col_model, ry + 25, bar_w.max(3), 3, 1, accent, 200);
+            canvas.fill_rounded_rect(col_model, ry + row_h - 9, bar_w.max(3), 3, 1, accent, 200);
         }
 
         // Agent badge pill
-        let badge_w = (font.measure_text(m.agent_name, 10.5) + 12).min(col_req - col_agent - 10);
+        let badge_w = (font.measure_text(m.agent_name, fs(16.5)) + 14).min(col_req - col_agent - 10);
         if badge_w > 24 {
-            canvas.fill_rounded_rect(col_agent, ry + 5, badge_w, 19, 4, accent, 38);
+            let bh = sc(28).max(18);
+            let by = ry + (row_h - bh) / 2;
+            canvas.fill_rounded_rect(col_agent, by, badge_w, bh, 4, accent, 38);
             canvas.draw_text_clipped(
                 font,
                 m.agent_name,
                 FontStyle::Bold,
-                10.5,
-                col_agent + 6,
-                ry + 18,
+                fs(16.5),
+                col_agent + 7,
+                base,
                 col_agent + badge_w - 4,
                 accent,
             );
@@ -1821,12 +2060,12 @@ fn render_usage_view(
         let tot_s = format_tokens(m.stats.total_tokens());
         let cost_s = format_cost(m.stats.estimated_cost_usd);
 
-        canvas.draw_text_clipped(font, &req_s, FontStyle::Regular, 12.0, col_req, base, col_in - 6, theme.fg_muted);
-        canvas.draw_text_clipped(font, &in_s, FontStyle::Regular, 12.0, col_in, base, col_out - 6, theme.fg);
-        canvas.draw_text_clipped(font, &out_s, FontStyle::Regular, 12.0, col_out, base, col_cache - 6, theme.fg);
-        canvas.draw_text_clipped(font, &cache_s, FontStyle::Regular, 12.0, col_cache, base, col_total - 6, theme.fg_muted);
-        canvas.draw_text_clipped(font, &tot_s, FontStyle::Bold, 12.0, col_total, base, col_cost - 6, accent);
-        canvas.draw_text_clipped(font, &cost_s, FontStyle::Regular, 12.0, col_cost, base, x0 + content_w - 10, theme.warning);
+        canvas.draw_text_clipped(font, &req_s, FontStyle::Regular, fs(18.0), col_req, base, col_in - 6, theme.fg_muted);
+        canvas.draw_text_clipped(font, &in_s, FontStyle::Regular, fs(18.0), col_in, base, col_out - 6, theme.fg);
+        canvas.draw_text_clipped(font, &out_s, FontStyle::Regular, fs(18.0), col_out, base, col_cache - 6, theme.fg);
+        canvas.draw_text_clipped(font, &cache_s, FontStyle::Regular, fs(18.0), col_cache, base, col_total - 6, theme.fg_muted);
+        canvas.draw_text_clipped(font, &tot_s, FontStyle::Bold, fs(18.0), col_total, base, col_cost - 6, accent);
+        canvas.draw_text_clipped(font, &cost_s, FontStyle::Regular, fs(18.0), col_cost, base, x0 + content_w - 10, theme.warning);
     }
 
     // Subtle scroll indicator on right edge if overflowing
@@ -1864,10 +2103,13 @@ fn render_agent_quota_row(
     accent: Rgb,
     theme: &Theme,
     font: &mut FontEngine,
+    s: f32,
 ) {
-    let bar_y = y + 16;
+    let fs = |base: f32| (base * s).clamp(8.0, 48.0);
+    let sc = |v: i32| ((v as f32) * s).round() as i32;
+    let bar_y = y + sc(23).max(15);
     let bar_w = w.max(20);
-    canvas.fill_rounded_rect(x, bar_y, bar_w, 5, 2, theme.surface_alt, 255);
+    canvas.fill_rounded_rect(x, bar_y, bar_w, 6, 3, theme.surface_alt, 255);
 
     if let Some(used_pct) = quota.live_used_pct {
         // Exact server-side quota percentage (Anthropic OAuth API / Codex rate_limits)
@@ -1886,16 +2128,16 @@ fn render_agent_quota_row(
         } else {
             format!("{:.0}% left", rem_pct.round())
         };
-        let right_w = font.measure_text(&right_str, 10.0);
-        let right_x = (x + w - right_w).max(x + 62);
+        let right_w = font.measure_text(&right_str, fs(16.0));
+        let right_x = (x + w - right_w).max(x + sc(92));
 
         canvas.draw_text_clipped(
             font,
             &left_str,
             FontStyle::Bold,
-            10.5,
+            fs(16.5),
             x,
-            y + 11,
+            y + sc(17),
             right_x - 4,
             theme.fg,
         );
@@ -1903,9 +2145,9 @@ fn render_agent_quota_row(
             font,
             &right_str,
             FontStyle::Regular,
-            10.0,
+            fs(16.0),
             right_x,
-            y + 11,
+            y + sc(17),
             x + w,
             bar_color,
         );
@@ -1913,7 +2155,7 @@ fn render_agent_quota_row(
         let fill_frac = (used_pct / 100.0).clamp(0.0, 1.0);
         let fill_w = ((bar_w as f64) * fill_frac).round() as i32;
         if fill_w > 0 {
-            canvas.fill_rounded_rect(x, bar_y, fill_w.max(3), 5, 2, bar_color, 255);
+            canvas.fill_rounded_rect(x, bar_y, fill_w.max(3), 6, 3, bar_color, 255);
         }
     } else {
         // Local log telemetry only (no server-side % quota API available for this agent)
@@ -1923,16 +2165,16 @@ fn render_agent_quota_row(
         } else {
             "idle".to_string()
         };
-        let right_w = font.measure_text(&right_str, 10.0);
-        let right_x = (x + w - right_w).max(x + 62);
+        let right_w = font.measure_text(&right_str, fs(16.0));
+        let right_x = (x + w - right_w).max(x + sc(92));
 
         canvas.draw_text_clipped(
             font,
             &left_str,
             FontStyle::Bold,
-            10.5,
+            fs(16.5),
             x,
-            y + 11,
+            y + sc(17),
             right_x - 4,
             if quota.used_tokens > 0 { theme.fg } else { theme.fg_muted },
         );
@@ -1940,15 +2182,15 @@ fn render_agent_quota_row(
             font,
             &right_str,
             FontStyle::Regular,
-            10.0,
+            fs(16.0),
             right_x,
-            y + 11,
+            y + sc(17),
             x + w,
             if quota.used_tokens > 0 { accent } else { theme.fg_muted },
         );
 
         if quota.used_tokens > 0 {
-            canvas.fill_rounded_rect(x, bar_y, (bar_w / 3).max(6), 5, 2, accent, 160);
+            canvas.fill_rounded_rect(x, bar_y, (bar_w / 3).max(6), 6, 3, accent, 160);
         }
     }
 }
@@ -1965,6 +2207,10 @@ fn render_monitor_view(
     mv: &MonitorViewState<'_>,
     hit_zones: &mut TabBarHitZones,
 ) {
+    let s = (cfg.monitor_font_size.clamp(9.0, 36.0)) / 18.0;
+    let fs = |base: f32| (base * s).clamp(8.0, 48.0);
+    let sc = |v: i32| ((v as f32) * s).round() as i32;
+
     let top = if cfg.show_tab_bar { TAB_BAR_H as i32 } else { 0 };
     let bottom = if cfg.show_status_bar { STATUS_BAR_H as i32 } else { 0 };
     let pad = 18i32;
@@ -1974,49 +2220,19 @@ fn render_monitor_view(
 
     // Header bar
     let hy = top + 14;
-    canvas.draw_text_clipped(
-        font,
-        "System Monitor",
-        FontStyle::Bold,
-        18.0,
-        content_x,
-        hy + 18,
-        content_x + 220,
-        theme.fg,
-    );
-
-    if let Some(snap) = mv.snapshot {
-        let sub = format!(
-            "up {}  ·  load {:.2} {:.2} {:.2}  ·  {} procs ({} running)",
-            format_uptime(snap.uptime_secs),
-            snap.load_avg.0,
-            snap.load_avg.1,
-            snap.load_avg.2,
-            snap.total_processes,
-            snap.running_processes
-        );
-        canvas.draw_text_clipped(
-            font,
-            &sub,
-            FontStyle::Regular,
-            11.5,
-            content_x,
-            hy + 36,
-            content_x + content_w - 320,
-            theme.fg_muted,
-        );
-    }
+    let btn_h = sc(36).max(24);
+    let btn_base = hy + 4 + sc(24).max(16);
 
     // Right-side controls: Sort pills (CPU, MEM, PID, NAME) + Refresh
     let mut rx = content_x + content_w;
     let ref_label = "Refresh (r)";
-    let ref_w = font.measure_text(ref_label, 11.5) + 18;
+    let ref_w = font.measure_text(ref_label, fs(17.5)) + 22;
     rx -= ref_w;
     let ref_rect = Rect {
         x: rx,
         y: hy + 4,
         w: ref_w,
-        h: 26,
+        h: btn_h,
     };
     canvas.fill_rounded_rect(ref_rect.x, ref_rect.y, ref_rect.w, ref_rect.h, 6, theme.surface_alt, 255);
     canvas.stroke_rounded_rect(ref_rect.x, ref_rect.y, ref_rect.w, ref_rect.h, 6, theme.border, 200);
@@ -2024,9 +2240,9 @@ fn render_monitor_view(
         font,
         ref_label,
         FontStyle::Bold,
-        11.5,
-        ref_rect.x + 9,
-        ref_rect.y + 17,
+        fs(17.5),
+        ref_rect.x + 11,
+        btn_base,
         ref_rect.x + ref_rect.w - 4,
         theme.fg,
     );
@@ -2040,13 +2256,13 @@ fn render_monitor_view(
         ProcessSort::Cpu,
     ] {
         let lbl = sort_mode.label();
-        let sw = font.measure_text(lbl, 11.5) + 16;
+        let sw = font.measure_text(lbl, fs(17.5)) + 20;
         rx -= sw + 4;
         let sr = Rect {
             x: rx,
             y: hy + 4,
             w: sw,
-            h: 26,
+            h: btn_h,
         };
         let active = mv.sort == sort_mode;
         canvas.fill_rounded_rect(
@@ -2071,13 +2287,47 @@ fn render_monitor_view(
             font,
             lbl,
             if active { FontStyle::Bold } else { FontStyle::Regular },
-            11.5,
-            sr.x + 8,
-            sr.y + 17,
+            fs(17.5),
+            sr.x + 10,
+            btn_base,
             sr.x + sr.w - 4,
             if active { theme.accent } else { theme.fg_muted },
         );
         hit_zones.monitor_sort_btns.push((sort_mode, sr));
+    }
+
+    let header_max_x = (rx - 12).max(content_x + 180);
+    canvas.draw_text_clipped(
+        font,
+        "System Monitor",
+        FontStyle::Bold,
+        fs(25.0),
+        content_x,
+        hy + sc(24),
+        header_max_x,
+        theme.fg,
+    );
+
+    if let Some(snap) = mv.snapshot {
+        let sub = format!(
+            "up {}  ·  load {:.2} {:.2} {:.2}  ·  {} procs ({} running)",
+            format_uptime(snap.uptime_secs),
+            snap.load_avg.0,
+            snap.load_avg.1,
+            snap.load_avg.2,
+            snap.total_processes,
+            snap.running_processes
+        );
+        canvas.draw_text_clipped(
+            font,
+            &sub,
+            FontStyle::Regular,
+            fs(17.5),
+            content_x,
+            hy + sc(47),
+            header_max_x,
+            theme.fg_muted,
+        );
     }
 
     let Some(snap) = mv.snapshot else {
@@ -2085,19 +2335,19 @@ fn render_monitor_view(
             font,
             "Sampling system metrics...",
             FontStyle::Italic,
-            14.0,
+            fs(20.0),
             content_x,
-            hy + 80,
-            content_x + 300,
+            hy + sc(90),
+            content_x + 380,
             theme.fg_muted,
         );
         return;
     };
 
     // Top 3-card row: CPU | Memory (RAM & Swap) | Disks
-    let cards_y = hy + 48;
+    let cards_y = hy + sc(62).max(btn_h + 14);
     let card_gap = 12i32;
-    let card_h = 178i32;
+    let card_h = sc(254).clamp(170, (content_bottom - cards_y - 140).max(170));
     let card_w = (content_w - card_gap * 2) / 3;
 
     let cpu_x = content_x;
@@ -2114,30 +2364,30 @@ fn render_monitor_view(
         font,
         "CPU",
         FontStyle::Bold,
-        12.0,
+        fs(18.0),
         cpu_x + 14,
-        cards_y + 22,
-        cpu_x + 90,
+        cards_y + sc(28),
+        cpu_x + 130,
         theme.fg_muted,
     );
     let cpu_pct_str = format!("{:.1}%", snap.cpu_total_pct);
-    let cpu_pw = font.measure_text(&cpu_pct_str, 20.0);
+    let cpu_pw = font.measure_text(&cpu_pct_str, fs(28.0));
     canvas.draw_text_clipped(
         font,
         &cpu_pct_str,
         FontStyle::Bold,
-        20.0,
+        fs(28.0),
         cpu_x + card_w - cpu_pw - 14,
-        cards_y + 26,
+        cards_y + sc(32),
         cpu_x + card_w - 8,
         cpu_color,
     );
 
     // Live btop-style sparkline graph
     let graph_x = cpu_x + 14;
-    let graph_y = cards_y + 36;
+    let graph_y = cards_y + sc(46);
     let graph_w = card_w - 28;
-    let graph_h = 54i32;
+    let graph_h = sc(52).max(32);
     canvas.fill_rounded_rect(graph_x, graph_y, graph_w, graph_h, 6, theme.bg, 255);
     if !snap.cpu_history.is_empty() && graph_w > 20 {
         let max_bars = 48usize;
@@ -2153,35 +2403,38 @@ fn render_monitor_view(
         }
     }
 
-    // Per-core mini bars (2 columns, up to 8 rows = 16 cores)
+    // Per-core mini bars (2 columns, up to 6 rows = 12 cores)
     let cores_y = graph_y + graph_h + 10;
     let max_cores = snap.cpu_cores_pct.len().min(12);
     let half_w = (card_w - 36) / 2;
+    let core_row_step = sc(22).max(14);
     for (ci, &cpct) in snap.cpu_cores_pct.iter().take(max_cores).enumerate() {
         let col_idx = (ci % 2) as i32;
         let row_idx = (ci / 2) as i32;
         let cx = cpu_x + 14 + col_idx * (half_w + 8);
-        let cy = cores_y + row_idx * 12;
-        if cy + 10 > cards_y + card_h - 6 {
+        let cy = cores_y + row_idx * core_row_step;
+        if cy + sc(18) > cards_y + card_h - 6 {
             break;
         }
         let lbl = format!("C{ci}");
-        canvas.draw_text_clipped(font, &lbl, FontStyle::Regular, 9.5, cx, cy + 8, cx + 22, theme.fg_muted);
-        let bar_x = cx + 24;
-        let bar_w = (half_w - 52).max(16);
-        canvas.fill_rounded_rect(bar_x, cy + 2, bar_w, 6, 3, theme.bg, 255);
+        let lbl_w = sc(36).max(24);
+        canvas.draw_text_clipped(font, &lbl, FontStyle::Regular, fs(15.5), cx, cy + sc(15), cx + lbl_w, theme.fg_muted);
+        let bar_x = cx + lbl_w + 2;
+        let pct_col_w = sc(48).max(32);
+        let bar_w = (half_w - lbl_w - pct_col_w - 6).max(16);
+        canvas.fill_rounded_rect(bar_x, cy + sc(6), bar_w, 7, 3, theme.bg, 255);
         let fill_w = ((cpct / 100.0) * bar_w as f32).round() as i32;
         if fill_w > 0 {
-            canvas.fill_rounded_rect(bar_x, cy + 2, fill_w.min(bar_w), 6, 3, load_color(cpct, theme), 255);
+            canvas.fill_rounded_rect(bar_x, cy + sc(6), fill_w.min(bar_w), 7, 3, load_color(cpct, theme), 255);
         }
         let pct_s = format!("{:.0}%", cpct);
         canvas.draw_text_clipped(
             font,
             &pct_s,
             FontStyle::Regular,
-            9.5,
+            fs(15.5),
             bar_x + bar_w + 4,
-            cy + 8,
+            cy + sc(15),
             cx + half_w,
             theme.fg_muted,
         );
@@ -2197,28 +2450,28 @@ fn render_monitor_view(
         font,
         "MEMORY (RAM)",
         FontStyle::Bold,
-        12.0,
+        fs(18.0),
         mem_x + 14,
-        cards_y + 22,
-        mem_x + 150,
+        cards_y + sc(28),
+        mem_x + 210,
         theme.fg_muted,
     );
     let mem_pct_str = format!("{:.1}%", mem.used_pct);
-    let mem_pw = font.measure_text(&mem_pct_str, 20.0);
+    let mem_pw = font.measure_text(&mem_pct_str, fs(28.0));
     canvas.draw_text_clipped(
         font,
         &mem_pct_str,
         FontStyle::Bold,
-        20.0,
+        fs(28.0),
         mem_x + card_w - mem_pw - 14,
-        cards_y + 26,
+        cards_y + sc(32),
         mem_x + card_w - 8,
         mem_color,
     );
 
     // Segmented RAM bar (Used + Cached + Free)
     let mbar_x = mem_x + 14;
-    let mbar_y = cards_y + 38;
+    let mbar_y = cards_y + sc(46);
     let mbar_w = card_w - 28;
     canvas.fill_rounded_rect(mbar_x, mbar_y, mbar_w, 12, 6, theme.bg, 255);
     if mem.total_bytes > 0 {
@@ -2254,24 +2507,28 @@ fn render_monitor_view(
             theme.accent,
         ),
     ];
+    let mem_step = sc(28).max(18);
     for (ri, (label, val, col)) in mem_rows.iter().enumerate() {
-        let ry = cards_y + 68 + (ri as i32) * 18;
+        let ry = cards_y + sc(84) + (ri as i32) * mem_step;
+        if ry > cards_y + card_h - 6 {
+            break;
+        }
         canvas.draw_text_clipped(
             font,
             label,
             FontStyle::Regular,
-            11.5,
+            fs(17.5),
             mem_x + 14,
             ry,
             mem_x + card_w / 2,
             theme.fg_muted,
         );
-        let vw = font.measure_text(val, 11.5);
+        let vw = font.measure_text(val, fs(17.5));
         canvas.draw_text_clipped(
             font,
             val,
             FontStyle::Bold,
-            11.5,
+            fs(17.5),
             mem_x + card_w - vw - 14,
             ry,
             mem_x + card_w - 8,
@@ -2287,21 +2544,21 @@ fn render_monitor_view(
         font,
         "DISKS",
         FontStyle::Bold,
-        12.0,
+        fs(18.0),
         disk_x + 14,
-        cards_y + 22,
-        disk_x + 120,
+        cards_y + sc(28),
+        disk_x + 140,
         theme.fg_muted,
     );
     let dcount = format!("{} mounted", snap.disks.len());
-    let dcw = font.measure_text(&dcount, 11.0);
+    let dcw = font.measure_text(&dcount, fs(17.0));
     canvas.draw_text_clipped(
         font,
         &dcount,
         FontStyle::Regular,
-        11.0,
+        fs(17.0),
         disk_x + disk_w - dcw - 14,
-        cards_y + 22,
+        cards_y + sc(28),
         disk_x + disk_w - 8,
         theme.fg_muted,
     );
@@ -2311,26 +2568,30 @@ fn render_monitor_view(
             font,
             "No mounted block disks found",
             FontStyle::Italic,
-            12.0,
+            fs(18.0),
             disk_x + 14,
-            cards_y + 56,
+            cards_y + sc(66),
             disk_x + disk_w - 14,
             theme.fg_muted,
         );
     } else {
+        let disk_step = sc(66).max(46);
         for (di, d) in snap.disks.iter().take(3).enumerate() {
-            let dy = cards_y + 38 + (di as i32) * 44;
+            let dy = cards_y + sc(48) + (di as i32) * disk_step;
+            if dy + sc(46) > cards_y + card_h - 4 {
+                break;
+            }
             let dcol = load_color(d.used_pct, theme);
             let title = format!("{} ({})", d.mount, d.fs_type);
             let pct_s = format!("{:.0}%", d.used_pct);
-            let pw = font.measure_text(&pct_s, 11.5);
+            let pw = font.measure_text(&pct_s, fs(17.5));
             canvas.draw_text_clipped(
                 font,
                 &title,
                 FontStyle::Bold,
-                11.5,
+                fs(17.5),
                 disk_x + 14,
-                dy + 11,
+                dy + sc(17),
                 disk_x + disk_w - pw - 22,
                 theme.fg,
             );
@@ -2338,9 +2599,9 @@ fn render_monitor_view(
                 font,
                 &pct_s,
                 FontStyle::Bold,
-                11.5,
+                fs(17.5),
                 disk_x + disk_w - pw - 14,
-                dy + 11,
+                dy + sc(17),
                 disk_x + disk_w - 8,
                 dcol,
             );
@@ -2348,10 +2609,10 @@ fn render_monitor_view(
             // Progress bar
             let bx = disk_x + 14;
             let bw = disk_w - 28;
-            canvas.fill_rounded_rect(bx, dy + 16, bw, 7, 3, theme.bg, 255);
+            canvas.fill_rounded_rect(bx, dy + sc(25), bw, 8, 4, theme.bg, 255);
             let fw = ((d.used_pct / 100.0) * bw as f32).round() as i32;
             if fw > 0 {
-                canvas.fill_rounded_rect(bx, dy + 16, fw.min(bw), 7, 3, dcol, 255);
+                canvas.fill_rounded_rect(bx, dy + sc(25), fw.min(bw), 8, 4, dcol, 255);
             }
 
             let detail = format!(
@@ -2364,9 +2625,9 @@ fn render_monitor_view(
                 font,
                 &detail,
                 FontStyle::Regular,
-                10.5,
+                fs(16.5),
                 disk_x + 14,
-                dy + 35,
+                dy + sc(53),
                 disk_x + disk_w - 12,
                 theme.fg_muted,
             );
@@ -2385,22 +2646,22 @@ fn render_monitor_view(
         font,
         &ptitle,
         FontStyle::Bold,
-        12.0,
+        fs(18.0),
         content_x + 14,
-        proc_y + 22,
-        content_x + 220,
+        proc_y + sc(28),
+        content_x + 300,
         theme.fg_muted,
     );
     let hint = "↑↓ select  ·  c/m/p/n sort  ·  k terminate  ·  K kill  ·  Esc close";
-    let hw = font.measure_text(hint, 11.0);
-    if content_w > hw + 220 {
+    let hw = font.measure_text(hint, fs(16.5));
+    if content_w > hw + 300 {
         canvas.draw_text_clipped(
             font,
             hint,
             FontStyle::Regular,
-            11.0,
+            fs(16.5),
             content_x + content_w - hw - 14,
-            proc_y + 22,
+            proc_y + sc(28),
             content_x + content_w - 10,
             theme.fg_muted,
         );
@@ -2408,19 +2669,19 @@ fn render_monitor_view(
 
     // Column layout
     let col_pid = content_x + 16;
-    let col_name = content_x + 88;
-    let col_mem_pct = content_x + content_w - 72;
-    let col_mem = col_mem_pct - 96;
-    let col_cpu = col_mem - 84;
-    let col_thr = col_cpu - 54;
-    let col_state = col_thr - 44;
+    let col_name = content_x + sc(112).clamp(70, 180);
+    let col_mem_pct = content_x + content_w - sc(96).clamp(64, 150);
+    let col_mem = col_mem_pct - sc(132).clamp(84, 210);
+    let col_cpu = col_mem - sc(110).clamp(72, 175);
+    let col_thr = col_cpu - sc(72).clamp(48, 115);
+    let col_state = col_thr - sc(52).clamp(36, 85);
 
-    let hdr_y = proc_y + 42;
+    let hdr_y = proc_y + sc(56);
     canvas.draw_text_clipped(
         font,
         "PID",
         FontStyle::Bold,
-        11.0,
+        fs(17.0),
         col_pid,
         hdr_y,
         col_name - 6,
@@ -2430,19 +2691,19 @@ fn render_monitor_view(
         font,
         "COMMAND",
         FontStyle::Bold,
-        11.0,
+        fs(17.0),
         col_name,
         hdr_y,
         col_state - 8,
         if mv.sort == ProcessSort::Name { theme.accent } else { theme.fg_muted },
     );
-    canvas.draw_text_clipped(font, "S", FontStyle::Bold, 11.0, col_state, hdr_y, col_thr - 4, theme.fg_muted);
-    canvas.draw_text_clipped(font, "THR", FontStyle::Bold, 11.0, col_thr, hdr_y, col_cpu - 4, theme.fg_muted);
+    canvas.draw_text_clipped(font, "S", FontStyle::Bold, fs(17.0), col_state, hdr_y, col_thr - 4, theme.fg_muted);
+    canvas.draw_text_clipped(font, "THR", FontStyle::Bold, fs(17.0), col_thr, hdr_y, col_cpu - 4, theme.fg_muted);
     canvas.draw_text_clipped(
         font,
         "CPU %",
         FontStyle::Bold,
-        11.0,
+        fs(17.0),
         col_cpu,
         hdr_y,
         col_mem - 6,
@@ -2452,7 +2713,7 @@ fn render_monitor_view(
         font,
         "MEMORY",
         FontStyle::Bold,
-        11.0,
+        fs(17.0),
         col_mem,
         hdr_y,
         col_mem_pct - 6,
@@ -2462,16 +2723,16 @@ fn render_monitor_view(
         font,
         "MEM %",
         FontStyle::Bold,
-        11.0,
+        fs(17.0),
         col_mem_pct,
         hdr_y,
         content_x + content_w - 10,
         if mv.sort == ProcessSort::Memory { theme.accent } else { theme.fg_muted },
     );
-    canvas.fill_rect(content_x + 10, hdr_y + 6, content_w - 20, 1, theme.border);
+    canvas.fill_rect(content_x + 10, hdr_y + 10, content_w - 20, 1, theme.border);
 
-    let list_y = hdr_y + 12;
-    let row_h = 24i32;
+    let list_y = hdr_y + 16;
+    let row_h = sc(34).max(20);
     let max_rows = ((proc_y + proc_h - list_y - 8) / row_h).max(1) as usize;
     let start = mv.scroll.min(snap.processes.len().saturating_sub(1));
 
@@ -2488,12 +2749,12 @@ fn render_monitor_view(
 
         if is_sel {
             canvas.fill_rounded_rect(row_rect.x, row_rect.y, row_rect.w, row_rect.h, 6, theme.accent_soft, 255);
-            canvas.fill_rounded_rect(row_rect.x, row_rect.y + 4, 3, row_rect.h - 8, 1, theme.accent, 255);
+            canvas.fill_rounded_rect(row_rect.x, row_rect.y + 4, 3, (row_rect.h - 8).max(4), 1, theme.accent, 255);
         } else if vi % 2 == 1 {
             canvas.fill_rounded_rect(row_rect.x, row_rect.y, row_rect.w, row_rect.h, 4, theme.bg, 90);
         }
 
-        let ty = ry + 15;
+        let ty = ry + sc(23).max(14);
         let pid_s = format!("{}", p.pid);
         let state_s = p.state.to_string();
         let thr_s = format!("{}", p.threads);
@@ -2524,35 +2785,35 @@ fn render_monitor_view(
             theme.info
         };
 
-        canvas.draw_text_clipped(font, &pid_s, FontStyle::Regular, 12.0, col_pid, ty, col_name - 6, theme.fg_muted);
+        canvas.draw_text_clipped(font, &pid_s, FontStyle::Regular, fs(18.0), col_pid, ty, col_name - 6, theme.fg_muted);
         canvas.draw_text_clipped(
             font,
             &p.name,
             if is_sel { FontStyle::Bold } else { FontStyle::Regular },
-            12.0,
+            fs(18.0),
             col_name,
             ty,
             col_state - 8,
             name_col,
         );
-        canvas.draw_text_clipped(font, &state_s, FontStyle::Bold, 11.5, col_state, ty, col_thr - 4, state_col);
-        canvas.draw_text_clipped(font, &thr_s, FontStyle::Regular, 11.5, col_thr, ty, col_cpu - 4, theme.fg_muted);
+        canvas.draw_text_clipped(font, &state_s, FontStyle::Bold, fs(17.5), col_state, ty, col_thr - 4, state_col);
+        canvas.draw_text_clipped(font, &thr_s, FontStyle::Regular, fs(17.5), col_thr, ty, col_cpu - 4, theme.fg_muted);
         canvas.draw_text_clipped(
             font,
             &cpu_s,
             if p.cpu_pct >= 10.0 { FontStyle::Bold } else { FontStyle::Regular },
-            12.0,
+            fs(18.0),
             col_cpu,
             ty,
             col_mem - 6,
             cpu_col,
         );
-        canvas.draw_text_clipped(font, &mem_s, FontStyle::Regular, 12.0, col_mem, ty, col_mem_pct - 6, mem_col);
+        canvas.draw_text_clipped(font, &mem_s, FontStyle::Regular, fs(18.0), col_mem, ty, col_mem_pct - 6, mem_col);
         canvas.draw_text_clipped(
             font,
             &memp_s,
             FontStyle::Regular,
-            12.0,
+            fs(18.0),
             col_mem_pct,
             ty,
             content_x + content_w - 10,
@@ -2570,5 +2831,1304 @@ fn load_color(pct: f32, theme: &Theme) -> Rgb {
         theme.warning
     } else {
         theme.success
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_commands_view(
+    canvas: &mut Canvas<'_>,
+    width: usize,
+    height: usize,
+    cfg: &Config,
+    theme: &Theme,
+    font: &mut FontEngine,
+    cv: &CommandsViewState<'_>,
+    hit_zones: &mut TabBarHitZones,
+) {
+    let s = (cfg.commands_font_size.clamp(9.0, 36.0)) / 18.0;
+    let fs = |base: f32| (base * s).clamp(8.0, 48.0);
+    let sc = |v: i32| ((v as f32) * s).round() as i32;
+
+    let top = if cfg.show_tab_bar { TAB_BAR_H as i32 } else { 0 };
+    let bottom = if cfg.show_status_bar {
+        (height.saturating_sub(STATUS_BAR_H)) as i32
+    } else {
+        height as i32
+    };
+    let pad = 20i32;
+    let content_x = pad;
+    let content_w = (width as i32 - pad * 2).max(400);
+    let content_bottom = bottom - 12;
+
+    // Header bar
+    let hy = top + 14;
+    let running_count = cv.entries.iter().filter(|e| e.status.is_active()).count();
+    let hdr_btn_h = sc(38).max(26);
+    let hdr_btn_base = hy + 4 + sc(25).max(17);
+
+    // Header right buttons: "+ Add Command (a)" and optional "Stop All (S)"
+    let mut rx = content_x + content_w;
+
+    let add_label = "+ Add Command (a)";
+    let add_w = font.measure_text(add_label, fs(17.5)) + 24;
+    rx -= add_w;
+    let add_rect = Rect {
+        x: rx,
+        y: hy + 4,
+        w: add_w,
+        h: hdr_btn_h,
+    };
+    canvas.fill_rounded_rect(add_rect.x, add_rect.y, add_rect.w, add_rect.h, 6, theme.accent_soft, 255);
+    canvas.stroke_rounded_rect(add_rect.x, add_rect.y, add_rect.w, add_rect.h, 6, theme.accent, 220);
+    canvas.draw_text_clipped(
+        font,
+        add_label,
+        FontStyle::Bold,
+        fs(17.5),
+        add_rect.x + 12,
+        hdr_btn_base,
+        add_rect.x + add_rect.w - 4,
+        theme.accent,
+    );
+    hit_zones.cmd_add_btn = Some(add_rect);
+
+    if running_count > 0 {
+        let stop_all_label = "Stop All (S)";
+        let stop_all_w = font.measure_text(stop_all_label, fs(17.5)) + 22;
+        rx -= stop_all_w + 8;
+        let stop_all_rect = Rect {
+            x: rx,
+            y: hy + 4,
+            w: stop_all_w,
+            h: hdr_btn_h,
+        };
+        canvas.fill_rounded_rect(
+            stop_all_rect.x,
+            stop_all_rect.y,
+            stop_all_rect.w,
+            stop_all_rect.h,
+            6,
+            theme.surface_alt,
+            255,
+        );
+        canvas.stroke_rounded_rect(
+            stop_all_rect.x,
+            stop_all_rect.y,
+            stop_all_rect.w,
+            stop_all_rect.h,
+            6,
+            theme.danger,
+            200,
+        );
+        canvas.draw_text_clipped(
+            font,
+            stop_all_label,
+            FontStyle::Bold,
+            fs(17.5),
+            stop_all_rect.x + 11,
+            hdr_btn_base,
+            stop_all_rect.x + stop_all_rect.w - 4,
+            theme.danger,
+        );
+        hit_zones.cmd_stop_all_btn = Some(stop_all_rect);
+    }
+
+    let header_max_x = (rx - 12).max(content_x + 180);
+    canvas.draw_text_clipped(
+        font,
+        "Commands",
+        FontStyle::Bold,
+        fs(25.0),
+        content_x,
+        hy + sc(24),
+        header_max_x,
+        theme.fg,
+    );
+
+    let sub = format!(
+        "{} total  ·  {} active  ·  saved in commands.toml",
+        cv.entries.len(),
+        running_count
+    );
+    canvas.draw_text_clipped(
+        font,
+        &sub,
+        FontStyle::Regular,
+        fs(17.5),
+        content_x,
+        hy + sc(47),
+        header_max_x,
+        theme.fg_muted,
+    );
+
+    let mut cur_y = hy + sc(62).max(hdr_btn_h + 14);
+
+    // Inline Add / Edit Form card
+    if let Some(ref form) = cv.form {
+        let form_h = if form.error.is_some() { sc(206).max(150) } else { sc(178).max(130) };
+        canvas.fill_rounded_rect(content_x, cur_y, content_w, form_h, 10, theme.surface, 255);
+        canvas.stroke_rounded_rect(content_x, cur_y, content_w, form_h, 10, theme.accent, 220);
+
+        let form_title = if form.is_edit {
+            "EDIT COMMAND"
+        } else {
+            "ADD & LAUNCH COMMAND"
+        };
+        canvas.draw_text_clipped(
+            font,
+            form_title,
+            FontStyle::Bold,
+            fs(18.0),
+            content_x + 14,
+            cur_y + sc(28),
+            content_x + 360,
+            theme.accent,
+        );
+        let fhint = "Tab switch field  ·  Ctrl+V paste  ·  Enter submit  ·  Esc cancel";
+        let fhw = font.measure_text(fhint, fs(16.5));
+        if content_w > fhw + 340 {
+            canvas.draw_text_clipped(
+                font,
+                fhint,
+                FontStyle::Regular,
+                fs(16.5),
+                content_x + content_w - fhw - 14,
+                cur_y + sc(28),
+                content_x + content_w - 10,
+                theme.fg_muted,
+            );
+        }
+
+        // Two side-by-side input fields: Command (55%) | Directory (45%)
+        let inner_x = content_x + 14;
+        let inner_w = content_w - 28;
+        let gap = 12i32;
+        let cmd_fw = (inner_w - gap) * 55 / 100;
+        let dir_fw = inner_w - gap - cmd_fw;
+        let field_y = cur_y + sc(60);
+        let field_h = sc(42).max(28);
+
+        // Command input
+        canvas.draw_text_clipped(
+            font,
+            "Command",
+            FontStyle::Bold,
+            fs(17.0),
+            inner_x,
+            field_y - 8,
+            inner_x + cmd_fw,
+            if form.active_field == CommandFormField::Command {
+                theme.accent
+            } else {
+                theme.fg_muted
+            },
+        );
+        let cmd_field_rect = Rect {
+            x: inner_x,
+            y: field_y,
+            w: cmd_fw,
+            h: field_h,
+        };
+        let cmd_focused = form.active_field == CommandFormField::Command;
+        canvas.fill_rounded_rect(cmd_field_rect.x, cmd_field_rect.y, cmd_field_rect.w, cmd_field_rect.h, 6, theme.bg, 255);
+        canvas.stroke_rounded_rect(
+            cmd_field_rect.x,
+            cmd_field_rect.y,
+            cmd_field_rect.w,
+            cmd_field_rect.h,
+            6,
+            if cmd_focused { theme.accent } else { theme.border },
+            255,
+        );
+        if form.command_input.is_empty() && !cmd_focused {
+            canvas.draw_text_clipped(
+                font,
+                "e.g. docker-compose up -d",
+                FontStyle::Italic,
+                fs(18.5),
+                cmd_field_rect.x + 10,
+                cmd_field_rect.y + sc(28).max(18),
+                cmd_field_rect.x + cmd_field_rect.w - 10,
+                theme.fg_muted,
+            );
+        } else {
+            let end_x = canvas.draw_text_clipped(
+                font,
+                form.command_input,
+                FontStyle::Regular,
+                fs(18.5),
+                cmd_field_rect.x + 10,
+                cmd_field_rect.y + sc(28).max(18),
+                cmd_field_rect.x + cmd_field_rect.w - 12,
+                theme.fg,
+            );
+            if cmd_focused && cv.cursor_blink_on {
+                canvas.fill_rect(
+                    (end_x + 1).min(cmd_field_rect.x + cmd_field_rect.w - 6),
+                    cmd_field_rect.y + 7,
+                    2,
+                    (field_h - 14).max(12),
+                    theme.accent,
+                );
+            }
+        }
+        hit_zones.cmd_form_cmd_field = Some(cmd_field_rect);
+
+        // Directory input
+        let dir_x = inner_x + cmd_fw + gap;
+        canvas.draw_text_clipped(
+            font,
+            "Working Directory",
+            FontStyle::Bold,
+            fs(17.0),
+            dir_x,
+            field_y - 8,
+            dir_x + dir_fw,
+            if form.active_field == CommandFormField::Directory {
+                theme.accent
+            } else {
+                theme.fg_muted
+            },
+        );
+        let dir_field_rect = Rect {
+            x: dir_x,
+            y: field_y,
+            w: dir_fw,
+            h: field_h,
+        };
+        let dir_focused = form.active_field == CommandFormField::Directory;
+        canvas.fill_rounded_rect(dir_field_rect.x, dir_field_rect.y, dir_field_rect.w, dir_field_rect.h, 6, theme.bg, 255);
+        canvas.stroke_rounded_rect(
+            dir_field_rect.x,
+            dir_field_rect.y,
+            dir_field_rect.w,
+            dir_field_rect.h,
+            6,
+            if dir_focused { theme.accent } else { theme.border },
+            255,
+        );
+        if form.directory_input.is_empty() && !dir_focused {
+            canvas.draw_text_clipped(
+                font,
+                "e.g. ~/projects/my-app",
+                FontStyle::Italic,
+                fs(18.5),
+                dir_field_rect.x + 10,
+                dir_field_rect.y + sc(28).max(18),
+                dir_field_rect.x + dir_field_rect.w - 10,
+                theme.fg_muted,
+            );
+        } else {
+            let end_x = canvas.draw_text_clipped(
+                font,
+                form.directory_input,
+                FontStyle::Regular,
+                fs(18.5),
+                dir_field_rect.x + 10,
+                dir_field_rect.y + sc(28).max(18),
+                dir_field_rect.x + dir_field_rect.w - 12,
+                theme.fg,
+            );
+            if dir_focused && cv.cursor_blink_on {
+                canvas.fill_rect(
+                    (end_x + 1).min(dir_field_rect.x + dir_field_rect.w - 6),
+                    dir_field_rect.y + 7,
+                    2,
+                    (field_h - 14).max(12),
+                    theme.accent,
+                );
+            }
+        }
+        hit_zones.cmd_form_dir_field = Some(dir_field_rect);
+
+        // Error message if any
+        let btn_y = if let Some(err) = form.error {
+            canvas.draw_text_clipped(
+                font,
+                err,
+                FontStyle::Bold,
+                fs(17.0),
+                inner_x,
+                field_y + field_h + sc(22),
+                inner_x + inner_w,
+                theme.danger,
+            );
+            field_y + field_h + sc(36)
+        } else {
+            field_y + field_h + sc(18)
+        };
+
+        // Action buttons: Primary ("Add & Run" / "Save"), Secondary ("Save Only" / "Save & Run"), Cancel
+        let fbtn_h = sc(38).max(26);
+        let fbtn_base = btn_y + sc(25).max(17);
+        let primary_label = if form.is_edit { "Save" } else { "Add & Run" };
+        let pw = font.measure_text(primary_label, fs(17.5)) + 26;
+        let primary_rect = Rect {
+            x: inner_x,
+            y: btn_y,
+            w: pw,
+            h: fbtn_h,
+        };
+        canvas.fill_rounded_rect(primary_rect.x, primary_rect.y, primary_rect.w, primary_rect.h, 6, theme.success, 40);
+        canvas.stroke_rounded_rect(primary_rect.x, primary_rect.y, primary_rect.w, primary_rect.h, 6, theme.success, 230);
+        canvas.draw_text_clipped(
+            font,
+            primary_label,
+            FontStyle::Bold,
+            fs(17.5),
+            primary_rect.x + 13,
+            fbtn_base,
+            primary_rect.x + primary_rect.w - 4,
+            theme.success,
+        );
+        hit_zones.cmd_form_primary_btn = Some(primary_rect);
+
+        let secondary_label = if form.is_edit { "Save & Run" } else { "Save Only" };
+        let sw = font.measure_text(secondary_label, fs(17.5)) + 24;
+        let secondary_rect = Rect {
+            x: primary_rect.x + primary_rect.w + 8,
+            y: btn_y,
+            w: sw,
+            h: fbtn_h,
+        };
+        canvas.fill_rounded_rect(secondary_rect.x, secondary_rect.y, secondary_rect.w, secondary_rect.h, 6, theme.surface_alt, 255);
+        canvas.stroke_rounded_rect(secondary_rect.x, secondary_rect.y, secondary_rect.w, secondary_rect.h, 6, theme.border, 220);
+        canvas.draw_text_clipped(
+            font,
+            secondary_label,
+            FontStyle::Bold,
+            fs(17.5),
+            secondary_rect.x + 12,
+            fbtn_base,
+            secondary_rect.x + secondary_rect.w - 4,
+            theme.fg,
+        );
+        hit_zones.cmd_form_secondary_btn = Some(secondary_rect);
+
+        let cancel_label = "Cancel";
+        let cw = font.measure_text(cancel_label, fs(17.5)) + 22;
+        let cancel_rect = Rect {
+            x: secondary_rect.x + secondary_rect.w + 8,
+            y: btn_y,
+            w: cw,
+            h: fbtn_h,
+        };
+        canvas.fill_rounded_rect(cancel_rect.x, cancel_rect.y, cancel_rect.w, cancel_rect.h, 6, theme.surface_alt, 180);
+        canvas.draw_text_clipped(
+            font,
+            cancel_label,
+            FontStyle::Regular,
+            fs(17.5),
+            cancel_rect.x + 11,
+            fbtn_base,
+            cancel_rect.x + cancel_rect.w - 4,
+            theme.fg_muted,
+        );
+        hit_zones.cmd_form_cancel_btn = Some(cancel_rect);
+
+        cur_y += form_h + 12;
+    }
+
+    // Split remaining space between Commands List (top ~56%) and Selected Command Output (bottom ~44%)
+    let remaining_h = (content_bottom - cur_y).max(180);
+    let log_h = if cv.entries.is_empty() {
+        0
+    } else {
+        (remaining_h * 40 / 100).clamp(110, 240)
+    };
+    let list_h = if log_h > 0 {
+        remaining_h - log_h - 12
+    } else {
+        remaining_h
+    };
+
+    // --- COMMANDS LIST CARD ---
+    canvas.fill_rounded_rect(content_x, cur_y, content_w, list_h, 10, theme.surface, 255);
+    canvas.stroke_rounded_rect(content_x, cur_y, content_w, list_h, 10, theme.border, 220);
+
+    canvas.draw_text_clipped(
+        font,
+        "LAUNCHED COMMANDS",
+        FontStyle::Bold,
+        fs(18.0),
+        content_x + 14,
+        cur_y + sc(28),
+        content_x + 320,
+        theme.fg_muted,
+    );
+    let hint = "a add  ·  s start/stop  ·  e edit  ·  x delete  ·  ↑↓ select  ·  Esc close";
+    let hw = font.measure_text(hint, fs(16.5));
+    if content_w > hw + 320 {
+        canvas.draw_text_clipped(
+            font,
+            hint,
+            FontStyle::Regular,
+            fs(16.5),
+            content_x + content_w - hw - 14,
+            cur_y + sc(28),
+            content_x + content_w - 10,
+            theme.fg_muted,
+        );
+    }
+    let list_hdr_h = sc(42).max(28);
+    canvas.fill_rect(content_x + 10, cur_y + list_hdr_h, content_w - 20, 1, theme.border);
+
+    if cv.entries.is_empty() {
+        let empty_msg = "No commands yet. Click '+ Add Command' or press 'a' to launch one (e.g. docker-compose up -d).";
+        canvas.draw_text_clipped(
+            font,
+            empty_msg,
+            FontStyle::Italic,
+            fs(19.0),
+            content_x + 18,
+            cur_y + list_hdr_h + sc(38),
+            content_x + content_w - 18,
+            theme.fg_muted,
+        );
+    } else {
+        let list_y = cur_y + list_hdr_h + 8;
+        let row_h = sc(72).max(46);
+        let max_rows = ((list_h - list_hdr_h - 16) / row_h).max(1) as usize;
+        let start = cv.scroll.min(cv.entries.len().saturating_sub(1));
+
+        for (vi, entry) in cv.entries.iter().skip(start).take(max_rows).enumerate() {
+            let real_idx = start + vi;
+            let ry = list_y + (vi as i32) * row_h;
+            let is_sel = real_idx == cv.selected;
+            let row_rect = Rect {
+                x: content_x + 10,
+                y: ry,
+                w: content_w - 20,
+                h: row_h - 6,
+            };
+
+            if is_sel {
+                canvas.fill_rounded_rect(row_rect.x, row_rect.y, row_rect.w, row_rect.h, 8, theme.accent_soft, 255);
+                canvas.stroke_rounded_rect(row_rect.x, row_rect.y, row_rect.w, row_rect.h, 8, theme.accent, 140);
+                canvas.fill_rounded_rect(row_rect.x, row_rect.y + 8, 3, (row_rect.h - 16).max(6), 1, theme.accent, 255);
+            } else {
+                canvas.fill_rounded_rect(row_rect.x, row_rect.y, row_rect.w, row_rect.h, 8, theme.bg, 140);
+            }
+
+            // Status color & pill
+            let (st_col, st_bg_alpha) = match entry.status {
+                CommandStatus::Running => (theme.success, 36),
+                CommandStatus::Detached => (theme.info, 36),
+                CommandStatus::Stopping => (theme.warning, 36),
+                CommandStatus::Stopped | CommandStatus::Idle => (theme.fg_muted, 24),
+                CommandStatus::Exited(0) => (theme.info, 28),
+                CommandStatus::Exited(_) | CommandStatus::Failed => (theme.danger, 36),
+            };
+            let st_label = entry.status.label();
+            let badge_w = sc(116).clamp(80, 190);
+            let badge_h = sc(32).max(22);
+            let badge_x = row_rect.x + 12;
+            let badge_y = row_rect.y + (row_rect.h - badge_h) / 2;
+            canvas.fill_rounded_rect(badge_x, badge_y, badge_w, badge_h, 6, st_col, st_bg_alpha);
+            canvas.fill_rounded_rect(badge_x + 8, badge_y + badge_h / 2 - 3, 6, 6, 3, st_col, 255);
+            canvas.draw_text_clipped(
+                font,
+                &st_label,
+                FontStyle::Bold,
+                fs(16.5),
+                badge_x + 20,
+                badge_y + sc(22).max(15),
+                badge_x + badge_w - 4,
+                st_col,
+            );
+
+            // Right-side action buttons: [Stop/Start] [Edit] [×]
+            let btn_h = sc(36).max(24);
+            let btn_y = row_rect.y + (row_rect.h - btn_h) / 2;
+            let del_w = sc(38).max(28);
+            let del_x = row_rect.x + row_rect.w - del_w - 10;
+            let delete_btn = Rect {
+                x: del_x,
+                y: btn_y,
+                w: del_w,
+                h: btn_h,
+            };
+
+            let edit_w = (font.measure_text("Edit", fs(17.0)) + 24).max(48);
+            let edit_x = del_x - edit_w - 6;
+            let edit_btn = Rect {
+                x: edit_x,
+                y: btn_y,
+                w: edit_w,
+                h: btn_h,
+            };
+
+            let can_stop = entry.status.can_stop();
+            let toggle_label = if can_stop {
+                "Stop"
+            } else if entry.status == CommandStatus::Stopping {
+                "..."
+            } else {
+                "Start"
+            };
+            let toggle_w = (font.measure_text("Start", fs(17.0)) + 28).max(56);
+            let toggle_x = edit_x - toggle_w - 6;
+            let toggle_btn = Rect {
+                x: toggle_x,
+                y: btn_y,
+                w: toggle_w,
+                h: btn_h,
+            };
+
+            // Draw Toggle (Start / Stop) button
+            let toggle_col = if can_stop {
+                theme.danger
+            } else if entry.status == CommandStatus::Stopping {
+                theme.warning
+            } else {
+                theme.success
+            };
+            let act_base = btn_y + sc(24).max(16);
+            canvas.fill_rounded_rect(toggle_btn.x, toggle_btn.y, toggle_btn.w, toggle_btn.h, 6, toggle_col, 32);
+            canvas.stroke_rounded_rect(toggle_btn.x, toggle_btn.y, toggle_btn.w, toggle_btn.h, 6, toggle_col, 200);
+            let tlw = font.measure_text(toggle_label, fs(17.0));
+            canvas.draw_text_clipped(
+                font,
+                toggle_label,
+                FontStyle::Bold,
+                fs(17.0),
+                toggle_btn.x + (toggle_btn.w - tlw) / 2,
+                act_base,
+                toggle_btn.x + toggle_btn.w - 2,
+                toggle_col,
+            );
+
+            // Draw Edit button
+            canvas.fill_rounded_rect(edit_btn.x, edit_btn.y, edit_btn.w, edit_btn.h, 6, theme.surface_alt, 255);
+            canvas.stroke_rounded_rect(edit_btn.x, edit_btn.y, edit_btn.w, edit_btn.h, 6, theme.border, 210);
+            let elw = font.measure_text("Edit", fs(17.0));
+            canvas.draw_text_clipped(
+                font,
+                "Edit",
+                FontStyle::Bold,
+                fs(17.0),
+                edit_btn.x + (edit_btn.w - elw) / 2,
+                act_base,
+                edit_btn.x + edit_btn.w - 2,
+                theme.fg,
+            );
+
+            // Draw Delete (×) button
+            canvas.fill_rounded_rect(delete_btn.x, delete_btn.y, delete_btn.w, delete_btn.h, 6, theme.surface_alt, 200);
+            let dlw = font.measure_text("×", fs(20.0));
+            canvas.draw_text_clipped(
+                font,
+                "×",
+                FontStyle::Bold,
+                fs(20.0),
+                delete_btn.x + (delete_btn.w - dlw) / 2,
+                act_base + 1,
+                delete_btn.x + delete_btn.w - 2,
+                theme.fg_muted,
+            );
+
+            // Middle text: Command (top line) & Directory + meta (bottom line)
+            let text_x = badge_x + badge_w + 12;
+            let text_max_x = toggle_x - 12;
+            canvas.draw_text_clipped(
+                font,
+                &entry.command,
+                FontStyle::Bold,
+                fs(19.0),
+                text_x,
+                row_rect.y + sc(26).max(17),
+                text_max_x,
+                theme.fg,
+            );
+
+            let short_dir = shorten_path(Path::new(&entry.directory));
+            let mut meta = short_dir;
+            if let Some(pid) = entry.pid {
+                meta.push_str(&format!("  ·  pid {pid}"));
+            }
+            if let Some(up) = entry.uptime_secs() {
+                meta.push_str(&format!("  ·  up {}", format_elapsed(up)));
+            }
+            canvas.draw_text_clipped(
+                font,
+                &meta,
+                FontStyle::Regular,
+                fs(17.0),
+                text_x,
+                row_rect.y + sc(52).max(34),
+                text_max_x,
+                theme.fg_muted,
+            );
+
+            hit_zones.cmd_rows.push(CommandRowHitZone {
+                index: real_idx,
+                id: entry.id,
+                row_rect,
+                toggle_btn,
+                edit_btn,
+                delete_btn,
+            });
+        }
+    }
+
+    // --- SELECTED COMMAND OUTPUT CARD ---
+    if log_h > 0 {
+        let log_y = cur_y + list_h + 12;
+        let log_rect = Rect {
+            x: content_x,
+            y: log_y,
+            w: content_w,
+            h: log_h,
+        };
+        hit_zones.cmd_log_area = Some(log_rect);
+
+        canvas.fill_rounded_rect(log_rect.x, log_rect.y, log_rect.w, log_rect.h, 10, theme.surface, 255);
+        canvas.stroke_rounded_rect(log_rect.x, log_rect.y, log_rect.w, log_rect.h, 10, theme.border, 220);
+
+        if let Some(sel) = cv.entries.get(cv.selected) {
+            let title = format!("OUTPUT  ·  {}", sel.command);
+            canvas.draw_text_clipped(
+                font,
+                &title,
+                FontStyle::Bold,
+                fs(17.5),
+                log_rect.x + 14,
+                log_rect.y + sc(26).max(18),
+                log_rect.x + log_rect.w - 220,
+                theme.fg_muted,
+            );
+            let dir_short = shorten_path(Path::new(&sel.directory));
+            let dw = font.measure_text(&dir_short, fs(17.0));
+            canvas.draw_text_clipped(
+                font,
+                &dir_short,
+                FontStyle::Regular,
+                fs(17.0),
+                (log_rect.x + log_rect.w - dw - 14).max(log_rect.x + 220),
+                log_rect.y + sc(26).max(18),
+                log_rect.x + log_rect.w - 10,
+                theme.info,
+            );
+            let log_hdr_h = sc(38).max(26);
+            canvas.fill_rect(log_rect.x + 10, log_rect.y + log_hdr_h, log_rect.w - 20, 1, theme.border);
+
+            let inner_y = log_rect.y + log_hdr_h + 6;
+            let line_h = sc(25).max(15);
+            let visible_lines = ((log_rect.h - log_hdr_h - 14) / line_h).max(1) as usize;
+            if sel.logs.is_empty() {
+                canvas.draw_text_clipped(
+                    font,
+                    "No output yet. Press 's' or click Start to run this command.",
+                    FontStyle::Italic,
+                    fs(17.5),
+                    log_rect.x + 14,
+                    inner_y + sc(20).max(14),
+                    log_rect.x + log_rect.w - 14,
+                    theme.fg_muted,
+                );
+            } else {
+                let total = sel.logs.len();
+                let max_offset = total.saturating_sub(visible_lines);
+                let scroll_from_bottom = cv.log_scroll.min(max_offset);
+                let end = total.saturating_sub(scroll_from_bottom);
+                let start = end.saturating_sub(visible_lines);
+                for (i, line) in sel.logs.iter().skip(start).take(end - start).enumerate() {
+                    let ly = inner_y + (i as i32) * line_h + sc(19).max(13);
+                    let col = if line.starts_with('✖') {
+                        theme.danger
+                    } else if line.starts_with('▶') {
+                        theme.success
+                    } else if line.starts_with('■') {
+                        theme.warning
+                    } else if line.starts_with('●') {
+                        theme.info
+                    } else {
+                        theme.fg
+                    };
+                    canvas.draw_text_clipped(
+                        font,
+                        line,
+                        FontStyle::Regular,
+                        fs(17.5),
+                        log_rect.x + 14,
+                        ly,
+                        log_rect.x + log_rect.w - 14,
+                        col,
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_settings_view(
+    canvas: &mut Canvas<'_>,
+    width: usize,
+    height: usize,
+    cfg: &Config,
+    theme: &Theme,
+    font: &mut FontEngine,
+    sv: &SettingsViewState<'_>,
+    hit_zones: &mut TabBarHitZones,
+) {
+    let top = if cfg.show_tab_bar { TAB_BAR_H as i32 } else { 0 };
+    let bottom = if cfg.show_status_bar { STATUS_BAR_H as i32 } else { 0 };
+    let pad = 22i32;
+    let content_x = pad;
+    let content_w = (width as i32 - pad * 2).max(400);
+    let content_bottom = (height as i32 - bottom - 12).max(top + 200);
+
+    // Header
+    let hy = top + 14;
+    let reset_label = "Reset Defaults";
+    let reset_w = font.measure_text(reset_label, 15.5) + 24;
+    let reset_rect = Rect {
+        x: content_x + content_w - reset_w,
+        y: hy + 4,
+        w: reset_w,
+        h: 34,
+    };
+    canvas.fill_rounded_rect(reset_rect.x, reset_rect.y, reset_rect.w, reset_rect.h, 6, theme.surface_alt, 255);
+    canvas.stroke_rounded_rect(reset_rect.x, reset_rect.y, reset_rect.w, reset_rect.h, 6, theme.border, 200);
+    canvas.draw_text_clipped(
+        font,
+        reset_label,
+        FontStyle::Bold,
+        15.5,
+        reset_rect.x + 12,
+        reset_rect.y + 22,
+        reset_rect.x + reset_rect.w - 4,
+        theme.fg_muted,
+    );
+    hit_zones.settings_reset_all_btn = Some(reset_rect);
+
+    let header_max_x = (reset_rect.x - 12).max(content_x + 180);
+    canvas.draw_text_clipped(
+        font,
+        "Settings",
+        FontStyle::Bold,
+        24.0,
+        content_x,
+        hy + 22,
+        header_max_x,
+        theme.fg,
+    );
+    canvas.draw_text_clipped(
+        font,
+        "Changes apply live and save automatically to ~/.config/itsadri-terminal/config.toml",
+        FontStyle::Regular,
+        15.5,
+        content_x,
+        hy + 44,
+        header_max_x,
+        theme.fg_muted,
+    );
+
+    let body_top = hy + 58;
+    canvas.fill_rect(content_x, body_top, content_w, 1, theme.border);
+    let scroll_px = (sv.scroll as i32) * 32;
+    let mut cur_y = body_top + 14 - scroll_px;
+
+    // --- CARD 1: FONT SIZES ---
+    let font_rows = [
+        (
+            SettingsFontTarget::Terminal,
+            "Terminal",
+            "Main terminal grid & shell output",
+            cfg.font_size,
+            0usize,
+        ),
+        (
+            SettingsFontTarget::Commands,
+            "Commands",
+            "Background commands list, form & logs",
+            cfg.commands_font_size,
+            1usize,
+        ),
+        (
+            SettingsFontTarget::Monitor,
+            "Monitor",
+            "CPU, RAM, disks & process table",
+            cfg.monitor_font_size,
+            2usize,
+        ),
+        (
+            SettingsFontTarget::Usage,
+            "Usage",
+            "Agent & model token usage dashboard",
+            cfg.usage_font_size,
+            3usize,
+        ),
+    ];
+
+    let font_row_h = 46i32;
+    let font_card_h = 44 + (font_rows.len() as i32) * font_row_h + 10;
+    if cur_y + font_card_h > body_top && cur_y < content_bottom {
+        canvas.fill_rounded_rect(content_x, cur_y, content_w, font_card_h, 10, theme.surface, 255);
+        canvas.stroke_rounded_rect(content_x, cur_y, content_w, font_card_h, 10, theme.border, 210);
+
+        canvas.draw_text_clipped(
+            font,
+            "FONT SIZES",
+            FontStyle::Bold,
+            15.5,
+            content_x + 14,
+            cur_y + 25,
+            content_x + 260,
+            theme.fg_muted,
+        );
+        let fhint = "← / → adjust  ·  9–36 px";
+        let fhw = font.measure_text(fhint, 14.5);
+        if content_w > fhw + 260 {
+            canvas.draw_text_clipped(
+                font,
+                fhint,
+                FontStyle::Regular,
+                14.5,
+                content_x + content_w - fhw - 14,
+                cur_y + 25,
+                content_x + content_w - 10,
+                theme.fg_muted,
+            );
+        }
+        canvas.fill_rect(content_x + 10, cur_y + 36, content_w - 20, 1, theme.border);
+
+        for (i, &(target, label, desc, size, row_idx)) in font_rows.iter().enumerate() {
+            let ry = cur_y + 44 + (i as i32) * font_row_h;
+            let row_rect = Rect {
+                x: content_x + 10,
+                y: ry,
+                w: content_w - 20,
+                h: font_row_h - 6,
+            };
+            let is_sel = sv.selected == row_idx;
+            if is_sel {
+                canvas.fill_rounded_rect(row_rect.x, row_rect.y, row_rect.w, row_rect.h, 7, theme.accent_soft, 255);
+                canvas.stroke_rounded_rect(row_rect.x, row_rect.y, row_rect.w, row_rect.h, 7, theme.accent, 140);
+                canvas.fill_rounded_rect(row_rect.x, row_rect.y + 6, 3, row_rect.h - 12, 1, theme.accent, 255);
+            } else if i % 2 == 1 {
+                canvas.fill_rounded_rect(row_rect.x, row_rect.y, row_rect.w, row_rect.h, 6, theme.bg, 90);
+            }
+
+            // Right controls: [-]  [18 px]  [+]
+            let btn_s = 30i32;
+            let btn_y = row_rect.y + (row_rect.h - btn_s) / 2;
+            let plus_rect = Rect {
+                x: row_rect.x + row_rect.w - btn_s - 10,
+                y: btn_y,
+                w: btn_s,
+                h: btn_s,
+            };
+            let val_w = 72i32;
+            let val_x = plus_rect.x - val_w - 6;
+            let minus_rect = Rect {
+                x: val_x - btn_s - 6,
+                y: btn_y,
+                w: btn_s,
+                h: btn_s,
+            };
+
+            // Minus button
+            canvas.fill_rounded_rect(minus_rect.x, minus_rect.y, minus_rect.w, minus_rect.h, 6, theme.surface_alt, 255);
+            canvas.stroke_rounded_rect(minus_rect.x, minus_rect.y, minus_rect.w, minus_rect.h, 6, theme.border, 220);
+            let mw = font.measure_text("-", 18.0);
+            canvas.draw_text_clipped(
+                font,
+                "-",
+                FontStyle::Bold,
+                18.0,
+                minus_rect.x + (minus_rect.w - mw) / 2,
+                minus_rect.y + 21,
+                minus_rect.x + minus_rect.w,
+                theme.fg,
+            );
+
+            // Current size pill
+            canvas.fill_rounded_rect(val_x, btn_y, val_w, btn_s, 6, theme.bg, 255);
+            canvas.stroke_rounded_rect(val_x, btn_y, val_w, btn_s, 6, theme.border, 180);
+            let sz_str = format!("{} px", size.round() as i32);
+            let szw = font.measure_text(&sz_str, 15.5);
+            canvas.draw_text_clipped(
+                font,
+                &sz_str,
+                FontStyle::Bold,
+                15.5,
+                val_x + (val_w - szw) / 2,
+                btn_y + 20,
+                val_x + val_w - 2,
+                theme.accent,
+            );
+
+            // Plus button
+            canvas.fill_rounded_rect(plus_rect.x, plus_rect.y, plus_rect.w, plus_rect.h, 6, theme.surface_alt, 255);
+            canvas.stroke_rounded_rect(plus_rect.x, plus_rect.y, plus_rect.w, plus_rect.h, 6, theme.border, 220);
+            let pw = font.measure_text("+", 18.0);
+            canvas.draw_text_clipped(
+                font,
+                "+",
+                FontStyle::Bold,
+                18.0,
+                plus_rect.x + (plus_rect.w - pw) / 2,
+                plus_rect.y + 21,
+                plus_rect.x + plus_rect.w,
+                theme.fg,
+            );
+
+            // Left label + description
+            let ty = row_rect.y + 25;
+            let label_w = font.measure_text(label, 17.0);
+            canvas.draw_text_clipped(
+                font,
+                label,
+                FontStyle::Bold,
+                17.0,
+                row_rect.x + 14,
+                ty,
+                minus_rect.x - 14,
+                if is_sel { theme.fg } else { theme.fg.dim(theme.surface) },
+            );
+            let desc_x = row_rect.x + 14 + label_w.max(100) + 16;
+            if desc_x + 60 < minus_rect.x - 10 {
+                canvas.draw_text_clipped(
+                    font,
+                    desc,
+                    FontStyle::Regular,
+                    15.0,
+                    desc_x,
+                    ty,
+                    minus_rect.x - 14,
+                    theme.fg_muted,
+                );
+            }
+
+            if row_rect.y >= body_top && row_rect.y + row_rect.h <= content_bottom + 20 {
+                hit_zones
+                    .settings_font_btns
+                    .push((target, row_rect, minus_rect, plus_rect));
+            }
+        }
+    }
+
+    cur_y += font_card_h + 14;
+
+    // --- CARD 2: THEME ---
+    let theme_card_h = 104i32;
+    let theme_sel = sv.selected == 4;
+    if cur_y + theme_card_h > body_top && cur_y < content_bottom {
+        canvas.fill_rounded_rect(content_x, cur_y, content_w, theme_card_h, 10, theme.surface, 255);
+        canvas.stroke_rounded_rect(
+            content_x,
+            cur_y,
+            content_w,
+            theme_card_h,
+            10,
+            if theme_sel { theme.accent } else { theme.border },
+            if theme_sel { 240 } else { 210 },
+        );
+
+        canvas.draw_text_clipped(
+            font,
+            "THEME",
+            FontStyle::Bold,
+            15.5,
+            content_x + 14,
+            cur_y + 25,
+            content_x + 200,
+            if theme_sel { theme.accent } else { theme.fg_muted },
+        );
+        let thint = "Click a theme or press ← / →  (F2 cycles anytime)";
+        let thw = font.measure_text(thint, 14.5);
+        if content_w > thw + 200 {
+            canvas.draw_text_clipped(
+                font,
+                thint,
+                FontStyle::Regular,
+                14.5,
+                content_x + content_w - thw - 14,
+                cur_y + 25,
+                content_x + content_w - 10,
+                theme.fg_muted,
+            );
+        }
+        canvas.fill_rect(content_x + 10, cur_y + 36, content_w - 20, 1, theme.border);
+
+        let pill_gap = 10i32;
+        let inner_w = content_w - 28;
+        let count = Theme::ALL_NAMES.len() as i32;
+        let pill_w = ((inner_w - pill_gap * (count - 1)) / count).max(90);
+        let pill_h = 46i32;
+        let pill_y = cur_y + 46;
+
+        for (i, &tname) in Theme::ALL_NAMES.iter().enumerate() {
+            let px = content_x + 14 + (i as i32) * (pill_w + pill_gap);
+            let rect = Rect {
+                x: px,
+                y: pill_y,
+                w: pill_w,
+                h: pill_h,
+            };
+            let preview = Theme::by_name(tname);
+            let active = theme.name.eq_ignore_ascii_case(tname);
+
+            canvas.fill_rounded_rect(
+                rect.x,
+                rect.y,
+                rect.w,
+                rect.h,
+                8,
+                if active { theme.accent_soft } else { theme.bg },
+                255,
+            );
+            canvas.stroke_rounded_rect(
+                rect.x,
+                rect.y,
+                rect.w,
+                rect.h,
+                8,
+                if active { theme.accent } else { theme.border },
+                if active { 255 } else { 180 },
+            );
+
+            // Mini color swatch dots (bg, accent, success, danger)
+            let swatches = [preview.bg, preview.accent, preview.success, preview.danger];
+            for (si, &col) in swatches.iter().enumerate() {
+                let sx = rect.x + 10 + (si as i32) * 14;
+                let sy = rect.y + 10;
+                canvas.fill_rounded_rect(sx, sy, 10, 10, 5, col, 255);
+                canvas.stroke_rounded_rect(sx, sy, 10, 10, 5, theme.border, 150);
+            }
+
+            canvas.draw_text_clipped(
+                font,
+                tname,
+                if active { FontStyle::Bold } else { FontStyle::Regular },
+                14.5,
+                rect.x + 10,
+                rect.y + 37,
+                rect.x + rect.w - 8,
+                if active { theme.accent } else { theme.fg },
+            );
+
+            if rect.y >= body_top && rect.y + rect.h <= content_bottom + 20 {
+                hit_zones.settings_theme_btns.push((tname, rect));
+            }
+        }
+    }
+
+    cur_y += theme_card_h + 14;
+
+    // --- CARD 3: TAB SHORTCUTS ---
+    let shortcut_rows = [
+        (
+            SettingsShortcutTarget::Commands,
+            "Commands Tab",
+            cfg.commands_shortcut().format(),
+            5usize,
+        ),
+        (
+            SettingsShortcutTarget::Monitor,
+            "Monitor Tab",
+            cfg.monitor_shortcut().format(),
+            6usize,
+        ),
+        (
+            SettingsShortcutTarget::Usage,
+            "Usage Tab",
+            cfg.usage_shortcut().format(),
+            7usize,
+        ),
+    ];
+
+    let sc_row_h = 48i32;
+    let extra_err = if sv.error.is_some() { 26 } else { 0 };
+    let sc_card_h = 44 + (shortcut_rows.len() as i32) * sc_row_h + 12 + extra_err;
+    if cur_y + sc_card_h > body_top && cur_y < content_bottom {
+        canvas.fill_rounded_rect(content_x, cur_y, content_w, sc_card_h, 10, theme.surface, 255);
+        canvas.stroke_rounded_rect(content_x, cur_y, content_w, sc_card_h, 10, theme.border, 210);
+
+        canvas.draw_text_clipped(
+            font,
+            "TAB SHORTCUTS",
+            FontStyle::Bold,
+            15.5,
+            content_x + 14,
+            cur_y + 25,
+            content_x + 260,
+            theme.fg_muted,
+        );
+        let shint = "Click Change or press Enter, then press new shortcut (Ctrl/Alt/F1-F12)";
+        let shw = font.measure_text(shint, 14.5);
+        if content_w > shw + 260 {
+            canvas.draw_text_clipped(
+                font,
+                shint,
+                FontStyle::Regular,
+                14.5,
+                content_x + content_w - shw - 14,
+                cur_y + 25,
+                content_x + content_w - 10,
+                theme.fg_muted,
+            );
+        }
+        canvas.fill_rect(content_x + 10, cur_y + 36, content_w - 20, 1, theme.border);
+
+        for (i, (target, label, key_str, row_idx)) in shortcut_rows.iter().enumerate() {
+            let ry = cur_y + 44 + (i as i32) * sc_row_h;
+            let row_rect = Rect {
+                x: content_x + 10,
+                y: ry,
+                w: content_w - 20,
+                h: sc_row_h - 6,
+            };
+            let is_sel = sv.selected == *row_idx;
+            let is_rec = sv.recording_shortcut == Some(*target);
+
+            if is_rec {
+                canvas.fill_rounded_rect(row_rect.x, row_rect.y, row_rect.w, row_rect.h, 7, theme.warning, 30);
+                canvas.stroke_rounded_rect(row_rect.x, row_rect.y, row_rect.w, row_rect.h, 7, theme.warning, 230);
+                canvas.fill_rounded_rect(row_rect.x, row_rect.y + 6, 3, row_rect.h - 12, 1, theme.warning, 255);
+            } else if is_sel {
+                canvas.fill_rounded_rect(row_rect.x, row_rect.y, row_rect.w, row_rect.h, 7, theme.accent_soft, 255);
+                canvas.stroke_rounded_rect(row_rect.x, row_rect.y, row_rect.w, row_rect.h, 7, theme.accent, 140);
+                canvas.fill_rounded_rect(row_rect.x, row_rect.y + 6, 3, row_rect.h - 12, 1, theme.accent, 255);
+            } else if i % 2 == 1 {
+                canvas.fill_rounded_rect(row_rect.x, row_rect.y, row_rect.w, row_rect.h, 6, theme.bg, 90);
+            }
+
+            // Right buttons: [Change / Cancel]  [Reset]
+            let btn_h = 30i32;
+            let btn_y = row_rect.y + (row_rect.h - btn_h) / 2;
+            let rst_w = 66i32;
+            let reset_btn = Rect {
+                x: row_rect.x + row_rect.w - rst_w - 10,
+                y: btn_y,
+                w: rst_w,
+                h: btn_h,
+            };
+            let chg_label = if is_rec { "Cancel" } else { "Change" };
+            let chg_w = 82i32;
+            let change_btn = Rect {
+                x: reset_btn.x - chg_w - 8,
+                y: btn_y,
+                w: chg_w,
+                h: btn_h,
+            };
+
+            // Shortcut keycap badge to the left of Change button
+            let badge_text = if is_rec {
+                "Press new keys... (Esc cancel)"
+            } else {
+                key_str.as_str()
+            };
+            let badge_w = (font.measure_text(badge_text, 15.5) + 24).max(88);
+            let badge_x = change_btn.x - badge_w - 12;
+            canvas.fill_rounded_rect(
+                badge_x,
+                btn_y,
+                badge_w,
+                btn_h,
+                6,
+                if is_rec { theme.warning } else { theme.bg },
+                if is_rec { 38 } else { 255 },
+            );
+            canvas.stroke_rounded_rect(
+                badge_x,
+                btn_y,
+                badge_w,
+                btn_h,
+                6,
+                if is_rec { theme.warning } else { theme.accent },
+                if is_rec { 240 } else { 180 },
+            );
+            let bw = font.measure_text(badge_text, 15.5);
+            canvas.draw_text_clipped(
+                font,
+                badge_text,
+                FontStyle::Bold,
+                15.5,
+                badge_x + (badge_w - bw) / 2,
+                btn_y + 20,
+                badge_x + badge_w - 4,
+                if is_rec { theme.warning } else { theme.accent },
+            );
+
+            // Change button
+            canvas.fill_rounded_rect(
+                change_btn.x,
+                change_btn.y,
+                change_btn.w,
+                change_btn.h,
+                6,
+                if is_rec { theme.warning } else { theme.accent_soft },
+                if is_rec { 40 } else { 255 },
+            );
+            canvas.stroke_rounded_rect(
+                change_btn.x,
+                change_btn.y,
+                change_btn.w,
+                change_btn.h,
+                6,
+                if is_rec { theme.warning } else { theme.accent },
+                210,
+            );
+            let cw = font.measure_text(chg_label, 15.0);
+            canvas.draw_text_clipped(
+                font,
+                chg_label,
+                FontStyle::Bold,
+                15.0,
+                change_btn.x + (change_btn.w - cw) / 2,
+                btn_y + 20,
+                change_btn.x + change_btn.w - 2,
+                if is_rec { theme.warning } else { theme.accent },
+            );
+
+            // Reset button
+            canvas.fill_rounded_rect(reset_btn.x, reset_btn.y, reset_btn.w, reset_btn.h, 6, theme.surface_alt, 255);
+            canvas.stroke_rounded_rect(reset_btn.x, reset_btn.y, reset_btn.w, reset_btn.h, 6, theme.border, 200);
+            let rw = font.measure_text("Reset", 15.0);
+            canvas.draw_text_clipped(
+                font,
+                "Reset",
+                FontStyle::Regular,
+                15.0,
+                reset_btn.x + (reset_btn.w - rw) / 2,
+                btn_y + 20,
+                reset_btn.x + reset_btn.w - 2,
+                theme.fg_muted,
+            );
+
+            // Left label
+            canvas.draw_text_clipped(
+                font,
+                label,
+                FontStyle::Bold,
+                17.0,
+                row_rect.x + 14,
+                row_rect.y + 26,
+                badge_x - 12,
+                if is_sel || is_rec { theme.fg } else { theme.fg.dim(theme.surface) },
+            );
+
+            if row_rect.y >= body_top && row_rect.y + row_rect.h <= content_bottom + 20 {
+                hit_zones
+                    .settings_shortcut_btns
+                    .push((*target, row_rect, change_btn, reset_btn));
+            }
+        }
+
+        if let Some(err) = sv.error {
+            canvas.draw_text_clipped(
+                font,
+                err,
+                FontStyle::Bold,
+                15.0,
+                content_x + 14,
+                cur_y + sc_card_h - 10,
+                content_x + content_w - 14,
+                theme.danger,
+            );
+        }
     }
 }

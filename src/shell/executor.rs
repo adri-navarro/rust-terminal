@@ -22,6 +22,7 @@ pub struct ShellState {
 
 impl ShellState {
     pub fn new() -> Self {
+        ensure_user_path();
         let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
         let mut aliases = HashMap::new();
         aliases.insert("ll".to_string(), "ls -la --color=auto".to_string());
@@ -463,6 +464,69 @@ fn find_in_path(cmd: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Ensures standard user bin directories (e.g. `~/.local/bin`, `~/.gemini/antigravity-cli/bin`,
+/// `~/.cargo/bin`) are present in `PATH` when the built-in shell is launched from a desktop
+/// environment or compositor that does not source `~/.bashrc` / `~/.profile`.
+pub fn ensure_user_path() {
+    let current = env::var("PATH").unwrap_or_default();
+    let home = dirs::home_dir();
+    let enriched = build_enriched_path(&current, home.as_deref());
+    if enriched != current {
+        unsafe {
+            env::set_var("PATH", enriched);
+        }
+    }
+}
+
+pub fn build_enriched_path(current_path: &str, home: Option<&Path>) -> String {
+    let existing: Vec<PathBuf> = env::split_paths(current_path)
+        .filter(|p| !p.as_os_str().is_empty())
+        .collect();
+
+    let mut prepend: Vec<PathBuf> = Vec::new();
+    if let Some(h) = home {
+        let user_dirs = [
+            ".local/bin",
+            ".gemini/antigravity-cli/bin",
+            ".cargo/bin",
+            "bin",
+            "go/bin",
+            ".bun/bin",
+            ".opencode/bin",
+            ".npm-global/bin",
+            ".local/share/pnpm",
+            ".volta/bin",
+            ".local/share/mise/shims",
+            ".pyenv/shims",
+            ".asdf/shims",
+        ];
+        for rel in user_dirs {
+            let dir = h.join(rel);
+            if dir.is_dir() && !existing.contains(&dir) && !prepend.contains(&dir) {
+                prepend.push(dir);
+            }
+        }
+    }
+
+    let mut result = prepend;
+    for dir in existing {
+        if !result.contains(&dir) {
+            result.push(dir);
+        }
+    }
+
+    for sys in ["/usr/local/bin", "/usr/bin", "/bin"] {
+        let dir = PathBuf::from(sys);
+        if dir.is_dir() && !result.contains(&dir) {
+            result.push(dir);
+        }
+    }
+
+    env::join_paths(result)
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| current_path.to_string())
 }
 
 fn unescape_echo(s: &str) -> String {
