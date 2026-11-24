@@ -14,7 +14,7 @@ use crate::usage::{
 };
 use std::path::Path;
 
-pub const TAB_BAR_H: usize = 36;
+pub const TAB_BAR_H: usize = 44;
 pub const STATUS_BAR_H: usize = 26;
 
 #[derive(Debug, Clone, Copy)]
@@ -37,8 +37,6 @@ impl Rect {
 pub struct TabBarHitZones {
     pub tabs: Vec<(usize, Rect, Rect)>, // (tab_idx, tab_rect, close_rect)
     pub new_tab_btn: Option<Rect>,
-    pub history_btn: Option<Rect>,
-    pub theme_btn: Option<Rect>,
     pub usage_btn: Option<Rect>,
     pub usage_range_btns: Vec<(TimeRange, Rect)>,
     pub usage_refresh_btn: Option<Rect>,
@@ -100,8 +98,6 @@ impl TabBarHitZones {
         Self {
             tabs: Vec::new(),
             new_tab_btn: None,
-            history_btn: None,
-            theme_btn: None,
             usage_btn: None,
             usage_range_btns: Vec::new(),
             usage_refresh_btn: None,
@@ -546,27 +542,27 @@ fn render_tab_bar(
     canvas.fill_rect(0, 0, width as i32, h, theme.surface);
     canvas.fill_rect(0, h - 1, width as i32, 1, theme.border);
 
-    let ui_size = 12.5f32;
-    let baseline = 22;
+    let ui_size = 16.5f32;
+    let baseline = 28;
 
     // Top-right corner tab: Settings (Ctrl+, / F6)
     let right_margin = 10;
     let set_label = "Settings";
-    let set_w = font.measure_text(set_label, ui_size) + 30;
+    let set_w = font.measure_text(set_label, ui_size) + 32;
     let set_x = (width as i32) - right_margin - set_w;
     let set_rect = if settings_active {
         Rect {
             x: set_x,
             y: 5,
             w: set_w,
-            h: 26,
+            h: 34,
         }
     } else {
         Rect {
             x: set_x,
             y: 6,
             w: set_w,
-            h: 24,
+            h: 32,
         }
     };
     if settings_active {
@@ -591,7 +587,7 @@ fn render_tab_bar(
         set_label,
         FontStyle::Bold,
         ui_size,
-        set_rect.x + 21,
+        set_rect.x + 22,
         baseline,
         set_rect.x + set_rect.w - 6,
         if settings_active { theme.fg } else { theme.fg_muted },
@@ -600,21 +596,21 @@ fn render_tab_bar(
 
     // Next to Settings tab: Agent & Model Usage
     let usage_label = "Usage";
-    let usage_w = font.measure_text(usage_label, ui_size) + 30;
+    let usage_w = font.measure_text(usage_label, ui_size) + 32;
     let usage_x = set_x - 6 - usage_w;
     let usage_rect = if usage_active {
         Rect {
             x: usage_x,
             y: 5,
             w: usage_w,
-            h: 26,
+            h: 34,
         }
     } else {
         Rect {
             x: usage_x,
             y: 6,
             w: usage_w,
-            h: 24,
+            h: 32,
         }
     };
     if usage_active {
@@ -667,7 +663,7 @@ fn render_tab_bar(
         usage_label,
         FontStyle::Bold,
         ui_size,
-        usage_rect.x + 21,
+        usage_rect.x + 22,
         baseline,
         usage_rect.x + usage_rect.w - 6,
         if usage_active { theme.fg } else { theme.accent },
@@ -676,21 +672,21 @@ fn render_tab_bar(
 
     // Next to Usage tab: System / Processes Monitor tab (btop-style)
     let mon_label = "Monitor";
-    let mon_w = font.measure_text(mon_label, ui_size) + 30;
+    let mon_w = font.measure_text(mon_label, ui_size) + 32;
     let mon_x = usage_x - 6 - mon_w;
     let mon_rect = if monitor_active {
         Rect {
             x: mon_x,
             y: 5,
             w: mon_w,
-            h: 26,
+            h: 34,
         }
     } else {
         Rect {
             x: mon_x,
             y: 6,
             w: mon_w,
-            h: 24,
+            h: 32,
         }
     };
     if monitor_active {
@@ -723,7 +719,7 @@ fn render_tab_bar(
         mon_label,
         FontStyle::Bold,
         ui_size,
-        mon_rect.x + 21,
+        mon_rect.x + 22,
         baseline,
         mon_rect.x + mon_rect.w - 6,
         if monitor_active { theme.fg } else { theme.info },
@@ -736,21 +732,21 @@ fn render_tab_bar(
     } else {
         "Commands".to_string()
     };
-    let cmd_w = font.measure_text(&cmd_label, ui_size) + 30;
+    let cmd_w = font.measure_text(&cmd_label, ui_size) + 32;
     let cmd_x = mon_x - 6 - cmd_w;
     let cmd_rect = if commands_active {
         Rect {
             x: cmd_x,
             y: 5,
             w: cmd_w,
-            h: 26,
+            h: 34,
         }
     } else {
         Rect {
             x: cmd_x,
             y: 6,
             w: cmd_w,
-            h: 24,
+            h: 32,
         }
     };
     if commands_active {
@@ -795,7 +791,7 @@ fn render_tab_bar(
         &cmd_label,
         FontStyle::Bold,
         ui_size,
-        cmd_rect.x + 21,
+        cmd_rect.x + 22,
         baseline,
         cmd_rect.x + cmd_rect.w - 6,
         if commands_active {
@@ -808,83 +804,12 @@ fn render_tab_bar(
     );
     zones.commands_btn = Some(cmd_rect);
 
-    // Right-side utility pills (left of Commands tab): Theme (F2) & History (Ctrl+R)
-    let theme_label = "F2 Theme";
-    let theme_w = font.measure_text(theme_label, ui_size) + 18;
-    let theme_x = cmd_x - 8 - theme_w;
-    let theme_rect = Rect {
-        x: theme_x,
-        y: 6,
-        w: theme_w,
-        h: 24,
-    };
-    if theme_x > 240 {
-        canvas.fill_rounded_rect(
-            theme_rect.x,
-            theme_rect.y,
-            theme_rect.w,
-            theme_rect.h,
-            6,
-            theme.surface_alt,
-            255,
-        );
-        canvas.draw_text_clipped(
-            font,
-            theme_label,
-            FontStyle::Regular,
-            ui_size,
-            theme_rect.x + 9,
-            baseline,
-            theme_rect.x + theme_rect.w - 4,
-            theme.fg_muted,
-        );
-        zones.theme_btn = Some(theme_rect);
-    }
-
-    let hist_label = "Ctrl+R History";
-    let hist_w = font.measure_text(hist_label, ui_size) + 18;
-    let hist_x = theme_x - 8 - hist_w;
-    let hist_rect = Rect {
-        x: hist_x,
-        y: 6,
-        w: hist_w,
-        h: 24,
-    };
-    if zones.theme_btn.is_some() && hist_x > 300 {
-        canvas.fill_rounded_rect(
-            hist_rect.x,
-            hist_rect.y,
-            hist_rect.w,
-            hist_rect.h,
-            6,
-            theme.surface_alt,
-            255,
-        );
-        canvas.draw_text_clipped(
-            font,
-            hist_label,
-            FontStyle::Regular,
-            ui_size,
-            hist_rect.x + 9,
-            baseline,
-            hist_rect.x + hist_rect.w - 4,
-            theme.fg_muted,
-        );
-        zones.history_btn = Some(hist_rect);
-    }
-
-    let max_tabs_right = if zones.history_btn.is_some() {
-        hist_x - 42
-    } else if zones.theme_btn.is_some() {
-        theme_x - 42
-    } else {
-        cmd_x - 42
-    };
+    let max_tabs_right = cmd_x - 46;
 
     let mut x = 10i32;
     let tab_count = tabs.len().max(1) as i32;
     let avail = (max_tabs_right - x).max(120);
-    let tab_w = (avail / tab_count).clamp(110, 210);
+    let tab_w = (avail / tab_count).clamp(130, 250);
 
     for (idx, tab) in tabs.iter().enumerate() {
         if x + 60 > max_tabs_right {
@@ -897,7 +822,7 @@ fn render_tab_bar(
             x,
             y: 5,
             w,
-            h: 26,
+            h: 34,
         };
 
         if is_active {
@@ -916,10 +841,10 @@ fn render_tab_bar(
             font,
             &num,
             FontStyle::Bold,
-            11.0,
-            rect.x + 9,
+            15.0,
+            rect.x + 10,
             baseline,
-            rect.x + 22,
+            rect.x + 26,
             num_color,
         );
 
@@ -937,17 +862,17 @@ fn render_tab_bar(
             &tab.title
         };
         let close_rect = Rect {
-            x: rect.x + rect.w - 22,
-            y: rect.y + 4,
-            w: 18,
-            h: 18,
+            x: rect.x + rect.w - 26,
+            y: rect.y + 6,
+            w: 22,
+            h: 22,
         };
         canvas.draw_text_clipped(
             font,
             label,
             if is_active { FontStyle::Bold } else { FontStyle::Regular },
             ui_size,
-            rect.x + 24,
+            rect.x + 28,
             baseline,
             close_rect.x - 4,
             title_color,
@@ -959,7 +884,7 @@ fn render_tab_bar(
                 font,
                 "×",
                 FontStyle::Regular,
-                14.0,
+                18.0,
                 close_rect.x + 4,
                 baseline,
                 close_rect.x + close_rect.w,
@@ -975,17 +900,18 @@ fn render_tab_bar(
     let plus_rect = Rect {
         x,
         y: 6,
-        w: 26,
-        h: 24,
+        w: 32,
+        h: 32,
     };
-    if plus_rect.x + plus_rect.w < max_tabs_right + 34 {
+    if plus_rect.x + plus_rect.w < max_tabs_right + 38 {
         canvas.fill_rounded_rect(plus_rect.x, plus_rect.y, plus_rect.w, plus_rect.h, 6, theme.surface_alt, 200);
+        let plus_tw = font.measure_text("+", 19.0);
         canvas.draw_text_clipped(
             font,
             "+",
             FontStyle::Bold,
-            15.0,
-            plus_rect.x + 8,
+            19.0,
+            plus_rect.x + (plus_rect.w - plus_tw) / 2,
             baseline + 1,
             plus_rect.x + plus_rect.w,
             theme.fg,

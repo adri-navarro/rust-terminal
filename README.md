@@ -1,4 +1,4 @@
-# itsadri-terminal
+# rust-terminal
 
 A lightweight, fast, modern terminal emulator in Rust with a built-in interactive shell, Fish-style inline autosuggestions, floating Tab autocomplete popup, and a `Ctrl+R` fuzzy history command palette.
 

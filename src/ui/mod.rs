@@ -288,6 +288,7 @@ struct TerminalApp {
     modifiers: ModifiersState,
     cursor_pos: (f64, f64),
     selecting: bool,
+    selection_pending_copy: bool,
     last_click: Instant,
     click_count: u8,
 
@@ -334,6 +335,7 @@ impl TerminalApp {
             modifiers: ModifiersState::empty(),
             cursor_pos: (0.0, 0.0),
             selecting: false,
+            selection_pending_copy: false,
             last_click: Instant::now(),
             click_count: 0,
             palette: HistoryPaletteState::new(),
@@ -2336,23 +2338,6 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
                                     return;
                                 }
                             }
-                            if let Some(r) = self.hit_zones.history_btn {
-                                if r.contains(px, py) {
-                                    self.usage.open = false;
-                                    self.monitor.open = false;
-                                    self.commands.open = false;
-                                    self.settings.close();
-                                    self.palette.open(&mut self.history);
-                                    self.request_redraw();
-                                    return;
-                                }
-                            }
-                            if let Some(r) = self.hit_zones.theme_btn {
-                                if r.contains(px, py) {
-                                    self.cycle_theme();
-                                    return;
-                                }
-                            }
                             let hit_tabs = self.hit_zones.tabs.clone();
                             for (idx, tab_rect, close_rect) in hit_tabs {
                                 if close_rect.contains(px, py) {
@@ -2610,6 +2595,7 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
                                     let cols = tab.grid.lock().map(|g| g.cols).unwrap_or(80);
                                     tab.selection = Some(((cell.0, 0), (cell.0, cols - 1)));
                                     self.selecting = false;
+                                    self.selection_pending_copy = true;
                                 } else if self.click_count == 2 {
                                     let sel = tab.grid.lock().ok().and_then(|g| {
                                         let row = g.visible_row(cell.0)?;
@@ -2626,24 +2612,34 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
                                     });
                                     tab.selection = sel;
                                     self.selecting = false;
+                                    self.selection_pending_copy = sel.is_some();
                                 } else {
                                     tab.selection = Some((cell, cell));
                                     self.selecting = true;
+                                    self.selection_pending_copy = true;
                                 }
                             }
                             self.request_redraw();
                         }
                     }
                     (MouseButton::Left, ElementState::Released) => {
+                        let should_copy = self.selecting || self.selection_pending_copy;
                         self.selecting = false;
+                        self.selection_pending_copy = false;
                         // Clear degenerate 1-cell click selection
+                        let mut cleared = false;
                         if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                             if let Some((a, b)) = tab.selection {
                                 if a == b && self.click_count == 1 {
                                     tab.selection = None;
-                                    self.request_redraw();
+                                    cleared = true;
                                 }
                             }
+                        }
+                        if cleared {
+                            self.request_redraw();
+                        } else if should_copy && self.cfg.copy_on_select {
+                            self.copy_selection();
                         }
                     }
                     (MouseButton::Middle, ElementState::Pressed) => {

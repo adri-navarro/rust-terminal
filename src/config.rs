@@ -426,6 +426,7 @@ pub struct Config {
     pub scrollback_lines: usize,
     pub show_tab_bar: bool,
     pub show_status_bar: bool,
+    pub copy_on_select: bool,
     pub cursor_style: String, // "beam", "block", "underline"
     pub cursor_blink: bool,
     pub shell: Option<String>, // None = built-in Rust shell (--shell)
@@ -451,6 +452,7 @@ impl Default for Config {
             scrollback_lines: 10_000,
             show_tab_bar: true,
             show_status_bar: true,
+            copy_on_select: true,
             cursor_style: "beam".to_string(),
             cursor_blink: true,
             shell: None,

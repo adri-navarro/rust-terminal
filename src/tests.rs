@@ -112,6 +112,7 @@ fn test_system_monitor_samples_cpu_ram_disks_and_processes() {
 #[test]
 fn test_themes_and_default_config() {
     let cfg = Config::default();
+    assert!(cfg.copy_on_select);
     let t = Theme::by_name(&cfg.theme);
     assert_eq!(t.name, "catppuccin-mocha");
     assert_eq!(Theme::next_name(t.name), "tokyo-night");
