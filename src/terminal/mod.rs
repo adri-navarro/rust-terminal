@@ -66,6 +66,15 @@ impl TerminalTab {
         cmd.env("COLORTERM", "truecolor");
         cmd.env("ITSADRI_TERMINAL", "1");
 
+        // Finder/Dock-launched apps have no locale; default to UTF-8.
+        #[cfg(target_os = "macos")]
+        {
+            let unset = |k: &str| env::var_os(k).is_none_or(|v| v.is_empty());
+            if unset("LANG") && unset("LC_ALL") {
+                cmd.env("LANG", "en_US.UTF-8");
+            }
+        }
+
         let mut child = pair
             .slave
             .spawn_command(cmd)

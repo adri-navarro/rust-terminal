@@ -16,7 +16,7 @@ use std::process;
 use ui::AppOptions;
 
 fn print_help() {
-    println!(
+    let help = String::from(
         "\
 itsadri-terminal — lightweight modern terminal emulator & shell in Rust
 
@@ -46,6 +46,20 @@ KEYBINDINGS:
     Ctrl+, / F6         Toggle Settings tab (font sizes, theme, shortcuts)
     Ctrl+Shift+R        Reload ~/.config/itsadri-terminal/config.toml"
     );
+    // On macOS the app shortcuts use Cmd; Ctrl+C stays SIGINT and Ctrl+R stays in-terminal.
+    #[cfg(target_os = "macos")]
+    let help = help
+        .replace("Ctrl+T / Ctrl+W     New", "Cmd+T / Cmd+W       New")
+        .replace("Ctrl+Tab / Alt+1-9  Switch", "Ctrl+Tab / Cmd+1-9  Switch")
+        .replace("Ctrl+C / Ctrl+V     Copy selection (or SIGINT if none) / paste clipboard", "Cmd+C / Cmd+V       Copy selection / paste clipboard (Ctrl+C = SIGINT)")
+        .replace("Ctrl+Shift+C / V    Copy", "Cmd+Shift+C / V     Copy")
+        .replace("Ctrl+= / - / 0      Zoom", "Cmd+= / - / 0       Zoom")
+        .replace("Ctrl+U / F3         Toggle", "Cmd+U / F3          Toggle")
+        .replace("Ctrl+M / F4         Toggle", "Cmd+M / F4          Toggle")
+        .replace("Ctrl+P / F5         Toggle", "Cmd+P / F5          Toggle")
+        .replace("Ctrl+, / F6         Toggle", "Cmd+, / F6          Toggle")
+        .replace("Ctrl+Shift+R        Reload", "Cmd+Shift+R         Reload");
+    println!("{help}");
 }
 
 fn main() {

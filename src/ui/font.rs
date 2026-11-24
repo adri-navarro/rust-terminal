@@ -222,6 +222,15 @@ fn discover_font_paths(
         }
     }
 
+    #[cfg(target_os = "macos")]
+    {
+        for set in macos_font_candidates() {
+            if let Some(found) = first_existing(set) {
+                return Ok(found);
+            }
+        }
+    }
+
     let candidates: &[(&str, &str, &str, &str)] = &[
         (
             "/usr/share/fonts/TTF/JetBrainsMonoNerdFontMono-Regular.ttf",
@@ -273,5 +282,68 @@ fn discover_font_paths(
         }
     }
 
-    Err("No monospace TrueType font found. Set `font_path` in ~/.config/itsadri-terminal/config.toml".to_string())
+    Err(format!(
+        "No monospace TrueType font found. Set `font_path` in {}",
+        crate::config::Config::config_path().display()
+    ))
+}
+
+/// Returns the set when its regular file exists; style files are optional.
+#[cfg(target_os = "macos")]
+fn first_existing(
+    [reg, bold, ital, bi]: [PathBuf; 4],
+) -> Option<(PathBuf, Option<PathBuf>, Option<PathBuf>, Option<PathBuf>)> {
+    if !reg.is_file() {
+        return None;
+    }
+    let opt = |p: PathBuf| p.is_file().then_some(p);
+    Some((reg, opt(bold), opt(ital), opt(bi)))
+}
+
+/// macOS candidates in priority order. Menlo.ttc is skipped: it is a
+/// collection and the loader has no face-index support.
+#[cfg(target_os = "macos")]
+fn macos_font_candidates() -> Vec<[PathBuf; 4]> {
+    let mut sets = Vec::new();
+
+    let mut dirs_to_try: Vec<PathBuf> = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        dirs_to_try.push(home.join("Library/Fonts"));
+    }
+    dirs_to_try.push(PathBuf::from("/Library/Fonts"));
+
+    for dir in &dirs_to_try {
+        for stem in ["JetBrainsMonoNerdFontMono", "JetBrainsMonoNerdFont"] {
+            sets.push(
+                ["Regular", "Bold", "Italic", "BoldItalic"]
+                    .map(|style| dir.join(format!("{stem}-{style}.ttf"))),
+            );
+        }
+    }
+
+    let sys = PathBuf::from("/System/Library/Fonts");
+    for name in ["Monaco.ttf", "SFNSMono.ttf"] {
+        // Single-style fonts: bold/italic fall back to regular at render time.
+        sets.push([
+            sys.join(name),
+            PathBuf::new(),
+            PathBuf::new(),
+            PathBuf::new(),
+        ]);
+    }
+    sets
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn discovers_a_font_on_macos() {
+        if !PathBuf::from("/System/Library/Fonts/Monaco.ttf").is_file() {
+            return;
+        }
+        let (reg, _, _, _) = discover_font_paths(None).expect("font discovered");
+        assert!(reg.is_file());
+    }
 }

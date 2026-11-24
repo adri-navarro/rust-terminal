@@ -717,7 +717,7 @@ impl TerminalApp {
             if other_t != target && other_sc == sc {
                 self.settings.error = Some(format!(
                     "{} is already assigned to {other_name}.",
-                    sc.format()
+                    sc.display()
                 ));
                 self.request_redraw();
                 return;
@@ -742,7 +742,7 @@ impl TerminalApp {
         self.settings.recording_shortcut = None;
         self.settings.error = None;
         let _ = self.cfg.save();
-        self.show_toast(format!("{label} shortcut: {formatted}"));
+        self.show_toast(format!("{label} shortcut: {}", sc.display()));
     }
 
     fn reset_shortcut(&mut self, target: SettingsShortcutTarget) {
@@ -785,8 +785,32 @@ impl TerminalApp {
         self.show_toast("Settings reset to defaults");
     }
 
+    /// App-shortcut modifier: Cmd (Super) on macOS, Ctrl elsewhere. Real Ctrl on
+    /// macOS is left for the shell (Ctrl+C = SIGINT, Ctrl+R, ...).
+    fn cmd_or_ctrl(&self) -> bool {
+        if cfg!(target_os = "macos") {
+            self.modifiers.super_key()
+        } else {
+            self.modifiers.control_key()
+        }
+    }
+
+    /// True on macOS while Cmd is held; such keys are app-level and never plain input.
+    fn super_held(&self) -> bool {
+        cfg!(target_os = "macos") && self.modifiers.super_key()
+    }
+
+    /// Modifier for jumping to tab N: Cmd on macOS, Alt elsewhere.
+    fn tab_jump_mod(&self) -> bool {
+        if cfg!(target_os = "macos") {
+            self.modifiers.super_key() && !self.modifiers.alt_key() && !self.modifiers.control_key()
+        } else {
+            self.modifiers.alt_key() && !self.modifiers.control_key()
+        }
+    }
+
     fn try_handle_global_tab_shortcut(&mut self, key: &Key, physical_key: PhysicalKey) -> bool {
-        let ctrl = self.modifiers.control_key();
+        let ctrl = self.cmd_or_ctrl();
         let shift = self.modifiers.shift_key();
         let alt = self.modifiers.alt_key();
 
@@ -804,7 +828,7 @@ impl TerminalApp {
             return true;
         }
 
-        // Settings tab shortcut: Ctrl+, or F6
+        // Settings tab shortcut: Ctrl+, (Cmd+, on macOS) or F6
         if (ctrl && !alt && !shift && matches!(key, Key::Character(c) if c.as_str() == ","))
             || (!ctrl && !alt && !shift && matches!(key, Key::Named(NamedKey::F6)))
         {
@@ -1051,7 +1075,7 @@ impl TerminalApp {
                     self.cursor_blink_on = true;
                     self.request_redraw();
                 }
-                _ if ctrl && !alt && matches_shortcut_key(key, physical_key, 'v', KeyCode::KeyV) => {
+                _ if self.cmd_or_ctrl() && !alt && matches_shortcut_key(key, physical_key, 'v', KeyCode::KeyV) => {
                     self.paste_clipboard();
                 }
                 Key::Character(c) if ctrl && c.eq_ignore_ascii_case("u") => {
@@ -1065,7 +1089,7 @@ impl TerminalApp {
                     self.request_redraw();
                 }
                 _ => {
-                    if !ctrl && !alt {
+                    if !ctrl && !alt && !self.super_held() {
                         if let Some(t) = text {
                             let filtered: String = t.chars().filter(|c| !c.is_control()).collect();
                             if !filtered.is_empty() {
@@ -1089,6 +1113,10 @@ impl TerminalApp {
 
         // Commands list navigation & actions
         if self.try_handle_global_tab_shortcut(key, physical_key) {
+            return;
+        }
+        // On macOS, Cmd+<non-character> (Enter, Delete, arrows...) must not trigger plain-key actions.
+        if self.super_held() && !matches!(key, Key::Character(_)) {
             return;
         }
         match key {
@@ -1135,7 +1163,16 @@ impl TerminalApp {
                     self.delete_command(id);
                 }
             }
-            Key::Character(c) if ctrl && !alt => match c.to_ascii_lowercase().as_str() {
+            Key::Character(c) if self.tab_jump_mod() && c.chars().next().is_some_and(|ch| ch.is_ascii_digit()) => {
+                if let Some(d) = c.chars().next().and_then(|ch| ch.to_digit(10)) {
+                    if d >= 1 && (d as usize) <= self.tabs.len() {
+                        self.active_tab = (d as usize) - 1;
+                        self.commands.open = false;
+                        self.request_redraw();
+                    }
+                }
+            }
+            Key::Character(c) if self.cmd_or_ctrl() && !alt => match c.to_ascii_lowercase().as_str() {
                 "t" => {
                     self.commands.open = false;
                     let cwd = self.tabs.get(self.active_tab).and_then(|t| t.cwd_path());
@@ -1152,16 +1189,7 @@ impl TerminalApp {
                 }
                 _ => {}
             },
-            Key::Character(c) if alt && !ctrl => {
-                if let Some(d) = c.chars().next().and_then(|ch| ch.to_digit(10)) {
-                    if d >= 1 && (d as usize) <= self.tabs.len() {
-                        self.active_tab = (d as usize) - 1;
-                        self.commands.open = false;
-                        self.request_redraw();
-                    }
-                }
-            }
-            Key::Character(c) if !ctrl && !alt => match c.as_str() {
+            Key::Character(c) if !ctrl && !alt && !self.super_held() => match c.as_str() {
                 "a" | "A" | "n" | "N" => {
                     self.open_add_command_form();
                 }
@@ -1217,6 +1245,10 @@ impl TerminalApp {
         if self.try_handle_global_tab_shortcut(key, physical_key) {
             return;
         }
+        // On macOS, Cmd+<non-character> (Enter, Delete, arrows...) must not trigger plain-key actions.
+        if self.super_held() && !matches!(key, Key::Character(_)) {
+            return;
+        }
 
         match key {
             Key::Named(NamedKey::Escape) => {
@@ -1245,7 +1277,16 @@ impl TerminalApp {
             Key::Named(NamedKey::Delete) => {
                 self.kill_selected_process(libc::SIGTERM);
             }
-            Key::Character(c) if ctrl && !alt => match c.to_ascii_lowercase().as_str() {
+            Key::Character(c) if self.tab_jump_mod() && c.chars().next().is_some_and(|ch| ch.is_ascii_digit()) => {
+                if let Some(d) = c.chars().next().and_then(|ch| ch.to_digit(10)) {
+                    if d >= 1 && (d as usize) <= self.tabs.len() {
+                        self.active_tab = (d as usize) - 1;
+                        self.monitor.open = false;
+                        self.request_redraw();
+                    }
+                }
+            }
+            Key::Character(c) if self.cmd_or_ctrl() && !alt => match c.to_ascii_lowercase().as_str() {
                 "t" => {
                     self.monitor.open = false;
                     let cwd = self.tabs.get(self.active_tab).and_then(|t| t.cwd_path());
@@ -1262,16 +1303,7 @@ impl TerminalApp {
                 }
                 _ => {}
             },
-            Key::Character(c) if alt && !ctrl => {
-                if let Some(d) = c.chars().next().and_then(|ch| ch.to_digit(10)) {
-                    if d >= 1 && (d as usize) <= self.tabs.len() {
-                        self.active_tab = (d as usize) - 1;
-                        self.monitor.open = false;
-                        self.request_redraw();
-                    }
-                }
-            }
-            Key::Character(c) if !ctrl && !alt => match c.as_str() {
+            Key::Character(c) if !ctrl && !alt && !self.super_held() => match c.as_str() {
                 "c" | "C" => {
                     self.monitor.set_sort(ProcessSort::Cpu);
                     self.request_redraw();
@@ -1342,6 +1374,10 @@ impl TerminalApp {
         if self.try_handle_global_tab_shortcut(key, physical_key) {
             return;
         }
+        // On macOS, Cmd+<non-character> (Enter, Delete, arrows...) must not trigger plain-key actions.
+        if self.super_held() && !matches!(key, Key::Character(_)) {
+            return;
+        }
 
         match key {
             Key::Named(NamedKey::Escape) => {
@@ -1373,7 +1409,17 @@ impl TerminalApp {
                 self.request_redraw();
                 return;
             }
-            Key::Character(c) if ctrl && !alt => match c.to_ascii_lowercase().as_str() {
+            Key::Character(c) if self.tab_jump_mod() && c.chars().next().is_some_and(|ch| ch.is_ascii_digit()) => {
+                if let Some(d) = c.chars().next().and_then(|ch| ch.to_digit(10)) {
+                    if d >= 1 && (d as usize) <= self.tabs.len() {
+                        self.active_tab = (d as usize) - 1;
+                        self.usage.open = false;
+                        self.request_redraw();
+                        return;
+                    }
+                }
+            }
+            Key::Character(c) if self.cmd_or_ctrl() && !alt => match c.to_ascii_lowercase().as_str() {
                 "t" => {
                     self.usage.open = false;
                     let cwd = self.tabs.get(self.active_tab).and_then(|t| t.cwd_path());
@@ -1394,17 +1440,7 @@ impl TerminalApp {
                 }
                 _ => {}
             },
-            Key::Character(c) if alt && !ctrl => {
-                if let Some(d) = c.chars().next().and_then(|ch| ch.to_digit(10)) {
-                    if d >= 1 && (d as usize) <= self.tabs.len() {
-                        self.active_tab = (d as usize) - 1;
-                        self.usage.open = false;
-                        self.request_redraw();
-                        return;
-                    }
-                }
-            }
-            Key::Character(c) if !ctrl && !alt => match c.to_ascii_lowercase().as_str() {
+            Key::Character(c) if !ctrl && !alt && !self.super_held() => match c.to_ascii_lowercase().as_str() {
                 "1" => {
                     self.usage.range = TimeRange::FiveHours;
                     self.usage.scroll = 0;
@@ -1469,17 +1505,21 @@ impl TerminalApp {
                 self.request_redraw();
                 return;
             }
-            if let Some(sc) = shortcut_from_winit(key, physical_key, ctrl, shift, alt) {
+            if let Some(sc) = shortcut_from_winit(key, physical_key, self.cmd_or_ctrl(), shift, alt) {
                 self.assign_shortcut(target, sc);
             } else {
                 self.settings.error =
-                    Some("Use Ctrl, Alt, or F1–F12 for tab shortcuts (Esc to cancel).".to_string());
+                    Some(if cfg!(target_os = "macos") { "Use Cmd, Alt, or F1–F12 for tab shortcuts (Esc to cancel)." } else { "Use Ctrl, Alt, or F1–F12 for tab shortcuts (Esc to cancel)." }.to_string());
                 self.request_redraw();
             }
             return;
         }
 
         if self.try_handle_global_tab_shortcut(key, physical_key) {
+            return;
+        }
+        // On macOS, Cmd+<non-character> (Enter, Delete, arrows...) must not trigger plain-key actions.
+        if self.super_held() && !matches!(key, Key::Character(_)) {
             return;
         }
 
@@ -1549,7 +1589,16 @@ impl TerminalApp {
                     _ => {}
                 }
             }
-            Key::Character(c) if ctrl && !alt => match c.to_ascii_lowercase().as_str() {
+            Key::Character(c) if self.tab_jump_mod() && c.chars().next().is_some_and(|ch| ch.is_ascii_digit()) => {
+                if let Some(d) = c.chars().next().and_then(|ch| ch.to_digit(10)) {
+                    if d >= 1 && (d as usize) <= self.tabs.len() {
+                        self.active_tab = (d as usize) - 1;
+                        self.settings.close();
+                        self.request_redraw();
+                    }
+                }
+            }
+            Key::Character(c) if self.cmd_or_ctrl() && !alt => match c.to_ascii_lowercase().as_str() {
                 "t" => {
                     self.settings.close();
                     let cwd = self.tabs.get(self.active_tab).and_then(|t| t.cwd_path());
@@ -1566,16 +1615,7 @@ impl TerminalApp {
                 }
                 _ => {}
             },
-            Key::Character(c) if alt && !ctrl => {
-                if let Some(d) = c.chars().next().and_then(|ch| ch.to_digit(10)) {
-                    if d >= 1 && (d as usize) <= self.tabs.len() {
-                        self.active_tab = (d as usize) - 1;
-                        self.settings.close();
-                        self.request_redraw();
-                    }
-                }
-            }
-            Key::Character(c) if !ctrl && !alt => match c.as_str() {
+            Key::Character(c) if !ctrl && !alt && !self.super_held() => match c.as_str() {
                 "j" => {
                     self.settings.move_selection(1);
                     self.request_redraw();
@@ -1678,7 +1718,7 @@ impl TerminalApp {
             Key::Character(c) if ctrl && (c.eq_ignore_ascii_case("c") || c.eq_ignore_ascii_case("g")) => {
                 self.palette.open = false;
             }
-            _ if ctrl && !alt && matches_shortcut_key(key, physical_key, 'v', KeyCode::KeyV) => {
+            _ if self.cmd_or_ctrl() && !alt && matches_shortcut_key(key, physical_key, 'v', KeyCode::KeyV) => {
                 self.paste_clipboard();
             }
             Key::Character(c) if ctrl && c.eq_ignore_ascii_case("u") => {
@@ -1692,7 +1732,7 @@ impl TerminalApp {
                 self.palette.refresh(&self.history);
             }
             _ => {
-                if !ctrl {
+                if !ctrl && !self.super_held() {
                     if let Some(t) = text {
                         let filtered: String = t.chars().filter(|c| !c.is_control()).collect();
                         if !filtered.is_empty() {
@@ -1715,6 +1755,8 @@ impl TerminalApp {
         event_loop: &ActiveEventLoop,
     ) {
         let ctrl = self.modifiers.control_key();
+        // Cmd on macOS, Ctrl elsewhere (identical to `ctrl` off macOS)
+        let cmd = self.cmd_or_ctrl();
         let shift = self.modifiers.shift_key();
         let alt = self.modifiers.alt_key();
 
@@ -1745,8 +1787,19 @@ impl TerminalApp {
             }
         }
 
-        // Ctrl+T / Ctrl+W -> new tab / close tab
-        if ctrl && !alt {
+        // Cmd+Q -> quit, same path as CloseRequested
+        if cfg!(target_os = "macos") && cmd && !shift && !alt && !ctrl {
+            if let Key::Character(c) = key {
+                if c.eq_ignore_ascii_case("q") {
+                    self.commands.manager.shutdown_foreground();
+                    event_loop.exit();
+                    return;
+                }
+            }
+        }
+
+        // Ctrl+T / Ctrl+W (Cmd on macOS) -> new tab / close tab
+        if cmd && !alt {
             if let Key::Character(c) = key {
                 match c.to_ascii_lowercase().as_str() {
                     "t" => {
@@ -1765,7 +1818,7 @@ impl TerminalApp {
 
         // Ctrl+C (when text is selected) -> copy; otherwise falls through to PTY as SIGINT
         // Ctrl+V -> paste clipboard
-        if ctrl && !shift && !alt {
+        if cmd && !shift && !alt {
             if let Key::Character(c) = key {
                 match c.to_ascii_lowercase().as_str() {
                     "c" => {
@@ -1792,8 +1845,8 @@ impl TerminalApp {
             }
         }
 
-        // Ctrl+Shift shortcuts
-        if ctrl && shift && !alt {
+        // Ctrl+Shift shortcuts (Cmd+Shift on macOS)
+        if cmd && shift && !alt {
             if matches_shortcut_key(key, physical_key, 'c', KeyCode::KeyC) {
                 self.copy_selection();
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
@@ -1846,8 +1899,8 @@ impl TerminalApp {
             return;
         }
 
-        // Alt+1..9 -> jump to tab
-        if alt && !ctrl {
+        // Alt+1..9 -> jump to tab (Cmd+1..9 on macOS; Alt stays free for the shell there)
+        if self.tab_jump_mod() {
             if let Key::Character(c) = key {
                 if let Some(d) = c.chars().next().and_then(|ch| ch.to_digit(10)) {
                     if d >= 1 && (d as usize) <= self.tabs.len() {
@@ -1859,8 +1912,8 @@ impl TerminalApp {
             }
         }
 
-        // Font zoom: Ctrl+= / Ctrl++ / Ctrl+- / Ctrl+0
-        if ctrl && !alt {
+        // Font zoom: Ctrl+= / Ctrl++ / Ctrl+- / Ctrl+0 (Cmd on macOS)
+        if cmd && !alt {
             if let Key::Character(c) = key {
                 match c.as_str() {
                     "+" | "=" => {
@@ -1910,6 +1963,11 @@ impl TerminalApp {
                     _ => {}
                 }
             }
+        }
+
+        // On macOS, Cmd combos are app-level only; never type them into the PTY.
+        if self.super_held() {
+            return;
         }
 
         // --- Forward key to active PTY ---
@@ -2096,6 +2154,7 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
         if self.window.is_some() {
             return;
         }
+        #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(unused_mut))]
         let mut attrs = Window::default_attributes()
             .with_title("itsadri-terminal")
             .with_inner_size(LogicalSize::new(
@@ -2107,6 +2166,14 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
         {
             use winit::platform::wayland::WindowAttributesExtWayland;
             attrs = attrs.with_name("itsadri-terminal", "itsadri-terminal");
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            use winit::platform::macos::{OptionAsAlt, WindowAttributesExtMacOS};
+            // Left Option acts as Alt (readline Alt+b/f/Backspace/arrows); right Option still composes
+            // characters such as @ # | \ { } on Spanish/German layouts
+            attrs = attrs.with_option_as_alt(OptionAsAlt::OnlyLeft);
         }
 
         let window = Rc::new(
@@ -3043,6 +3110,13 @@ pub(crate) fn encode_key(
             }
             NamedKey::ArrowUp => encode_cursor(b'A', mod_code, app_cursor),
             NamedKey::ArrowDown => encode_cursor(b'B', mod_code, app_cursor),
+            // macOS: Option+Left/Right send ESC b / ESC f (word motion), like Terminal.app
+            NamedKey::ArrowRight if cfg!(target_os = "macos") && alt && !ctrl && !shift => {
+                vec![0x1b, b'f']
+            }
+            NamedKey::ArrowLeft if cfg!(target_os = "macos") && alt && !ctrl && !shift => {
+                vec![0x1b, b'b']
+            }
             NamedKey::ArrowRight => encode_cursor(b'C', mod_code, app_cursor),
             NamedKey::ArrowLeft => encode_cursor(b'D', mod_code, app_cursor),
             NamedKey::Home => encode_cursor(b'H', mod_code, app_cursor),

@@ -381,10 +381,20 @@ impl Shortcut {
         })
     }
 
+    /// Canonical text form; this is what gets persisted to config.toml.
     pub fn format(&self) -> String {
+        self.format_with_ctrl_label("Ctrl")
+    }
+
+    /// Text form for the UI: the `ctrl` flag is shown as Cmd on macOS.
+    pub fn display(&self) -> String {
+        self.format_with_ctrl_label(if cfg!(target_os = "macos") { "Cmd" } else { "Ctrl" })
+    }
+
+    fn format_with_ctrl_label(&self, ctrl_label: &str) -> String {
         let mut parts: Vec<String> = Vec::new();
         if self.ctrl {
-            parts.push("Ctrl".to_string());
+            parts.push(ctrl_label.to_string());
         }
         if self.shift {
             parts.push("Shift".to_string());

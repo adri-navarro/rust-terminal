@@ -410,6 +410,7 @@ fn find_agy_binary(home: &Path) -> Option<PathBuf> {
     let candidates = [
         home.join(".local/bin/agy"),
         home.join(".gemini/antigravity-cli/bin/agy"),
+        PathBuf::from("/opt/homebrew/bin/agy"),
         PathBuf::from("/usr/local/bin/agy"),
         PathBuf::from("/usr/bin/agy"),
     ];

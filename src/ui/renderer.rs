@@ -2910,7 +2910,11 @@ fn render_commands_view(
             content_x + 360,
             theme.accent,
         );
-        let fhint = "Tab switch field  ·  Ctrl+V paste  ·  Enter submit  ·  Esc cancel";
+        let fhint = if cfg!(target_os = "macos") {
+            "Tab switch field  ·  Cmd+V paste  ·  Enter submit  ·  Esc cancel"
+        } else {
+            "Tab switch field  ·  Ctrl+V paste  ·  Enter submit  ·  Esc cancel"
+        };
         let fhw = font.measure_text(fhint, fs(16.5));
         if content_w > fhw + 340 {
             canvas.draw_text_clipped(
@@ -3849,19 +3853,19 @@ fn render_settings_view(
         (
             SettingsShortcutTarget::Commands,
             "Commands Tab",
-            cfg.commands_shortcut().format(),
+            cfg.commands_shortcut().display(),
             5usize,
         ),
         (
             SettingsShortcutTarget::Monitor,
             "Monitor Tab",
-            cfg.monitor_shortcut().format(),
+            cfg.monitor_shortcut().display(),
             6usize,
         ),
         (
             SettingsShortcutTarget::Usage,
             "Usage Tab",
-            cfg.usage_shortcut().format(),
+            cfg.usage_shortcut().display(),
             7usize,
         ),
     ];
@@ -3883,7 +3887,11 @@ fn render_settings_view(
             content_x + 260,
             theme.fg_muted,
         );
-        let shint = "Click Change or press Enter, then press new shortcut (Ctrl/Alt/F1-F12)";
+        let shint = if cfg!(target_os = "macos") {
+            "Click Change or press Enter, then press new shortcut (Cmd/Alt/F1-F12)"
+        } else {
+            "Click Change or press Enter, then press new shortcut (Ctrl/Alt/F1-F12)"
+        };
         let shw = font.measure_text(shint, 14.5);
         if content_w > shw + 260 {
             canvas.draw_text_clipped(

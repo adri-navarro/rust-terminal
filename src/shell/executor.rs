@@ -25,9 +25,11 @@ impl ShellState {
         ensure_user_path();
         let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
         let mut aliases = HashMap::new();
-        aliases.insert("ll".to_string(), "ls -la --color=auto".to_string());
-        aliases.insert("la".to_string(), "ls -A --color=auto".to_string());
-        aliases.insert("ls".to_string(), "ls -la --color=auto".to_string());
+        // BSD ls (macOS) has no --color; -G is its equivalent.
+        let ls_color = if cfg!(target_os = "macos") { "-G" } else { "--color=auto" };
+        aliases.insert("ll".to_string(), format!("ls -la {ls_color}"));
+        aliases.insert("la".to_string(), format!("ls -A {ls_color}"));
+        aliases.insert("ls".to_string(), format!("ls -la {ls_color}"));
         aliases.insert("grep".to_string(), "grep --color=auto".to_string());
 
         Self {
@@ -432,12 +434,23 @@ fn run_builtin(cmd: &SimpleCommand, state: &mut ShellState) -> i32 {
             let _ = writeln!(out, "  Ctrl+R                 Fuzzy history search palette");
             let _ = writeln!(out, "  Up / Down              Navigate command history");
             let _ = writeln!(out, "\nTerminal GUI shortcuts:");
-            let _ = writeln!(out, "  Ctrl+T / Ctrl+W        New / close tab");
-            let _ = writeln!(out, "  Ctrl+Tab / Alt+1..9    Switch tabs");
-            let _ = writeln!(out, "  Ctrl+Shift+C / V       Copy / paste");
-            let _ = writeln!(out, "  Ctrl+= / - / 0         Zoom font in / out / reset");
+            if cfg!(target_os = "macos") {
+                let _ = writeln!(out, "  Cmd+T / Cmd+W          New / close tab");
+                let _ = writeln!(out, "  Ctrl+Tab / Cmd+1..9    Switch tabs");
+                let _ = writeln!(out, "  Cmd+C / V              Copy / paste (Ctrl+C = SIGINT)");
+                let _ = writeln!(out, "  Cmd+= / - / 0          Zoom font in / out / reset");
+            } else {
+                let _ = writeln!(out, "  Ctrl+T / Ctrl+W        New / close tab");
+                let _ = writeln!(out, "  Ctrl+Tab / Alt+1..9    Switch tabs");
+                let _ = writeln!(out, "  Ctrl+Shift+C / V       Copy / paste");
+                let _ = writeln!(out, "  Ctrl+= / - / 0         Zoom font in / out / reset");
+            }
             let _ = writeln!(out, "  F2                     Cycle theme");
-            let _ = writeln!(out, "  Ctrl+Shift+R           Reload config.toml");
+            if cfg!(target_os = "macos") {
+                let _ = writeln!(out, "  Cmd+Shift+R            Reload config.toml");
+            } else {
+                let _ = writeln!(out, "  Ctrl+Shift+R           Reload config.toml");
+            }
             0
         }
         "exit" => {
@@ -504,6 +517,17 @@ pub fn build_enriched_path(current_path: &str, home: Option<&Path>) -> String {
         ];
         for rel in user_dirs {
             let dir = h.join(rel);
+            if dir.is_dir() && !existing.contains(&dir) && !prepend.contains(&dir) {
+                prepend.push(dir);
+            }
+        }
+    }
+
+    // Finder/Dock-launched apps get a minimal PATH without Homebrew.
+    #[cfg(target_os = "macos")]
+    {
+        for sys in ["/opt/homebrew/bin", "/opt/homebrew/sbin"] {
+            let dir = PathBuf::from(sys);
             if dir.is_dir() && !existing.contains(&dir) && !prepend.contains(&dir) {
                 prepend.push(dir);
             }
