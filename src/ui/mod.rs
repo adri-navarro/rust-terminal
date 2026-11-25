@@ -1,16 +1,23 @@
+pub mod docker_view;
 pub mod font;
 pub mod renderer;
 
 use crate::commands::{CommandEvent, CommandManager, CommandStatus, expand_directory};
+use crate::docker::{
+    ComposeAction, ComposeStatus, DockerEvent, DockerManager, complete_directory,
+    find_compose_file, spawn_compose_job,
+};
+use crate::ui::docker_view::{DockerFormView, DockerViewState};
 use crate::config::{
-    Config, DEFAULT_COMMANDS_FONT_SIZE, DEFAULT_MONITOR_FONT_SIZE, DEFAULT_SHORTCUT_COMMANDS,
-    DEFAULT_SHORTCUT_MONITOR, DEFAULT_SHORTCUT_USAGE, DEFAULT_TERMINAL_FONT_SIZE,
-    DEFAULT_USAGE_FONT_SIZE, Shortcut, ShortcutKey, Theme,
+    Config, DEFAULT_COMMANDS_FONT_SIZE, DEFAULT_DOCKER_FONT_SIZE, DEFAULT_MONITOR_FONT_SIZE,
+    DEFAULT_SHORTCUT_COMMANDS, DEFAULT_SHORTCUT_DOCKER, DEFAULT_SHORTCUT_MONITOR,
+    DEFAULT_SHORTCUT_USAGE, DEFAULT_TERMINAL_FONT_SIZE, DEFAULT_USAGE_FONT_SIZE, Shortcut,
+    ShortcutKey, Theme,
 };
 use crate::history::{FuzzyMatch, HistoryStore};
 use crate::monitor::{ProcessSort, SystemMonitor, SystemSnapshot, send_process_signal, sort_processes};
 use crate::terminal::TerminalTab;
-use crate::ui::font::FontEngine;
+use crate::ui::font::{FontEngine, FontPreset, available_font_presets};
 use crate::ui::renderer::{
     CommandFormField, CommandFormView, CommandsViewState, HistoryPaletteView, MonitorViewState,
     SettingsFontTarget, SettingsShortcutTarget, SettingsViewState, TabBarHitZones,
@@ -25,7 +32,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -39,6 +46,7 @@ pub enum UserEvent {
     PtyWake,
     UsageUpdated(UsageReport),
     CommandEvent(CommandEvent),
+    Docker(DockerEvent),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,7 +187,7 @@ struct SettingsTabState {
 }
 
 impl SettingsTabState {
-    const ROW_COUNT: usize = 8;
+    const ROW_COUNT: usize = 11;
 
     fn new() -> Self {
         Self {
@@ -228,6 +236,78 @@ impl UsageTabState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DockerFormMode {
+    Add,
+    Edit(u64),
+}
+
+struct DockerFormState {
+    mode: DockerFormMode,
+    dir_input: String,
+    error: Option<String>,
+}
+
+struct DockerTabState {
+    open: bool,
+    manager: DockerManager,
+    selected: usize,
+    scroll: usize,
+    log_scroll: usize,
+    form: Option<DockerFormState>,
+}
+
+impl DockerTabState {
+    fn new() -> Self {
+        Self {
+            open: false,
+            manager: DockerManager::load(),
+            selected: 0,
+            scroll: 0,
+            log_scroll: 0,
+            form: None,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.manager.entries.len()
+    }
+
+    fn selected_id(&self) -> Option<u64> {
+        self.manager.entries.get(self.selected).map(|e| e.id)
+    }
+
+    fn clamp_selection(&mut self) {
+        let len = self.len();
+        if len == 0 {
+            self.selected = 0;
+            self.scroll = 0;
+        } else {
+            self.selected = self.selected.min(len - 1);
+            self.scroll = self.scroll.min(self.selected);
+        }
+    }
+
+    fn move_selection(&mut self, delta: isize, page: usize) {
+        let len = self.len();
+        if len == 0 {
+            return;
+        }
+        if delta < 0 {
+            self.selected = self.selected.saturating_sub((-delta) as usize);
+        } else {
+            self.selected = (self.selected + delta as usize).min(len - 1);
+        }
+        let page = page.max(1);
+        if self.selected < self.scroll {
+            self.scroll = self.selected;
+        } else if self.selected >= self.scroll + page {
+            self.scroll = self.selected + 1 - page;
+        }
+        self.log_scroll = 0;
+    }
+}
+
 struct HistoryPaletteState {
     open: bool,
     query: String,
@@ -273,6 +353,7 @@ struct TerminalApp {
     cfg: Config,
     theme: Theme,
     font: FontEngine,
+    font_presets: Vec<FontPreset>,
     history: HistoryStore,
     clipboard: Option<Clipboard>,
 
@@ -299,11 +380,14 @@ struct TerminalApp {
     monitor: MonitorTabState,
     commands: CommandsTabState,
     settings: SettingsTabState,
+    docker: DockerTabState,
     toast: Option<(String, Instant)>,
 
     cursor_blink_on: bool,
     last_blink: Instant,
     last_input: Instant,
+    last_window_title: String,
+    pty_wake_pending: Arc<AtomicBool>,
 }
 
 impl TerminalApp {
@@ -317,6 +401,7 @@ impl TerminalApp {
         }
         let theme = Theme::by_name(&cfg.theme);
         let font = FontEngine::new(cfg.font_path.as_deref(), cfg.font_size, cfg.line_height)?;
+        let font_presets = available_font_presets();
         let history = HistoryStore::load();
         let clipboard = Clipboard::new().ok();
 
@@ -325,6 +410,7 @@ impl TerminalApp {
             cfg,
             theme,
             font,
+            font_presets,
             history,
             clipboard,
             window: None,
@@ -347,10 +433,13 @@ impl TerminalApp {
             monitor: MonitorTabState::new(),
             commands: CommandsTabState::new(),
             settings: SettingsTabState::new(),
+            docker: DockerTabState::new(),
             toast: None,
             cursor_blink_on: true,
             last_blink: Instant::now(),
             last_input: Instant::now(),
+            last_window_title: "itsadri-terminal".to_string(),
+            pty_wake_pending: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -364,6 +453,7 @@ impl TerminalApp {
     fn spawn_tab(&mut self, cwd: Option<PathBuf>) {
         let (cols, rows) = self.grid_dims();
         let proxy = self.proxy.clone();
+        let wake_pending = Arc::clone(&self.pty_wake_pending);
         match TerminalTab::spawn(
             cols,
             rows,
@@ -371,7 +461,9 @@ impl TerminalApp {
             self.cfg.shell.as_deref(),
             cwd.as_deref(),
             move || {
-                let _ = proxy.send_event(UserEvent::PtyWake);
+                if !wake_pending.swap(true, Ordering::AcqRel) {
+                    let _ = proxy.send_event(UserEvent::PtyWake);
+                }
             },
         ) {
             Ok(tab) => {
@@ -531,6 +623,15 @@ impl TerminalApp {
             }
             return;
         }
+        if self.docker.open {
+            if let Some(ref mut form) = self.docker.form {
+                let clean = text.replace(['\r', '\n'], "");
+                form.dir_input.push_str(&clean);
+                form.error = None;
+                self.request_redraw();
+            }
+            return;
+        }
         if let Some(tab) = self.tabs.get_mut(self.active_tab) {
             tab.selection = None;
             let bracketed = tab
@@ -607,6 +708,7 @@ impl TerminalApp {
             self.monitor.open = false;
             self.commands.open = false;
             self.settings.close();
+            self.docker.open = false;
             let stale = self
                 .usage
                 .last_scan
@@ -626,6 +728,7 @@ impl TerminalApp {
             self.usage.open = false;
             self.commands.open = false;
             self.settings.close();
+            self.docker.open = false;
             self.monitor.refresh();
         }
         self.request_redraw();
@@ -638,6 +741,7 @@ impl TerminalApp {
             self.usage.open = false;
             self.monitor.open = false;
             self.settings.close();
+            self.docker.open = false;
             self.commands.clamp_selection();
         }
         self.request_redraw();
@@ -652,8 +756,178 @@ impl TerminalApp {
             self.usage.open = false;
             self.monitor.open = false;
             self.commands.open = false;
+            self.docker.open = false;
         }
         self.request_redraw();
+    }
+
+    fn toggle_docker_tab(&mut self) {
+        self.docker.open = !self.docker.open;
+        if self.docker.open {
+            self.palette.open = false;
+            self.usage.open = false;
+            self.monitor.open = false;
+            self.commands.open = false;
+            self.settings.close();
+        }
+        self.request_redraw();
+    }
+
+    fn docker_event_cb(&self) -> Arc<dyn Fn(DockerEvent) + Send + Sync> {
+        let proxy = self.proxy.clone();
+        Arc::new(move |ev| {
+            let _ = proxy.send_event(UserEvent::Docker(ev));
+        })
+    }
+
+    fn run_docker_action(&mut self, id: u64, action: ComposeAction) {
+        let Some((name, dir_str)) = self
+            .docker
+            .manager
+            .find_by_id(id)
+            .map(|e| (e.display_name(), e.directory.clone()))
+        else {
+            return;
+        };
+        let resolved = expand_directory(&dir_str);
+        if !resolved.is_dir() {
+            let msg = format!("Directory does not exist: {}", resolved.display());
+            if let Some(entry) = self.docker.manager.find_by_id_mut(id) {
+                entry.push_log(format!("✖ {msg}"));
+                entry.status = ComposeStatus::Failed;
+            }
+            self.show_toast(msg);
+            self.request_redraw();
+            return;
+        }
+        if find_compose_file(&resolved).is_none() {
+            let msg = format!("No compose file found in {}", resolved.display());
+            if let Some(entry) = self.docker.manager.find_by_id_mut(id) {
+                entry.push_log(format!("✖ {msg}"));
+                entry.status = ComposeStatus::Failed;
+            }
+            self.show_toast(msg);
+            self.request_redraw();
+            return;
+        }
+
+        if let Some(entry) = self.docker.manager.find_by_id_mut(id) {
+            entry.jobs_running += 1;
+            match action {
+                ComposeAction::Up | ComposeAction::UpBuild | ComposeAction::Restart => {
+                    entry.status = ComposeStatus::Starting;
+                }
+                ComposeAction::Down => {
+                    entry.status = ComposeStatus::Stopping;
+                }
+                ComposeAction::Logs => {}
+            }
+        }
+        self.docker.log_scroll = 0;
+        let label = format!("{} ({name})", action.label());
+        self.show_toast(format!("{label}…"));
+        let cb = self.docker_event_cb();
+        spawn_compose_job(id, action, label, resolved, cb);
+        self.request_redraw();
+    }
+
+    fn down_all_docker(&mut self) {
+        let ids: Vec<u64> = self
+            .docker
+            .manager
+            .entries
+            .iter()
+            .filter(|e| e.status.is_up())
+            .map(|e| e.id)
+            .collect();
+        for id in ids {
+            self.run_docker_action(id, ComposeAction::Down);
+        }
+    }
+
+    fn open_docker_add_form(&mut self) {
+        let dir = self
+            .tabs
+            .get(self.active_tab)
+            .and_then(|t| t.cwd_path())
+            .or_else(|| std::env::current_dir().ok())
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "~".to_string());
+        self.docker.form = Some(DockerFormState {
+            mode: DockerFormMode::Add,
+            dir_input: dir,
+            error: None,
+        });
+        self.last_input = Instant::now();
+        self.cursor_blink_on = true;
+        self.request_redraw();
+    }
+
+    fn open_docker_edit_form(&mut self, id: u64) {
+        let Some(dir) = self
+            .docker
+            .manager
+            .find_by_id(id)
+            .map(|e| e.directory.clone())
+        else {
+            return;
+        };
+        self.docker.form = Some(DockerFormState {
+            mode: DockerFormMode::Edit(id),
+            dir_input: dir,
+            error: None,
+        });
+        self.last_input = Instant::now();
+        self.cursor_blink_on = true;
+        self.request_redraw();
+    }
+
+    fn submit_docker_form(&mut self) {
+        let Some(ref mut form) = self.docker.form else {
+            return;
+        };
+        let raw = form.dir_input.trim().to_string();
+        let resolved = expand_directory(&raw);
+        if raw.is_empty() || !resolved.is_dir() {
+            form.error = Some(format!("Directory does not exist: {}", resolved.display()));
+            self.request_redraw();
+            return;
+        }
+        if find_compose_file(&resolved).is_none() {
+            form.error = Some("No compose.yaml / docker-compose.yml found in that directory.".to_string());
+            self.request_redraw();
+            return;
+        }
+        let mode = form.mode;
+        self.docker.form = None;
+        match mode {
+            DockerFormMode::Add => {
+                let (id, added) = self.docker.manager.add(raw);
+                if let Some(idx) = self.docker.manager.entries.iter().position(|e| e.id == id) {
+                    self.docker.selected = idx;
+                    self.docker.log_scroll = 0;
+                }
+                if added {
+                    self.show_toast("Compose directory added");
+                } else {
+                    self.show_toast("Directory already in list");
+                }
+            }
+            DockerFormMode::Edit(id) => {
+                self.docker.manager.update(id, raw);
+                self.show_toast("Compose directory updated");
+            }
+        }
+        self.request_redraw();
+    }
+
+    fn delete_docker_dir(&mut self, id: u64) {
+        if self.docker.manager.remove(id) {
+            self.docker.clamp_selection();
+            self.docker.log_scroll = 0;
+            self.show_toast("Compose directory removed");
+            self.request_redraw();
+        }
     }
 
     fn set_theme(&mut self, name: &str) {
@@ -663,6 +937,56 @@ impl TerminalApp {
         self.cfg.theme = canonical.to_string();
         let _ = self.cfg.save();
         self.show_toast(format!("Theme: {canonical}"));
+    }
+
+    fn set_font_preset(&mut self, path: &str) {
+        match FontEngine::new(Some(path), self.cfg.font_size, self.cfg.line_height) {
+            Ok(new_font) => {
+                let label = self
+                    .font_presets
+                    .iter()
+                    .find(|p| p.regular == new_font.active_path)
+                    .map(|p| p.label.clone())
+                    .unwrap_or_else(|| {
+                        new_font
+                            .active_path
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("Custom")
+                            .to_string()
+                    });
+                self.font = new_font;
+                self.cfg.font_path = Some(path.to_string());
+                self.resize_all_tabs();
+                let _ = self.cfg.save();
+                self.show_toast(format!("Font: {label}"));
+            }
+            Err(e) => {
+                self.show_toast(format!("Font error: {e}"));
+            }
+        }
+    }
+
+    fn cycle_font_preset(&mut self, dir: isize) {
+        if self.font_presets.is_empty() {
+            return;
+        }
+        let len = self.font_presets.len();
+        let cur = self
+            .font_presets
+            .iter()
+            .position(|p| p.regular == self.font.active_path)
+            .unwrap_or(0);
+        let next_idx = if dir < 0 {
+            (cur + len - 1) % len
+        } else {
+            (cur + 1) % len
+        };
+        let next_path = self.font_presets[next_idx]
+            .regular
+            .to_string_lossy()
+            .into_owned();
+        self.set_font_preset(&next_path);
     }
 
     fn adjust_view_font_size(&mut self, target: SettingsFontTarget, delta: f32) {
@@ -686,6 +1010,15 @@ impl TerminalApp {
                 };
                 self.cfg.commands_font_size = v;
                 ("Commands", v)
+            }
+            SettingsFontTarget::Docker => {
+                let v = if delta == 0.0 {
+                    DEFAULT_DOCKER_FONT_SIZE
+                } else {
+                    (self.cfg.docker_font_size + delta).clamp(9.0, 36.0)
+                };
+                self.cfg.docker_font_size = v;
+                ("Docker", v)
             }
             SettingsFontTarget::Monitor => {
                 let v = if delta == 0.0 {
@@ -711,9 +1044,10 @@ impl TerminalApp {
     }
 
     fn assign_shortcut(&mut self, target: SettingsShortcutTarget, sc: Shortcut) {
-        // Check for duplicate bindings across the 3 customizable tab shortcuts
-        let others: [(SettingsShortcutTarget, &str, Shortcut); 3] = [
+        // Check for duplicate bindings across the customizable tab shortcuts
+        let others: [(SettingsShortcutTarget, &str, Shortcut); 4] = [
             (SettingsShortcutTarget::Commands, "Commands", self.cfg.commands_shortcut()),
+            (SettingsShortcutTarget::Docker, "Docker", self.cfg.docker_shortcut()),
             (SettingsShortcutTarget::Monitor, "Monitor", self.cfg.monitor_shortcut()),
             (SettingsShortcutTarget::Usage, "Usage", self.cfg.usage_shortcut()),
         ];
@@ -733,6 +1067,10 @@ impl TerminalApp {
             SettingsShortcutTarget::Commands => {
                 self.cfg.shortcut_commands = formatted.clone();
                 "Commands"
+            }
+            SettingsShortcutTarget::Docker => {
+                self.cfg.shortcut_docker = formatted.clone();
+                "Docker"
             }
             SettingsShortcutTarget::Monitor => {
                 self.cfg.shortcut_monitor = formatted.clone();
@@ -755,6 +1093,10 @@ impl TerminalApp {
                 self.cfg.shortcut_commands = DEFAULT_SHORTCUT_COMMANDS.to_string();
                 ("Commands", DEFAULT_SHORTCUT_COMMANDS)
             }
+            SettingsShortcutTarget::Docker => {
+                self.cfg.shortcut_docker = DEFAULT_SHORTCUT_DOCKER.to_string();
+                ("Docker", DEFAULT_SHORTCUT_DOCKER)
+            }
             SettingsShortcutTarget::Monitor => {
                 self.cfg.shortcut_monitor = DEFAULT_SHORTCUT_MONITOR.to_string();
                 ("Monitor", DEFAULT_SHORTCUT_MONITOR)
@@ -773,15 +1115,26 @@ impl TerminalApp {
     fn reset_all_settings(&mut self) {
         let def = Config::default();
         self.cfg.font_size = def.font_size;
+        self.cfg.font_path = def.font_path;
         self.cfg.commands_font_size = def.commands_font_size;
+        self.cfg.docker_font_size = def.docker_font_size;
         self.cfg.monitor_font_size = def.monitor_font_size;
         self.cfg.usage_font_size = def.usage_font_size;
         self.cfg.theme = def.theme.clone();
         self.cfg.shortcut_commands = def.shortcut_commands;
+        self.cfg.shortcut_docker = def.shortcut_docker;
         self.cfg.shortcut_monitor = def.shortcut_monitor;
         self.cfg.shortcut_usage = def.shortcut_usage;
         self.theme = Theme::by_name(&self.cfg.theme);
-        self.font.set_size(self.cfg.font_size, self.cfg.line_height);
+        if let Ok(new_font) = FontEngine::new(
+            self.cfg.font_path.as_deref(),
+            self.cfg.font_size,
+            self.cfg.line_height,
+        ) {
+            self.font = new_font;
+        } else {
+            self.font.set_size(self.cfg.font_size, self.cfg.line_height);
+        }
         self.resize_all_tabs();
         self.settings.recording_shortcut = None;
         self.settings.error = None;
@@ -831,6 +1184,10 @@ impl TerminalApp {
             self.toggle_usage_tab();
             return true;
         }
+        if matches_configured_shortcut(self.cfg.docker_shortcut(), key, physical_key, ctrl, shift, alt) {
+            self.toggle_docker_tab();
+            return true;
+        }
 
         // Settings tab shortcut: Ctrl+, (Cmd+, on macOS) or F6
         if (ctrl && !alt && !shift && matches!(key, Key::Character(c) if c.as_str() == ","))
@@ -853,6 +1210,10 @@ impl TerminalApp {
                 }
                 Key::Named(NamedKey::F5) => {
                     self.toggle_commands_tab();
+                    return true;
+                }
+                Key::Named(NamedKey::F7) => {
+                    self.toggle_docker_tab();
                     return true;
                 }
                 _ => {}
@@ -1236,6 +1597,237 @@ impl TerminalApp {
         }
     }
 
+    fn handle_docker_key(
+        &mut self,
+        key: &Key,
+        physical_key: PhysicalKey,
+        text: Option<&str>,
+        event_loop: &ActiveEventLoop,
+    ) {
+        let ctrl = self.modifiers.control_key();
+        let shift = self.modifiers.shift_key();
+        let alt = self.modifiers.alt_key();
+
+        // When Add / Edit directory form is open, route keys to it
+        if self.docker.form.is_some() {
+            match key {
+                Key::Named(NamedKey::Escape) => {
+                    self.docker.form = None;
+                    self.request_redraw();
+                }
+                Key::Named(NamedKey::Tab) => {
+                    if let Some(ref mut form) = self.docker.form {
+                        if let Some(completed) = complete_directory(&form.dir_input) {
+                            form.dir_input = completed;
+                            form.error = None;
+                        }
+                    }
+                    self.last_input = Instant::now();
+                    self.cursor_blink_on = true;
+                    self.request_redraw();
+                }
+                Key::Named(NamedKey::Enter) => {
+                    self.submit_docker_form();
+                }
+                Key::Named(NamedKey::Backspace) => {
+                    if let Some(ref mut form) = self.docker.form {
+                        form.dir_input.pop();
+                        form.error = None;
+                    }
+                    self.last_input = Instant::now();
+                    self.cursor_blink_on = true;
+                    self.request_redraw();
+                }
+                Key::Named(NamedKey::Space) => {
+                    if let Some(ref mut form) = self.docker.form {
+                        form.dir_input.push(' ');
+                        form.error = None;
+                    }
+                    self.last_input = Instant::now();
+                    self.cursor_blink_on = true;
+                    self.request_redraw();
+                }
+                _ if self.cmd_or_ctrl()
+                    && !alt
+                    && matches_shortcut_key(key, physical_key, 'v', KeyCode::KeyV) =>
+                {
+                    self.paste_clipboard();
+                }
+                Key::Character(c) if ctrl && c.eq_ignore_ascii_case("u") => {
+                    if let Some(ref mut form) = self.docker.form {
+                        form.dir_input.clear();
+                        form.error = None;
+                    }
+                    self.request_redraw();
+                }
+                _ => {
+                    if !ctrl && !alt && !self.super_held() {
+                        if let Some(t) = text {
+                            let filtered: String = t.chars().filter(|c| !c.is_control()).collect();
+                            if !filtered.is_empty() {
+                                if let Some(ref mut form) = self.docker.form {
+                                    form.dir_input.push_str(&filtered);
+                                    form.error = None;
+                                }
+                                self.last_input = Instant::now();
+                                self.cursor_blink_on = true;
+                                self.request_redraw();
+                            }
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        if self.try_handle_global_tab_shortcut(key, physical_key) {
+            return;
+        }
+        if self.super_held() && !matches!(key, Key::Character(_)) {
+            return;
+        }
+
+        let page = self.hit_zones.docker_page_rows.max(1);
+        match key {
+            Key::Named(NamedKey::Escape) => {
+                self.docker.open = false;
+                self.request_redraw();
+            }
+            Key::Named(NamedKey::F2) => {
+                self.cycle_theme();
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                self.docker.move_selection(-1, page);
+                self.request_redraw();
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                self.docker.move_selection(1, page);
+                self.request_redraw();
+            }
+            Key::Named(NamedKey::PageUp) => {
+                self.docker.log_scroll = self.docker.log_scroll.saturating_add(5);
+                self.request_redraw();
+            }
+            Key::Named(NamedKey::PageDown) => {
+                self.docker.log_scroll = self.docker.log_scroll.saturating_sub(5);
+                self.request_redraw();
+            }
+            Key::Named(NamedKey::Space) => {
+                if let Some(id) = self.docker.selected_id() {
+                    let is_up = self
+                        .docker
+                        .manager
+                        .find_by_id(id)
+                        .is_some_and(|e| e.status.is_up());
+                    self.run_docker_action(id, if is_up { ComposeAction::Down } else { ComposeAction::Up });
+                }
+            }
+            Key::Named(NamedKey::Delete) => {
+                if let Some(id) = self.docker.selected_id() {
+                    self.delete_docker_dir(id);
+                }
+            }
+            Key::Character(c)
+                if self.tab_jump_mod() && c.chars().next().is_some_and(|ch| ch.is_ascii_digit()) =>
+            {
+                if let Some(d) = c.chars().next().and_then(|ch| ch.to_digit(10)) {
+                    if d >= 1 && (d as usize) <= self.tabs.len() {
+                        self.active_tab = (d as usize) - 1;
+                        self.docker.open = false;
+                        self.request_redraw();
+                    }
+                }
+            }
+            Key::Character(c) if self.cmd_or_ctrl() && !alt => match c.to_ascii_lowercase().as_str() {
+                "t" => {
+                    self.docker.open = false;
+                    let cwd = self.tabs.get(self.active_tab).and_then(|t| t.cwd_path());
+                    self.spawn_tab(cwd);
+                }
+                "w" => {
+                    self.close_tab(self.active_tab, event_loop);
+                }
+                "k" if shift => {
+                    self.cycle_theme();
+                }
+                "r" if shift => {
+                    self.reload_config();
+                }
+                _ => {}
+            },
+            Key::Character(c) if !ctrl && !alt && !self.super_held() => match c.as_str() {
+                "a" | "A" => self.open_docker_add_form(),
+                "e" | "E" => {
+                    if let Some(id) = self.docker.selected_id() {
+                        self.open_docker_edit_form(id);
+                    }
+                }
+                "u" | "U" => {
+                    if let Some(id) = self.docker.selected_id() {
+                        self.run_docker_action(id, ComposeAction::Up);
+                    }
+                }
+                "b" | "B" => {
+                    if let Some(id) = self.docker.selected_id() {
+                        self.run_docker_action(id, ComposeAction::UpBuild);
+                    }
+                }
+                "d" | "D" => {
+                    if let Some(id) = self.docker.selected_id() {
+                        self.run_docker_action(id, ComposeAction::Down);
+                    }
+                }
+                "R" => {
+                    if let Some(id) = self.docker.selected_id() {
+                        self.run_docker_action(id, ComposeAction::Restart);
+                    }
+                }
+                "l" | "L" => {
+                    if let Some(id) = self.docker.selected_id() {
+                        self.run_docker_action(id, ComposeAction::Logs);
+                    }
+                }
+                "s" | "S" => {
+                    if let Some(id) = self.docker.selected_id() {
+                        let is_up = self
+                            .docker
+                            .manager
+                            .find_by_id(id)
+                            .is_some_and(|e| e.status.is_up());
+                        self.run_docker_action(
+                            id,
+                            if is_up { ComposeAction::Down } else { ComposeAction::Up },
+                        );
+                    }
+                }
+                "x" | "X" => {
+                    if let Some(id) = self.docker.selected_id() {
+                        self.delete_docker_dir(id);
+                    }
+                }
+                "c" | "C" => {
+                    if let Some(id) = self.docker.selected_id() {
+                        if let Some(entry) = self.docker.manager.find_by_id_mut(id) {
+                            entry.logs.clear();
+                        }
+                    }
+                    self.docker.log_scroll = 0;
+                    self.request_redraw();
+                }
+                "j" => {
+                    self.docker.move_selection(1, page);
+                    self.request_redraw();
+                }
+                "k" => {
+                    self.docker.move_selection(-1, page);
+                    self.request_redraw();
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
     fn handle_monitor_key(
         &mut self,
         key: &Key,
@@ -1547,9 +2139,11 @@ impl TerminalApp {
                 match self.settings.selected {
                     0 => self.adjust_view_font_size(SettingsFontTarget::Terminal, -1.0),
                     1 => self.adjust_view_font_size(SettingsFontTarget::Commands, -1.0),
-                    2 => self.adjust_view_font_size(SettingsFontTarget::Monitor, -1.0),
-                    3 => self.adjust_view_font_size(SettingsFontTarget::Usage, -1.0),
-                    4 => {
+                    2 => self.adjust_view_font_size(SettingsFontTarget::Docker, -1.0),
+                    3 => self.adjust_view_font_size(SettingsFontTarget::Monitor, -1.0),
+                    4 => self.adjust_view_font_size(SettingsFontTarget::Usage, -1.0),
+                    5 => self.cycle_font_preset(-1),
+                    6 => {
                         let prev = Theme::prev_name(self.theme.name);
                         self.set_theme(prev);
                     }
@@ -1560,25 +2154,33 @@ impl TerminalApp {
                 match self.settings.selected {
                     0 => self.adjust_view_font_size(SettingsFontTarget::Terminal, 1.0),
                     1 => self.adjust_view_font_size(SettingsFontTarget::Commands, 1.0),
-                    2 => self.adjust_view_font_size(SettingsFontTarget::Monitor, 1.0),
-                    3 => self.adjust_view_font_size(SettingsFontTarget::Usage, 1.0),
-                    4 => self.cycle_theme(),
+                    2 => self.adjust_view_font_size(SettingsFontTarget::Docker, 1.0),
+                    3 => self.adjust_view_font_size(SettingsFontTarget::Monitor, 1.0),
+                    4 => self.adjust_view_font_size(SettingsFontTarget::Usage, 1.0),
+                    5 => self.cycle_font_preset(1),
+                    6 => self.cycle_theme(),
                     _ => {}
                 }
             }
             Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Space) => match self.settings.selected {
-                4 => self.cycle_theme(),
-                5 => {
+                5 => self.cycle_font_preset(1),
+                6 => self.cycle_theme(),
+                7 => {
                     self.settings.recording_shortcut = Some(SettingsShortcutTarget::Commands);
                     self.settings.error = None;
                     self.request_redraw();
                 }
-                6 => {
+                8 => {
+                    self.settings.recording_shortcut = Some(SettingsShortcutTarget::Docker);
+                    self.settings.error = None;
+                    self.request_redraw();
+                }
+                9 => {
                     self.settings.recording_shortcut = Some(SettingsShortcutTarget::Monitor);
                     self.settings.error = None;
                     self.request_redraw();
                 }
-                7 => {
+                10 => {
                     self.settings.recording_shortcut = Some(SettingsShortcutTarget::Usage);
                     self.settings.error = None;
                     self.request_redraw();
@@ -1587,9 +2189,10 @@ impl TerminalApp {
             },
             Key::Named(NamedKey::Backspace) | Key::Named(NamedKey::Delete) => {
                 match self.settings.selected {
-                    5 => self.reset_shortcut(SettingsShortcutTarget::Commands),
-                    6 => self.reset_shortcut(SettingsShortcutTarget::Monitor),
-                    7 => self.reset_shortcut(SettingsShortcutTarget::Usage),
+                    7 => self.reset_shortcut(SettingsShortcutTarget::Commands),
+                    8 => self.reset_shortcut(SettingsShortcutTarget::Docker),
+                    9 => self.reset_shortcut(SettingsShortcutTarget::Monitor),
+                    10 => self.reset_shortcut(SettingsShortcutTarget::Usage),
                     _ => {}
                 }
             }
@@ -1631,22 +2234,25 @@ impl TerminalApp {
                 "-" | "_" => match self.settings.selected {
                     0 => self.adjust_view_font_size(SettingsFontTarget::Terminal, -1.0),
                     1 => self.adjust_view_font_size(SettingsFontTarget::Commands, -1.0),
-                    2 => self.adjust_view_font_size(SettingsFontTarget::Monitor, -1.0),
-                    3 => self.adjust_view_font_size(SettingsFontTarget::Usage, -1.0),
+                    2 => self.adjust_view_font_size(SettingsFontTarget::Docker, -1.0),
+                    3 => self.adjust_view_font_size(SettingsFontTarget::Monitor, -1.0),
+                    4 => self.adjust_view_font_size(SettingsFontTarget::Usage, -1.0),
                     _ => {}
                 },
                 "+" | "=" => match self.settings.selected {
                     0 => self.adjust_view_font_size(SettingsFontTarget::Terminal, 1.0),
                     1 => self.adjust_view_font_size(SettingsFontTarget::Commands, 1.0),
-                    2 => self.adjust_view_font_size(SettingsFontTarget::Monitor, 1.0),
-                    3 => self.adjust_view_font_size(SettingsFontTarget::Usage, 1.0),
+                    2 => self.adjust_view_font_size(SettingsFontTarget::Docker, 1.0),
+                    3 => self.adjust_view_font_size(SettingsFontTarget::Monitor, 1.0),
+                    4 => self.adjust_view_font_size(SettingsFontTarget::Usage, 1.0),
                     _ => {}
                 },
                 "0" => match self.settings.selected {
                     0 => self.adjust_view_font_size(SettingsFontTarget::Terminal, 0.0),
                     1 => self.adjust_view_font_size(SettingsFontTarget::Commands, 0.0),
-                    2 => self.adjust_view_font_size(SettingsFontTarget::Monitor, 0.0),
-                    3 => self.adjust_view_font_size(SettingsFontTarget::Usage, 0.0),
+                    2 => self.adjust_view_font_size(SettingsFontTarget::Docker, 0.0),
+                    3 => self.adjust_view_font_size(SettingsFontTarget::Monitor, 0.0),
+                    4 => self.adjust_view_font_size(SettingsFontTarget::Usage, 0.0),
                     _ => {}
                 },
                 _ => {}
@@ -2045,14 +2651,19 @@ impl TerminalApp {
             })
             .collect();
 
-        // Update OS window title from active tab
+        // Update OS window title only when it changes; calling set_title on every
+        // redraw can re-invalidate the window (especially with macOS fullsize_content_view)
+        // and trigger a continuous 100% CPU redraw loop.
         if let Some(s) = summaries.get(self.active_tab) {
             let win_title = if s.title.is_empty() {
                 "itsadri-terminal".to_string()
             } else {
                 format!("{} — itsadri-terminal", s.title)
             };
-            window.set_title(&win_title);
+            if win_title != self.last_window_title {
+                window.set_title(&win_title);
+                self.last_window_title = win_title;
+            }
         }
 
         let Ok(mut buffer) = surface.buffer_mut() else {
@@ -2119,11 +2730,44 @@ impl TerminalApp {
                 recording_shortcut: self.settings.recording_shortcut,
                 error: self.settings.error.as_deref(),
                 scroll: self.settings.scroll,
+                font_presets: &self.font_presets,
+            })
+        } else {
+            None
+        };
+        let docker_form_detected = self.docker.form.as_ref().map(|f| {
+            let p = expand_directory(&f.dir_input);
+            let exists = !f.dir_input.trim().is_empty() && p.is_dir();
+            let file = if exists { find_compose_file(&p) } else { None };
+            (exists, file)
+        });
+        let docker_view = if self.docker.open {
+            Some(DockerViewState {
+                entries: &self.docker.manager.entries,
+                selected: self.docker.selected,
+                scroll: self.docker.scroll,
+                log_scroll: self.docker.log_scroll,
+                form: self.docker.form.as_ref().map(|f| {
+                    let (dir_exists, detected_file) = docker_form_detected
+                        .as_ref()
+                        .map(|(e, f)| (*e, f.as_deref()))
+                        .unwrap_or((false, None));
+                    DockerFormView {
+                        is_edit: matches!(f.mode, DockerFormMode::Edit(_)),
+                        dir_input: &f.dir_input,
+                        detected_file,
+                        dir_exists,
+                        error: f.error.as_deref(),
+                    }
+                }),
+                cursor_blink_on: cursor_on,
             })
         } else {
             None
         };
         let active_commands_count = self.commands.manager.active_count();
+        let docker_up = self.docker.manager.up_count();
+        let docker_running = (docker_up > 0).then_some(docker_up);
         let toast_str = self.toast.as_ref().map(|(s, _)| s.as_str());
 
         if let Ok(grid) = tab.grid.lock() {
@@ -2144,7 +2788,9 @@ impl TerminalApp {
                 monitor_view.as_ref(),
                 commands_view.as_ref(),
                 settings_view.as_ref(),
+                docker_view.as_ref(),
                 active_commands_count,
+                docker_running,
                 toast_str,
             );
         }
@@ -2243,6 +2889,7 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::PtyWake => {
+                self.pty_wake_pending.store(false, Ordering::Release);
                 // Auto-close tabs whose shell exited cleanly
                 let mut i = 0;
                 while i < self.tabs.len() {
@@ -2269,6 +2916,12 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
             }
             UserEvent::CommandEvent(ev) => {
                 self.commands.manager.apply_event(ev);
+                self.request_redraw();
+            }
+            UserEvent::Docker(ev) => {
+                if let Some(toast) = self.docker.manager.apply_event(ev) {
+                    self.show_toast(toast);
+                }
                 self.request_redraw();
             }
         }
@@ -2381,6 +3034,8 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
                     self.handle_palette_key(&event.logical_key, event.physical_key, text);
                 } else if self.settings.open {
                     self.handle_settings_key(&event.logical_key, event.physical_key, event_loop);
+                } else if self.docker.open {
+                    self.handle_docker_key(&event.logical_key, event.physical_key, text, event_loop);
                 } else if self.commands.open {
                     self.handle_commands_key(&event.logical_key, event.physical_key, text, event_loop);
                 } else if self.monitor.open {
@@ -2434,6 +3089,12 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
                                     return;
                                 }
                             }
+                            if let Some(r) = self.hit_zones.docker_btn {
+                                if r.contains(px, py) {
+                                    self.toggle_docker_tab();
+                                    return;
+                                }
+                            }
                             if let Some(r) = self.hit_zones.commands_btn {
                                 if r.contains(px, py) {
                                     self.toggle_commands_tab();
@@ -2445,6 +3106,7 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
                                     self.usage.open = false;
                                     self.monitor.open = false;
                                     self.commands.open = false;
+                                    self.docker.open = false;
                                     self.settings.close();
                                     let cwd =
                                         self.tabs.get(self.active_tab).and_then(|t| t.cwd_path());
@@ -2463,6 +3125,7 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
                                     self.usage.open = false;
                                     self.monitor.open = false;
                                     self.commands.open = false;
+                                    self.docker.open = false;
                                     self.settings.close();
                                     self.request_redraw();
                                     return;
@@ -2522,10 +3185,20 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
                                     return;
                                 }
                             }
+                            let font_fam_btns = self.hit_zones.settings_font_family_btns.clone();
+                            for (fpath, r) in font_fam_btns {
+                                if r.contains(px, py) {
+                                    self.settings.selected = 5;
+                                    self.settings.recording_shortcut = None;
+                                    self.settings.error = None;
+                                    self.set_font_preset(&fpath);
+                                    return;
+                                }
+                            }
                             let theme_btns = self.hit_zones.settings_theme_btns.clone();
                             for (tname, r) in theme_btns {
                                 if r.contains(px, py) {
-                                    self.settings.selected = 4;
+                                    self.settings.selected = 6;
                                     self.settings.recording_shortcut = None;
                                     self.settings.error = None;
                                     self.set_theme(tname);
@@ -2534,7 +3207,7 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
                             }
                             let sc_btns = self.hit_zones.settings_shortcut_btns.clone();
                             for (i, (target, row_r, change_r, reset_r)) in sc_btns.into_iter().enumerate() {
-                                let row_idx = 5 + i;
+                                let row_idx = 7 + i;
                                 if reset_r.contains(px, py) {
                                     self.settings.selected = row_idx;
                                     self.reset_shortcut(target);
@@ -2563,6 +3236,68 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
                                 self.settings.recording_shortcut = None;
                                 self.settings.error = None;
                                 self.request_redraw();
+                            }
+                            return;
+                        }
+
+                        // Clicks inside full-screen Docker view
+                        if self.docker.open {
+                            if let Some(r) = self.hit_zones.docker_add_btn {
+                                if r.contains(px, py) {
+                                    self.open_docker_add_form();
+                                    return;
+                                }
+                            }
+                            if let Some(r) = self.hit_zones.docker_down_all_btn {
+                                if r.contains(px, py) {
+                                    self.down_all_docker();
+                                    return;
+                                }
+                            }
+                            if self.docker.form.is_some() {
+                                if let Some(r) = self.hit_zones.docker_form_cancel_btn {
+                                    if r.contains(px, py) {
+                                        self.docker.form = None;
+                                        self.request_redraw();
+                                        return;
+                                    }
+                                }
+                                if let Some(r) = self.hit_zones.docker_form_submit_btn {
+                                    if r.contains(px, py) {
+                                        self.submit_docker_form();
+                                        return;
+                                    }
+                                }
+                            }
+                            let dock_rows = self.hit_zones.docker_rows.clone();
+                            for row in dock_rows {
+                                if row.up_btn.contains(px, py) {
+                                    self.docker.selected = row.index;
+                                    self.run_docker_action(row.id, ComposeAction::Up);
+                                    return;
+                                }
+                                if row.down_btn.contains(px, py) {
+                                    self.docker.selected = row.index;
+                                    self.run_docker_action(row.id, ComposeAction::Down);
+                                    return;
+                                }
+                                if row.edit_btn.contains(px, py) {
+                                    self.docker.selected = row.index;
+                                    self.open_docker_edit_form(row.id);
+                                    return;
+                                }
+                                if row.delete_btn.contains(px, py) {
+                                    self.delete_docker_dir(row.id);
+                                    return;
+                                }
+                                if row.row_rect.contains(px, py) {
+                                    if self.docker.selected != row.index {
+                                        self.docker.selected = row.index;
+                                        self.docker.log_scroll = 0;
+                                    }
+                                    self.request_redraw();
+                                    return;
+                                }
                             }
                             return;
                         }
@@ -2808,9 +3543,42 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
                         self.request_redraw();
                     } else if lines < 0 {
                         self.settings.scroll =
-                            (self.settings.scroll.saturating_add((-lines) as usize)).min(12);
+                            (self.settings.scroll.saturating_add((-lines) as usize)).min(16);
                         self.request_redraw();
                     }
+                    return;
+                }
+                if self.docker.open {
+                    let lines = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => y as isize,
+                        MouseScrollDelta::PixelDelta(p) => (p.y / 24.0).round() as isize,
+                    };
+                    let (px, py) = self.cursor_pos;
+                    let over_logs = self
+                        .hit_zones
+                        .docker_log_area
+                        .map(|r| r.contains(px, py))
+                        .unwrap_or(false);
+                    if over_logs {
+                        if lines > 0 {
+                            self.docker.log_scroll =
+                                self.docker.log_scroll.saturating_add(lines as usize);
+                        } else if lines < 0 {
+                            self.docker.log_scroll =
+                                self.docker.log_scroll.saturating_sub((-lines) as usize);
+                        }
+                    } else {
+                        let max_scroll = self.docker.len().saturating_sub(1);
+                        if lines > 0 {
+                            self.docker.scroll =
+                                self.docker.scroll.saturating_sub(lines as usize);
+                        } else if lines < 0 {
+                            self.docker.scroll =
+                                (self.docker.scroll.saturating_add((-lines) as usize))
+                                    .min(max_scroll);
+                        }
+                    }
+                    self.request_redraw();
                     return;
                 }
                 if self.commands.open {

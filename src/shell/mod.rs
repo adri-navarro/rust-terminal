@@ -216,9 +216,8 @@ fn read_line(state: &mut ShellState, completer: &mut Completer, in_gui: bool) ->
 
     loop {
         let n = match stdin.read(&mut byte_buf) {
-            Ok(0) => return ReadResult::Eof,
+            Ok(0) | Err(_) => return ReadResult::Eof,
             Ok(n) => n,
-            Err(_) => continue,
         };
         if n == 0 {
             continue;

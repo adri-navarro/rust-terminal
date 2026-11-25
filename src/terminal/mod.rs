@@ -1,7 +1,7 @@
 pub mod grid;
 
 use crate::terminal::grid::TerminalGrid;
-use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::env;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -15,9 +15,18 @@ pub struct TerminalTab {
     pub grid: Arc<Mutex<TerminalGrid>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     master: Box<dyn MasterPty + Send>,
+    child_killer: Box<dyn ChildKiller + Send + Sync>,
     pub exited: Arc<AtomicBool>,
     pub dirty: Arc<AtomicBool>,
     pub selection: Option<((usize, usize), (usize, usize))>,
+}
+
+impl Drop for TerminalTab {
+    fn drop(&mut self) {
+        if !self.is_exited() {
+            let _ = self.child_killer.kill();
+        }
+    }
 }
 
 impl TerminalTab {
@@ -79,6 +88,7 @@ impl TerminalTab {
             .slave
             .spawn_command(cmd)
             .map_err(|e| format!("failed to spawn shell: {e}"))?;
+        let child_killer = child.clone_killer();
         drop(pair.slave);
 
         let mut reader = pair
@@ -146,6 +156,7 @@ impl TerminalTab {
             grid,
             writer,
             master: pair.master,
+            child_killer,
             exited,
             dirty,
             selection: None,

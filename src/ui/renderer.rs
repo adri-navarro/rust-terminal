@@ -8,10 +8,11 @@ use crate::terminal::grid::{
     FLAG_BOLD, FLAG_DIM, FLAG_INVERSE, FLAG_ITALIC, FLAG_STRIKE, FLAG_UNDERLINE, PopupState,
     TerminalGrid,
 };
-use crate::ui::font::{FontEngine, FontStyle};
+use crate::ui::font::{FontEngine, FontPreset, FontStyle};
 use crate::usage::{
     TimeRange, UsageReport, WindowQuota, format_cost, format_duration_short, format_tokens,
 };
+use crate::ui::docker_view::{DockerViewState, render_docker_view};
 use std::path::Path;
 
 pub const TAB_BAR_H: usize = 44;
@@ -93,14 +94,25 @@ pub struct TabBarHitZones {
     pub settings_btn: Option<Rect>,
     pub settings_reset_all_btn: Option<Rect>,
     pub settings_font_btns: Vec<(SettingsFontTarget, Rect, Rect, Rect)>, // (target, row, minus, plus)
+    pub settings_font_family_btns: Vec<(String, Rect)>,
     pub settings_theme_btns: Vec<(&'static str, Rect)>,
     pub settings_shortcut_btns: Vec<(SettingsShortcutTarget, Rect, Rect, Rect)>, // (target, row, change, reset)
+    pub docker_btn: Option<Rect>,
+    pub docker_add_btn: Option<Rect>,
+    pub docker_down_all_btn: Option<Rect>,
+    pub docker_rows: Vec<DockerRowHitZone>,
+    pub docker_form_field: Option<Rect>,
+    pub docker_form_submit_btn: Option<Rect>,
+    pub docker_form_cancel_btn: Option<Rect>,
+    pub docker_log_area: Option<Rect>,
+    pub docker_page_rows: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsFontTarget {
     Terminal,
     Commands,
+    Docker,
     Monitor,
     Usage,
 }
@@ -108,6 +120,7 @@ pub enum SettingsFontTarget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsShortcutTarget {
     Commands,
+    Docker,
     Monitor,
     Usage,
 }
@@ -117,6 +130,7 @@ pub struct SettingsViewState<'a> {
     pub recording_shortcut: Option<SettingsShortcutTarget>,
     pub error: Option<&'a str>,
     pub scroll: usize,
+    pub font_presets: &'a [FontPreset],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -125,6 +139,17 @@ pub struct CommandRowHitZone {
     pub id: u64,
     pub row_rect: Rect,
     pub toggle_btn: Rect,
+    pub edit_btn: Rect,
+    pub delete_btn: Rect,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DockerRowHitZone {
+    pub index: usize,
+    pub id: u64,
+    pub row_rect: Rect,
+    pub up_btn: Rect,
+    pub down_btn: Rect,
     pub edit_btn: Rect,
     pub delete_btn: Rect,
 }
@@ -154,8 +179,18 @@ impl TabBarHitZones {
             settings_btn: None,
             settings_reset_all_btn: None,
             settings_font_btns: Vec::new(),
+            settings_font_family_btns: Vec::new(),
             settings_theme_btns: Vec::new(),
             settings_shortcut_btns: Vec::new(),
+            docker_btn: None,
+            docker_add_btn: None,
+            docker_down_all_btn: None,
+            docker_rows: Vec::new(),
+            docker_form_field: None,
+            docker_form_submit_btn: None,
+            docker_form_cancel_btn: None,
+            docker_log_area: None,
+            docker_page_rows: 8,
         }
     }
 }
@@ -476,7 +511,9 @@ pub fn render_frame(
     monitor_view: Option<&MonitorViewState<'_>>,
     commands_view: Option<&CommandsViewState<'_>>,
     settings_view: Option<&SettingsViewState<'_>>,
+    docker_view: Option<&DockerViewState<'_>>,
     active_commands_count: usize,
+    docker_running: Option<usize>,
     toast: Option<&str>,
 ) -> TabBarHitZones {
     let mut canvas = Canvas::new(buf, width, height);
@@ -494,7 +531,9 @@ pub fn render_frame(
             monitor_view.is_some(),
             commands_view.is_some(),
             settings_view.is_some(),
+            docker_view.is_some(),
             active_commands_count,
+            docker_running,
         )
     } else {
         let strip = top_reserved(cfg) as i32;
@@ -506,6 +545,8 @@ pub fn render_frame(
 
     if let Some(sv) = settings_view {
         render_settings_view(&mut canvas, width, height, cfg, theme, font, sv, &mut hit_zones);
+    } else if let Some(dv) = docker_view {
+        render_docker_view(&mut canvas, width, height, cfg, theme, font, dv, &mut hit_zones);
     } else if let Some(cv) = commands_view {
         render_commands_view(&mut canvas, width, height, cfg, theme, font, cv, &mut hit_zones);
     } else if let Some(mv) = monitor_view {
@@ -575,7 +616,9 @@ fn render_tab_bar(
     monitor_active: bool,
     commands_active: bool,
     settings_active: bool,
+    docker_active: bool,
     active_commands_count: usize,
+    docker_running: Option<usize>,
 ) -> TabBarHitZones {
     let mut zones = TabBarHitZones::empty();
     let h = top_reserved_shown() as i32;
@@ -768,14 +811,50 @@ fn render_tab_bar(
     );
     zones.monitor_btn = Some(mon_rect);
 
-    // Next to Monitor tab: Commands Runner tab (Ctrl+P / F5)
+    // Next to Monitor tab: Docker tab (Ctrl+D / F7)
+    let dock_label = match docker_running {
+        Some(n) if n > 0 => format!("Docker ({n})"),
+        _ => "Docker".to_string(),
+    };
+    let dock_w = font.measure_text(&dock_label, ui_size) + 32;
+    let dock_x = mon_x - 6 - dock_w;
+    let dock_rect = Rect {
+        x: dock_x,
+        y: if docker_active { 5 + dy } else { 6 + dy },
+        w: dock_w,
+        h: if docker_active { 34 } else { 32 },
+    };
+    let dock_color = theme.info;
+    if docker_active {
+        canvas.fill_rounded_rect(dock_rect.x, dock_rect.y, dock_rect.w, dock_rect.h, 7, theme.bg, 255);
+        canvas.stroke_rounded_rect(dock_rect.x, dock_rect.y, dock_rect.w, dock_rect.h, 7, theme.border, 190);
+        canvas.fill_rounded_rect(dock_rect.x + 8, dock_rect.y + dock_rect.h - 2, dock_rect.w - 16, 2, 1, dock_color, 255);
+    } else {
+        canvas.fill_rounded_rect(dock_rect.x, dock_rect.y, dock_rect.w, dock_rect.h, 6, theme.surface_alt, 255);
+    }
+    let has_running = docker_running.is_some_and(|n| n > 0);
+    let dock_dot = if has_running { theme.success } else if docker_active { dock_color } else { theme.fg_muted };
+    canvas.fill_rounded_rect(dock_rect.x + 10, dock_rect.y + (dock_rect.h / 2) - 3, 6, 6, 3, dock_dot, 255);
+    canvas.draw_text_clipped(
+        font,
+        &dock_label,
+        FontStyle::Bold,
+        ui_size,
+        dock_rect.x + 22,
+        baseline,
+        dock_rect.x + dock_rect.w - 6,
+        if docker_active { theme.fg } else if has_running { dock_color } else { theme.fg_muted },
+    );
+    zones.docker_btn = Some(dock_rect);
+
+    // Next to Docker tab: Commands Runner tab (Ctrl+P / F5)
     let cmd_label = if active_commands_count > 0 {
         format!("Commands ({active_commands_count})")
     } else {
         "Commands".to_string()
     };
     let cmd_w = font.measure_text(&cmd_label, ui_size) + 32;
-    let cmd_x = mon_x - 6 - cmd_w;
+    let cmd_x = dock_x - 6 - cmd_w;
     let cmd_rect = if commands_active {
         Rect {
             x: cmd_x,
@@ -859,7 +938,7 @@ fn render_tab_bar(
         }
         let w = tab_w.min(max_tabs_right - x);
         let is_active =
-            !usage_active && !monitor_active && !commands_active && !settings_active && idx == active_tab;
+            !usage_active && !monitor_active && !commands_active && !settings_active && !docker_active && idx == active_tab;
         let rect = Rect {
             x,
             y: 5 + dy,
@@ -3619,18 +3698,25 @@ fn render_settings_view(
             1usize,
         ),
         (
+            SettingsFontTarget::Docker,
+            "Docker",
+            "Containers, compose projects & output",
+            cfg.docker_font_size,
+            2usize,
+        ),
+        (
             SettingsFontTarget::Monitor,
             "Monitor",
             "CPU, RAM, disks & process table",
             cfg.monitor_font_size,
-            2usize,
+            3usize,
         ),
         (
             SettingsFontTarget::Usage,
             "Usage",
             "Agent & model token usage dashboard",
             cfg.usage_font_size,
-            3usize,
+            4usize,
         ),
     ];
 
@@ -3784,9 +3870,143 @@ fn render_settings_view(
 
     cur_y += font_card_h + 14;
 
-    // --- CARD 2: THEME ---
+    // --- CARD 2: FONT FAMILY ---
+    let font_fam_card_h = 104i32;
+    let font_fam_sel = sv.selected == 5;
+    if cur_y + font_fam_card_h > body_top && cur_y < content_bottom {
+        canvas.fill_rounded_rect(content_x, cur_y, content_w, font_fam_card_h, 10, theme.surface, 255);
+        canvas.stroke_rounded_rect(
+            content_x,
+            cur_y,
+            content_w,
+            font_fam_card_h,
+            10,
+            if font_fam_sel { theme.accent } else { theme.border },
+            if font_fam_sel { 240 } else { 210 },
+        );
+
+        canvas.draw_text_clipped(
+            font,
+            "FONT FAMILY",
+            FontStyle::Bold,
+            15.5,
+            content_x + 14,
+            cur_y + 25,
+            content_x + 220,
+            if font_fam_sel { theme.accent } else { theme.fg_muted },
+        );
+        let ffhint = "Click a font or press ← / →";
+        let ffhw = font.measure_text(ffhint, 14.5);
+        if content_w > ffhw + 220 {
+            canvas.draw_text_clipped(
+                font,
+                ffhint,
+                FontStyle::Regular,
+                14.5,
+                content_x + content_w - ffhw - 14,
+                cur_y + 25,
+                content_x + content_w - 10,
+                theme.fg_muted,
+            );
+        }
+        canvas.fill_rect(content_x + 10, cur_y + 36, content_w - 20, 1, theme.border);
+
+        let pill_gap = 10i32;
+        let inner_w = content_w - 28;
+        let pill_h = 46i32;
+        let pill_y = cur_y + 46;
+
+        if sv.font_presets.is_empty() {
+            let fname = font
+                .active_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("System Monospace")
+                .to_string();
+            canvas.draw_text_clipped(
+                font,
+                &fname,
+                FontStyle::Regular,
+                15.0,
+                content_x + 14,
+                pill_y + 28,
+                content_x + content_w - 14,
+                theme.fg_muted,
+            );
+        } else {
+            let count = sv.font_presets.len() as i32;
+            let pill_w = ((inner_w - pill_gap * (count - 1)) / count).max(110);
+            for (i, preset) in sv.font_presets.iter().enumerate() {
+                let px = content_x + 14 + (i as i32) * (pill_w + pill_gap);
+                if px + 40 > content_x + content_w - 14 {
+                    break;
+                }
+                let rect = Rect {
+                    x: px,
+                    y: pill_y,
+                    w: pill_w.min(content_x + content_w - 14 - px),
+                    h: pill_h,
+                };
+                let active = preset.regular == font.active_path;
+
+                canvas.fill_rounded_rect(
+                    rect.x,
+                    rect.y,
+                    rect.w,
+                    rect.h,
+                    8,
+                    if active { theme.accent_soft } else { theme.bg },
+                    255,
+                );
+                canvas.stroke_rounded_rect(
+                    rect.x,
+                    rect.y,
+                    rect.w,
+                    rect.h,
+                    8,
+                    if active { theme.accent } else { theme.border },
+                    if active { 255 } else { 180 },
+                );
+
+                // Status dot + "Aa" badge
+                let dot_col = if active { theme.accent } else { theme.fg_muted };
+                canvas.fill_rounded_rect(rect.x + 10, rect.y + 11, 7, 7, 3, dot_col, 255);
+                canvas.draw_text_clipped(
+                    font,
+                    "Aa",
+                    FontStyle::Bold,
+                    12.5,
+                    rect.x + 22,
+                    rect.y + 19,
+                    rect.x + rect.w - 8,
+                    if active { theme.accent } else { theme.fg_muted },
+                );
+
+                canvas.draw_text_clipped(
+                    font,
+                    &preset.label,
+                    if active { FontStyle::Bold } else { FontStyle::Regular },
+                    14.5,
+                    rect.x + 10,
+                    rect.y + 38,
+                    rect.x + rect.w - 8,
+                    if active { theme.accent } else { theme.fg },
+                );
+
+                if rect.y >= body_top && rect.y + rect.h <= content_bottom + 20 {
+                    hit_zones
+                        .settings_font_family_btns
+                        .push((preset.regular.to_string_lossy().into_owned(), rect));
+                }
+            }
+        }
+    }
+
+    cur_y += font_fam_card_h + 14;
+
+    // --- CARD 3: THEME ---
     let theme_card_h = 104i32;
-    let theme_sel = sv.selected == 4;
+    let theme_sel = sv.selected == 6;
     if cur_y + theme_card_h > body_top && cur_y < content_bottom {
         canvas.fill_rounded_rect(content_x, cur_y, content_w, theme_card_h, 10, theme.surface, 255);
         canvas.stroke_rounded_rect(
@@ -3890,25 +4110,31 @@ fn render_settings_view(
 
     cur_y += theme_card_h + 14;
 
-    // --- CARD 3: TAB SHORTCUTS ---
+    // --- CARD 4: TAB SHORTCUTS ---
     let shortcut_rows = [
         (
             SettingsShortcutTarget::Commands,
             "Commands Tab",
             cfg.commands_shortcut().display(),
-            5usize,
+            7usize,
+        ),
+        (
+            SettingsShortcutTarget::Docker,
+            "Docker Tab",
+            cfg.docker_shortcut().display(),
+            8usize,
         ),
         (
             SettingsShortcutTarget::Monitor,
             "Monitor Tab",
             cfg.monitor_shortcut().display(),
-            6usize,
+            9usize,
         ),
         (
             SettingsShortcutTarget::Usage,
             "Usage Tab",
             cfg.usage_shortcut().display(),
-            7usize,
+            10usize,
         ),
     ];
 

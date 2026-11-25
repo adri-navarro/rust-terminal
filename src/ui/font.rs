@@ -27,6 +27,15 @@ pub struct CachedGlyph {
     pub bitmap: Vec<u8>,
 }
 
+#[derive(Debug, Clone)]
+pub struct FontPreset {
+    pub label: String,
+    pub regular: PathBuf,
+    pub bold: Option<PathBuf>,
+    pub italic: Option<PathBuf>,
+    pub bold_italic: Option<PathBuf>,
+}
+
 pub struct FontEngine {
     regular: FontVec,
     bold: Option<FontVec>,
@@ -41,6 +50,7 @@ pub struct FontEngine {
     italic_loaded: bool,
     bold_italic_loaded: bool,
 
+    pub active_path: PathBuf,
     pub size: f32,
     pub cell_w: usize,
     pub cell_h: usize,
@@ -68,6 +78,7 @@ impl FontEngine {
             bold_loaded: false,
             italic_loaded: false,
             bold_italic_loaded: false,
+            active_path: reg_path,
             size,
             cell_w: 9,
             cell_h: 18,
@@ -212,61 +223,179 @@ fn rasterize_ab_glyph(font: &FontVec, ch: char, px_size: f32) -> CachedGlyph {
     }
 }
 
-fn discover_font_paths(
-    custom_path: Option<&str>,
-) -> Result<(PathBuf, Option<PathBuf>, Option<PathBuf>, Option<PathBuf>), String> {
-    if let Some(p) = custom_path {
-        let pb = PathBuf::from(p);
-        if pb.is_file() {
-            return Ok((pb, None, None, None));
-        }
-    }
+pub fn available_font_presets() -> Vec<FontPreset> {
+    let mut presets = Vec::new();
+    let mut seen_labels: Vec<&str> = Vec::new();
 
     #[cfg(target_os = "macos")]
     {
-        for set in macos_font_candidates() {
-            if let Some(found) = first_existing(set) {
-                return Ok(found);
+        for (label, [reg, bold, ital, bi]) in macos_font_candidates() {
+            if seen_labels.contains(&label) {
+                continue;
+            }
+            if reg.is_file() {
+                let opt = |p: PathBuf| p.is_file().then_some(p);
+                seen_labels.push(label);
+                presets.push(FontPreset {
+                    label: label.to_string(),
+                    regular: reg,
+                    bold: opt(bold),
+                    italic: opt(ital),
+                    bold_italic: opt(bi),
+                });
             }
         }
     }
 
-    let candidates: &[(&str, &str, &str, &str)] = &[
+    let candidates: &[(&str, &str, &str, &str, &str)] = &[
         (
-            "/usr/share/fonts/TTF/JetBrainsMonoNerdFontMono-Regular.ttf",
-            "/usr/share/fonts/TTF/JetBrainsMonoNerdFontMono-Bold.ttf",
-            "/usr/share/fonts/TTF/JetBrainsMonoNerdFontMono-Italic.ttf",
-            "/usr/share/fonts/TTF/JetBrainsMonoNerdFontMono-BoldItalic.ttf",
-        ),
-        (
-            "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf",
-            "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Bold.ttf",
-            "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Italic.ttf",
-            "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-BoldItalic.ttf",
-        ),
-        (
+            "Adwaita Mono",
             "/usr/share/fonts/Adwaita/AdwaitaMono-Regular.ttf",
             "/usr/share/fonts/Adwaita/AdwaitaMono-Bold.ttf",
             "/usr/share/fonts/Adwaita/AdwaitaMono-Italic.ttf",
             "/usr/share/fonts/Adwaita/AdwaitaMono-BoldItalic.ttf",
         ),
         (
+            "JetBrains Mono Medium",
+            "/usr/share/fonts/TTF/JetBrainsMonoNerdFontMono-Medium.ttf",
+            "/usr/share/fonts/TTF/JetBrainsMonoNerdFontMono-Bold.ttf",
+            "/usr/share/fonts/TTF/JetBrainsMonoNerdFontMono-MediumItalic.ttf",
+            "/usr/share/fonts/TTF/JetBrainsMonoNerdFontMono-BoldItalic.ttf",
+        ),
+        (
+            "JetBrains Mono Medium",
+            "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Medium.ttf",
+            "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Bold.ttf",
+            "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-MediumItalic.ttf",
+            "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-BoldItalic.ttf",
+        ),
+        (
+            "DejaVu Sans Mono",
             "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
             "/usr/share/fonts/TTF/DejaVuSansMono-Bold.ttf",
             "/usr/share/fonts/TTF/DejaVuSansMono-Oblique.ttf",
             "/usr/share/fonts/TTF/DejaVuSansMono-BoldOblique.ttf",
         ),
+        (
+            "DejaVu Sans Mono",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Oblique.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-BoldOblique.ttf",
+        ),
+        (
+            "JetBrains Mono",
+            "/usr/share/fonts/TTF/JetBrainsMonoNerdFontMono-Regular.ttf",
+            "/usr/share/fonts/TTF/JetBrainsMonoNerdFontMono-Bold.ttf",
+            "/usr/share/fonts/TTF/JetBrainsMonoNerdFontMono-Italic.ttf",
+            "/usr/share/fonts/TTF/JetBrainsMonoNerdFontMono-BoldItalic.ttf",
+        ),
+        (
+            "JetBrains Mono",
+            "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf",
+            "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Bold.ttf",
+            "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Italic.ttf",
+            "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-BoldItalic.ttf",
+        ),
+        (
+            "IBM Plex Mono",
+            "/usr/share/fonts/TTF/IBMPlexMono-Regular.ttf",
+            "/usr/share/fonts/TTF/IBMPlexMono-Bold.ttf",
+            "/usr/share/fonts/TTF/IBMPlexMono-Italic.ttf",
+            "/usr/share/fonts/TTF/IBMPlexMono-BoldItalic.ttf",
+        ),
+        (
+            "IBM Plex Mono",
+            "/usr/share/fonts/truetype/ibm-plex/IBMPlexMono-Regular.ttf",
+            "/usr/share/fonts/truetype/ibm-plex/IBMPlexMono-Bold.ttf",
+            "/usr/share/fonts/truetype/ibm-plex/IBMPlexMono-Italic.ttf",
+            "/usr/share/fonts/truetype/ibm-plex/IBMPlexMono-BoldItalic.ttf",
+        ),
+        (
+            "Fira Code",
+            "/usr/share/fonts/TTF/FiraCodeNerdFontMono-Regular.ttf",
+            "/usr/share/fonts/TTF/FiraCodeNerdFontMono-Bold.ttf",
+            "",
+            "",
+        ),
+        (
+            "Hack",
+            "/usr/share/fonts/TTF/Hack-Regular.ttf",
+            "/usr/share/fonts/TTF/Hack-Bold.ttf",
+            "/usr/share/fonts/TTF/Hack-Italic.ttf",
+            "/usr/share/fonts/TTF/Hack-BoldItalic.ttf",
+        ),
+        (
+            "Liberation Mono",
+            "/usr/share/fonts/TTF/LiberationMono-Regular.ttf",
+            "/usr/share/fonts/TTF/LiberationMono-Bold.ttf",
+            "/usr/share/fonts/TTF/LiberationMono-Italic.ttf",
+            "/usr/share/fonts/TTF/LiberationMono-BoldItalic.ttf",
+        ),
+        (
+            "Ubuntu Mono",
+            "/usr/share/fonts/truetype/ubuntu/UbuntuMono-R.ttf",
+            "/usr/share/fonts/truetype/ubuntu/UbuntuMono-B.ttf",
+            "/usr/share/fonts/truetype/ubuntu/UbuntuMono-RI.ttf",
+            "/usr/share/fonts/truetype/ubuntu/UbuntuMono-BI.ttf",
+        ),
     ];
 
-    for &(reg, bold, ital, bi) in candidates {
+    for &(label, reg, bold, ital, bi) in candidates {
+        if seen_labels.contains(&label) {
+            continue;
+        }
         let reg_p = PathBuf::from(reg);
         if reg_p.is_file() {
             let opt = |s: &str| {
+                if s.is_empty() {
+                    return None;
+                }
                 let p = PathBuf::from(s);
                 p.is_file().then_some(p)
             };
-            return Ok((reg_p, opt(bold), opt(ital), opt(bi)));
+            seen_labels.push(label);
+            presets.push(FontPreset {
+                label: label.to_string(),
+                regular: reg_p,
+                bold: opt(bold),
+                italic: opt(ital),
+                bold_italic: opt(bi),
+            });
         }
+    }
+
+    presets
+}
+
+fn discover_font_paths(
+    custom_path: Option<&str>,
+) -> Result<(PathBuf, Option<PathBuf>, Option<PathBuf>, Option<PathBuf>), String> {
+    let presets = available_font_presets();
+
+    if let Some(p) = custom_path {
+        let trimmed = p.trim();
+        if !trimmed.is_empty() {
+            let pb = PathBuf::from(trimmed);
+            if let Some(preset) = presets
+                .iter()
+                .find(|pr| pr.regular == pb || pr.label.eq_ignore_ascii_case(trimmed))
+            {
+                return Ok((
+                    preset.regular.clone(),
+                    preset.bold.clone(),
+                    preset.italic.clone(),
+                    preset.bold_italic.clone(),
+                ));
+            }
+            if pb.is_file() {
+                return Ok((pb, None, None, None));
+            }
+        }
+    }
+
+    if let Some(first) = presets.into_iter().next() {
+        return Ok((first.regular, first.bold, first.italic, first.bold_italic));
     }
 
     if let Ok(out) = Command::new("fc-match")
@@ -288,22 +417,10 @@ fn discover_font_paths(
     ))
 }
 
-/// Returns the set when its regular file exists; style files are optional.
-#[cfg(target_os = "macos")]
-fn first_existing(
-    [reg, bold, ital, bi]: [PathBuf; 4],
-) -> Option<(PathBuf, Option<PathBuf>, Option<PathBuf>, Option<PathBuf>)> {
-    if !reg.is_file() {
-        return None;
-    }
-    let opt = |p: PathBuf| p.is_file().then_some(p);
-    Some((reg, opt(bold), opt(ital), opt(bi)))
-}
-
 /// macOS candidates in priority order. Menlo.ttc is skipped: it is a
 /// collection and the loader has no face-index support.
 #[cfg(target_os = "macos")]
-fn macos_font_candidates() -> Vec<[PathBuf; 4]> {
+fn macos_font_candidates() -> Vec<(&'static str, [PathBuf; 4])> {
     let mut sets = Vec::new();
 
     let mut dirs_to_try: Vec<PathBuf> = Vec::new();
@@ -313,23 +430,47 @@ fn macos_font_candidates() -> Vec<[PathBuf; 4]> {
     dirs_to_try.push(PathBuf::from("/Library/Fonts"));
 
     for dir in &dirs_to_try {
-        for stem in ["JetBrainsMonoNerdFontMono", "JetBrainsMonoNerdFont"] {
-            sets.push(
-                ["Regular", "Bold", "Italic", "BoldItalic"]
+        for (label, stem, reg_style, ital_style) in [
+            ("Adwaita Mono", "AdwaitaMono", "Regular", "Italic"),
+            (
+                "JetBrains Mono Medium",
+                "JetBrainsMonoNerdFontMono",
+                "Medium",
+                "MediumItalic",
+            ),
+            (
+                "JetBrains Mono",
+                "JetBrainsMonoNerdFontMono",
+                "Regular",
+                "Italic",
+            ),
+            (
+                "JetBrains Mono",
+                "JetBrainsMonoNerdFont",
+                "Regular",
+                "Italic",
+            ),
+        ] {
+            sets.push((
+                label,
+                [reg_style, "Bold", ital_style, "BoldItalic"]
                     .map(|style| dir.join(format!("{stem}-{style}.ttf"))),
-            );
+            ));
         }
     }
 
     let sys = PathBuf::from("/System/Library/Fonts");
-    for name in ["Monaco.ttf", "SFNSMono.ttf"] {
+    for (label, name) in [("SF Mono", "SFNSMono.ttf"), ("Monaco", "Monaco.ttf")] {
         // Single-style fonts: bold/italic fall back to regular at render time.
-        sets.push([
-            sys.join(name),
-            PathBuf::new(),
-            PathBuf::new(),
-            PathBuf::new(),
-        ]);
+        sets.push((
+            label,
+            [
+                sys.join(name),
+                PathBuf::new(),
+                PathBuf::new(),
+                PathBuf::new(),
+            ],
+        ));
     }
     sets
 }

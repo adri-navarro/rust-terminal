@@ -635,3 +635,118 @@ fn test_clamp_ghost_multibyte_char_boundary() {
     assert_eq!(clamp_ghost("ñé日本", 3), "ñé日");
     assert_eq!(clamp_ghost("ñé日本", 4), "ñé日本");
 }
+
+#[test]
+fn test_docker_manager_persistence_and_events() {
+    use crate::docker::{ComposeAction, ComposeStatus, DockerEvent, DockerManager};
+    use std::fs;
+
+    let path = std::env::temp_dir().join(format!(
+        "itsadri_docker_mgr_test_{}.toml",
+        std::process::id()
+    ));
+    let _ = fs::remove_file(&path);
+
+    let mut mgr = DockerManager::with_path(path.clone());
+    assert!(mgr.entries.is_empty());
+
+    let (id1, added1) = mgr.add("/srv/myapp/".to_string());
+    assert!(added1);
+    // Duplicate normalized path should not create a second entry
+    let (id_dup, added_dup) = mgr.add("/srv/myapp".to_string());
+    assert!(!added_dup);
+    assert_eq!(id_dup, id1);
+
+    let (id2, added2) = mgr.add("/srv/other".to_string());
+    assert!(added2);
+    assert_eq!(mgr.entries.len(), 2);
+    assert_eq!(mgr.find_by_id(id1).unwrap().display_name(), "myapp");
+
+    // Reload from disk
+    let mut mgr2 = DockerManager::with_path(path.clone());
+    assert_eq!(mgr2.entries.len(), 2);
+    assert_eq!(mgr2.entries[0].directory, "/srv/myapp");
+
+    // Apply events and check status transitions
+    mgr2.find_by_id_mut(id1).unwrap().jobs_running = 1;
+    mgr2.apply_event(DockerEvent::Output {
+        id: id1,
+        line: "Container web Started".to_string(),
+    });
+    let toast = mgr2.apply_event(DockerEvent::Done {
+        id: id1,
+        action: ComposeAction::Up,
+        label: "compose up -d (myapp)".to_string(),
+        code: Some(0),
+    });
+    assert!(toast.is_some());
+    assert_eq!(mgr2.find_by_id(id1).unwrap().status, ComposeStatus::Up);
+    assert_eq!(mgr2.up_count(), 1);
+    assert_eq!(mgr2.find_by_id(id1).unwrap().logs.len(), 2);
+
+    mgr2.apply_event(DockerEvent::Done {
+        id: id1,
+        action: ComposeAction::Down,
+        label: "compose down (myapp)".to_string(),
+        code: Some(0),
+    });
+    assert_eq!(mgr2.find_by_id(id1).unwrap().status, ComposeStatus::Down);
+    assert_eq!(mgr2.up_count(), 0);
+
+    // Update & remove
+    assert!(mgr2.update(id2, "/srv/renamed".to_string()));
+    assert_eq!(mgr2.find_by_id(id2).unwrap().display_name(), "renamed");
+    assert!(mgr2.remove(id1));
+    assert_eq!(mgr2.entries.len(), 1);
+
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn test_docker_find_compose_file_and_complete_dir() {
+    use crate::docker::{complete_directory, find_compose_file};
+    use std::fs;
+
+    let base = std::env::temp_dir().join(format!("itsadri_docker_test_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    let proj = base.join("alpha-service");
+    fs::create_dir_all(&proj).unwrap();
+    assert_eq!(find_compose_file(&proj), None);
+
+    fs::write(proj.join("docker-compose.yml"), "services: {}\n").unwrap();
+    assert_eq!(find_compose_file(&proj).as_deref(), Some("docker-compose.yml"));
+
+    fs::write(proj.join("compose.yaml"), "services: {}\n").unwrap();
+    // compose.yaml has higher precedence
+    assert_eq!(find_compose_file(&proj).as_deref(), Some("compose.yaml"));
+
+    let partial = format!("{}/alp", base.display());
+    let expected = format!("{}/alpha-service/", base.display());
+    assert_eq!(complete_directory(&partial).as_deref(), Some(expected.as_str()));
+
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn test_docker_config_defaults_and_roundtrip() {
+    let def = Config::default();
+    assert_eq!(def.docker_font_size, 18.0);
+    assert_eq!(def.docker_shortcut().format(), "Ctrl+D");
+
+    let legacy: Config = toml::from_str("theme = \"tokyo-night\"\n").unwrap();
+    assert_eq!(legacy.docker_font_size, 18.0);
+    assert_eq!(legacy.docker_shortcut().format(), "Ctrl+D");
+}
+
+#[test]
+fn test_font_presets_and_default_discovery() {
+    use crate::ui::font::{FontEngine, available_font_presets};
+
+    let presets = available_font_presets();
+    if std::path::Path::new("/usr/share/fonts/Adwaita/AdwaitaMono-Regular.ttf").is_file() {
+        assert!(!presets.is_empty());
+        assert_eq!(presets[0].label, "Adwaita Mono");
+        let engine = FontEngine::new(None, 18.0, 1.25).expect("default font should load");
+        assert_eq!(engine.active_path, presets[0].regular);
+    }
+}

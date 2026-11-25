@@ -562,6 +562,8 @@ fn fetch_agy_usage(home: &Path, now: u64, allow_network: bool) -> Option<LiveAge
 
     let text = if let Some(t) = cached_text {
         t
+    } else if allow_network && agy_fetch_backoff_active(CACHE_TTL_SECS) {
+        fs::read_to_string(&cache_path).ok()?
     } else if allow_network {
         let agy_bin = find_agy_binary(home)?;
         let output = Command::new(agy_bin)
@@ -583,6 +585,19 @@ fn fetch_agy_usage(home: &Path, now: u64, allow_network: bool) -> Option<LiveAge
     };
 
     parse_agy_usage_output(&text, now)
+}
+
+static LAST_AGY_FETCH_ATTEMPT: Mutex<Option<Instant>> = Mutex::new(None);
+
+fn agy_fetch_backoff_active(ttl_secs: u64) -> bool {
+    let mut last = LAST_AGY_FETCH_ATTEMPT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if last.is_some_and(|t| t.elapsed().as_secs() < ttl_secs) {
+        return true;
+    }
+    *last = Some(Instant::now());
+    false
 }
 
 fn find_agy_binary(home: &Path) -> Option<PathBuf> {
@@ -1689,6 +1704,7 @@ impl JsonVal {
 
 fn parse_json(input: &str) -> Option<JsonVal> {
     let mut p = JsonParser {
+        input,
         bytes: input.as_bytes(),
         pos: 0,
     };
@@ -1696,6 +1712,7 @@ fn parse_json(input: &str) -> Option<JsonVal> {
 }
 
 struct JsonParser<'a> {
+    input: &'a str,
     bytes: &'a [u8],
     pos: usize,
 }
@@ -1800,7 +1817,7 @@ impl<'a> JsonParser<'a> {
         while self.pos < self.bytes.len() {
             let b = self.bytes[self.pos];
             if b == b'"' {
-                let s = std::str::from_utf8(&self.bytes[start..self.pos]).ok()?.to_string();
+                let s = self.input[start..self.pos].to_string();
                 self.pos += 1;
                 return Some(s);
             }
@@ -1809,16 +1826,17 @@ impl<'a> JsonParser<'a> {
             }
             self.pos += 1;
         }
-        // Slow path: handle escapes
-        let mut out = std::str::from_utf8(&self.bytes[start..self.pos])
-            .ok()?
-            .to_string();
+        // Slow path: copy unescaped spans in O(n) chunks (input is already valid UTF-8)
+        let mut out = String::with_capacity(self.pos - start + 32);
+        out.push_str(&self.input[start..self.pos]);
         while self.pos < self.bytes.len() {
-            let b = self.bytes[self.pos];
-            self.pos += 1;
-            match b {
-                b'"' => return Some(out),
+            match self.bytes[self.pos] {
+                b'"' => {
+                    self.pos += 1;
+                    return Some(out);
+                }
                 b'\\' => {
+                    self.pos += 1;
                     let esc = *self.bytes.get(self.pos)?;
                     self.pos += 1;
                     match esc {
@@ -1831,25 +1849,31 @@ impl<'a> JsonParser<'a> {
                         b'r' => out.push('\r'),
                         b't' => out.push('\t'),
                         b'u' => {
-                            if self.pos + 4 > self.bytes.len() {
-                                return None;
-                            }
-                            let hex = std::str::from_utf8(&self.bytes[self.pos..self.pos + 4]).ok()?;
+                            let hex = self.input.get(self.pos..self.pos + 4)?;
                             let code = u32::from_str_radix(hex, 16).ok()?;
                             self.pos += 4;
                             if let Some(ch) = char::from_u32(code) {
                                 out.push(ch);
                             }
                         }
-                        _ => out.push(esc as char),
+                        other if other < 0x80 => out.push(other as char),
+                        _ => {
+                            let ch = self.input.get(self.pos - 1..)?.chars().next()?;
+                            out.push(ch);
+                            self.pos += ch.len_utf8() - 1;
+                        }
                     }
                 }
                 _ => {
-                    // Decode UTF-8 char starting at pos-1
-                    let rest = std::str::from_utf8(&self.bytes[self.pos - 1..]).ok()?;
-                    let ch = rest.chars().next()?;
-                    out.push(ch);
-                    self.pos += ch.len_utf8() - 1;
+                    let chunk_start = self.pos;
+                    while self.pos < self.bytes.len() {
+                        let c = self.bytes[self.pos];
+                        if c == b'"' || c == b'\\' {
+                            break;
+                        }
+                        self.pos += 1;
+                    }
+                    out.push_str(&self.input[chunk_start..self.pos]);
                 }
             }
         }
@@ -1867,8 +1891,7 @@ impl<'a> JsonParser<'a> {
                 _ => break,
             }
         }
-        let s = std::str::from_utf8(&self.bytes[start..self.pos]).ok()?;
-        s.parse::<f64>().ok()
+        self.input[start..self.pos].parse::<f64>().ok()
     }
 }
 
@@ -1886,5 +1909,23 @@ mod keychain_tests {
     fn keychain_output_rejects_non_json() {
         assert!(keychain_output_to_json("7b2263").is_none());
         assert!(keychain_output_to_json("").is_none());
+    }
+
+    #[test]
+    fn parse_json_large_escaped_string_is_linear() {
+        let chunk = "hello \\\"world\\\" — café 🚀 \\n ";
+        let repeated = chunk.repeat(10_000); // ~300 KB with escapes and multi-byte UTF-8
+        let doc = format!("{{\"payload\":\"{repeated}\",\"tokens\":42}}");
+        let t0 = std::time::Instant::now();
+        let val = super::parse_json(&doc).expect("valid json");
+        let elapsed = t0.elapsed();
+        assert_eq!(val.get_u64("tokens"), 42);
+        let payload = val.get_str("payload").expect("payload string");
+        assert!(payload.starts_with("hello \"world\" — café 🚀 \n "));
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "parse_json took {:?} on 300KB escaped string (quadratic regression?)",
+            elapsed
+        );
     }
 }

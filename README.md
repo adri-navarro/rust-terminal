@@ -71,6 +71,7 @@ Run only the built-in interactive shell inside your current terminal:
 | `Ctrl+U` / `F3` | Toggle top-right Agent & Model Usage tab |
 | `Ctrl+M` / `F4` | Toggle btop-style System Monitor tab (CPU, RAM, Disks, Processes) |
 | `Ctrl+P` / `F5` | Toggle Commands tab (launch, stop & edit commands in any directory) |
+| `Ctrl+D` / `F7` | Toggle Docker tab (compose directories up/down) |
 | `Ctrl+Shift+R` | Live-reload `~/.config/itsadri-terminal/config.toml` |
 | `Shift+PageUp/Down/End` | Scroll through scrollback buffer |
 

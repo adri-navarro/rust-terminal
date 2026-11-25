@@ -1,6 +1,7 @@
 mod commands;
 mod completer;
 mod config;
+mod docker;
 mod history;
 mod monitor;
 mod shell;
@@ -43,6 +44,7 @@ KEYBINDINGS:
     Ctrl+U / F3         Toggle Agent & Model Usage tab (customizable in Settings)
     Ctrl+M / F4         Toggle System Monitor tab (customizable in Settings)
     Ctrl+P / F5         Toggle Commands tab (customizable in Settings)
+    Ctrl+D / F7         Toggle Docker tab (compose directories up/down)
     Ctrl+, / F6         Toggle Settings tab (font sizes, theme, shortcuts)
     Ctrl+Shift+R        Reload ~/.config/itsadri-terminal/config.toml"
     );
@@ -57,6 +59,7 @@ KEYBINDINGS:
         .replace("Ctrl+U / F3         Toggle", "Cmd+U / F3          Toggle")
         .replace("Ctrl+M / F4         Toggle", "Cmd+M / F4          Toggle")
         .replace("Ctrl+P / F5         Toggle", "Cmd+P / F5          Toggle")
+        .replace("Ctrl+D / F7         Toggle", "Cmd+D / F7          Toggle")
         .replace("Ctrl+, / F6         Toggle", "Cmd+, / F6          Toggle")
         .replace("Ctrl+Shift+R        Reload", "Cmd+Shift+R         Reload");
     println!("{help}");
