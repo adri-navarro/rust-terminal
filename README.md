@@ -116,7 +116,7 @@ Run only the built-in interactive shell inside your current terminal:
 | `Ctrl+U` / `F3` | Toggle top-right Agent & Model Usage tab |
 | `Ctrl+M` / `F4` | Toggle btop-style System Monitor tab (CPU, RAM, Disks, Processes); type to filter processes, `Alt+C/M/P/N` sort, `Alt+R` refresh, `Del`/`Alt+K` terminate, `Alt+Shift+K` kill, `Esc` clears filter then closes |
 | `Ctrl+P` / `F5` | Toggle Commands tab (launch, stop & edit commands in any directory) |
-| `Ctrl+D` / `F7` | Toggle Docker tab (compose directories up/down) |
+| `Ctrl+D` / `F7` | Toggle Docker tab (compose directories up/down/rebuild, running containers with rebuild and stop) |
 | `Ctrl+,` / `F6` | Toggle Settings tab (font sizes, font presets, theme, shortcuts) |
 | `Ctrl+Shift+R` | Live-reload `~/.config/itsadri-terminal/config.toml` |
 | `Shift+PageUp/Down/End` | Scroll through scrollback buffer |

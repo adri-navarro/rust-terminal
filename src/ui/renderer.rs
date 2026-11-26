@@ -171,6 +171,10 @@ pub struct TabBarHitZones {
     pub docker_form_cancel_btn: Option<Rect>,
     pub docker_log_area: Option<Rect>,
     pub docker_page_rows: usize,
+    pub docker_container_rows: Vec<DockerContainerRowHitZone>,
+    pub docker_containers_area: Option<Rect>,
+    pub docker_dirs_area: Option<Rect>,
+    pub docker_container_page_rows: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,9 +219,19 @@ pub struct DockerRowHitZone {
     pub id: u64,
     pub row_rect: Rect,
     pub up_btn: Rect,
+    pub rebuild_btn: Rect,
     pub down_btn: Rect,
     pub edit_btn: Rect,
     pub delete_btn: Rect,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DockerContainerRowHitZone {
+    pub index: usize,
+    pub row_rect: Rect,
+    /// None on containers that were not started by compose.
+    pub rebuild_btn: Option<Rect>,
+    pub stop_btn: Rect,
 }
 
 impl TabBarHitZones {
@@ -260,6 +274,10 @@ impl TabBarHitZones {
             docker_form_cancel_btn: None,
             docker_log_area: None,
             docker_page_rows: 8,
+            docker_container_rows: Vec::new(),
+            docker_containers_area: None,
+            docker_dirs_area: None,
+            docker_container_page_rows: 8,
         }
     }
 }

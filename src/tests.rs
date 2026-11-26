@@ -922,3 +922,96 @@ fn test_csi_plain_sgr_underline_and_cursor_restore_still_work() {
     parser.advance(&mut grid, b"\x1b[2;3H\x1b[s\x1b[5;5H\x1b[uZ");
     assert_eq!(grid.cells[1][2].ch, 'Z');
 }
+
+#[test]
+fn test_docker_parse_ps_output() {
+    use crate::docker::parse_ps_output;
+
+    let out = "\
+bbb222\tweb\tnginx:latest\tUp 2 hours\t0.0.0.0:80->80/tcp\tshop\t/srv/shop\t/srv/shop/compose.yaml, /srv/shop/extra.yml
+aaa111\tdb\tpostgres:16\tUp 2 hours (healthy)\t5432/tcp\tshop\t/srv/shop\t/srv/shop/compose.yaml
+ccc333\tsolo\talpine\tUp 5 minutes\t\t\t\t
+ddd444\tshort\tbusybox\tUp 1 minute
+
+not a container line
+\tnoid\timg\tUp\t\t
+xyz\ttoo\tfew
+";
+    let list = parse_ps_output(out);
+    let names: Vec<&str> = list.iter().map(|c| c.name.as_str()).collect();
+    // Sorted by name; blank, malformed (<4 fields) and empty-id lines are skipped
+    assert_eq!(names, vec!["db", "short", "solo", "web"]);
+
+    let db = &list[0];
+    assert_eq!(db.id, "aaa111");
+    assert_eq!(db.image, "postgres:16");
+    assert_eq!(db.status, "Up 2 hours (healthy)");
+    assert_eq!(db.ports, "5432/tcp");
+    assert_eq!(db.project, "shop");
+    assert_eq!(db.working_dir, "/srv/shop");
+    assert_eq!(db.config_files, vec!["/srv/shop/compose.yaml"]);
+    assert!(db.can_rebuild());
+
+    // Multiple comma-separated config files are split and trimmed
+    let web = &list[3];
+    assert_eq!(web.config_files, vec!["/srv/shop/compose.yaml", "/srv/shop/extra.yml"]);
+
+    // Only four fields: trailing ports/project are empty
+    let short = &list[1];
+    assert_eq!(short.status, "Up 1 minute");
+    assert!(short.ports.is_empty() && short.project.is_empty());
+    assert!(short.working_dir.is_empty() && short.config_files.is_empty());
+    assert!(!short.can_rebuild());
+
+    // Empty ports and empty project
+    let solo = &list[2];
+    assert!(solo.ports.is_empty() && solo.project.is_empty());
+    assert_eq!(solo.image, "alpine");
+    assert!(solo.config_files.is_empty() && !solo.can_rebuild());
+}
+
+#[test]
+fn test_docker_rebuild_action_and_project_args() {
+    use crate::docker::{ComposeAction, project_rebuild_args};
+    assert_eq!(ComposeAction::Rebuild.label(), "compose rebuild");
+    assert_eq!(
+        ComposeAction::Rebuild.sub_args(),
+        &["up", "-d", "--build", "--force-recreate"]
+    );
+    let args = project_rebuild_args("shop", &["/a/compose.yaml".into(), "/a/x.yml".into()]);
+    let p = args.iter().position(|a| a == "-p").expect("-p present");
+    assert_eq!(
+        &args[p..],
+        [
+            "-p", "shop", "-f", "/a/compose.yaml", "-f", "/a/x.yml", "up", "-d", "--build",
+            "--force-recreate"
+        ]
+    );
+}
+
+#[test]
+fn test_docker_reselect_keeps_container_by_id() {
+    use crate::docker::{RunningContainer, reselect};
+    let c = |id: &str| RunningContainer {
+        id: id.into(),
+        name: id.into(),
+        image: String::new(),
+        status: String::new(),
+        ports: String::new(),
+        project: String::new(),
+        working_dir: String::new(),
+        config_files: Vec::new(),
+    };
+    let list = vec![c("a"), c("b"), c("c")];
+    // Previously selected "c" moved from index 0 to 2
+    assert_eq!(reselect(Some(("c", "c")), &list, 0), 2);
+    // Gone: clamp old index into the new list
+    assert_eq!(reselect(Some(("zzz", "zzz")), &list, 7), 2);
+    assert_eq!(reselect(None, &list, 1), 1);
+    assert_eq!(reselect(Some(("a", "a")), &[], 3), 0);
+    // Recreated container: new id, same name -> follow the name
+    let mut recreated = c("new-id");
+    recreated.name = "b".into();
+    let list = vec![c("a"), recreated, c("c")];
+    assert_eq!(reselect(Some(("old-id", "b")), &list, 0), 1);
+}

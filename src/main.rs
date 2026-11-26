@@ -45,7 +45,7 @@ KEYBINDINGS:
     Ctrl+M / F4         Toggle System Monitor tab (customizable in Settings)
                         In it: type to filter processes; Alt+C/M/P/N sort, Alt+R refresh, Del / Alt+K terminate, Alt+Shift+K kill
     Ctrl+P / F5         Toggle Commands tab (customizable in Settings)
-    Ctrl+D / F7         Toggle Docker tab (compose directories up/down)
+    Ctrl+D / F7         Toggle Docker tab (compose directories, running containers)
     Ctrl+, / F6         Toggle Settings tab (font sizes, theme, shortcuts)
     Ctrl+Shift+R        Reload ~/.config/itsadri-terminal/config.toml"
     );

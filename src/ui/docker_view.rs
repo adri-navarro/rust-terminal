@@ -1,13 +1,15 @@
 //! Full-screen Docker Compose tab: user-managed list of compose directories
-//! with Up / Down / Edit / Remove controls and streamed per-directory output.
+//! with Up / Down / Edit / Remove controls, the engine's running containers with
+//! Stop controls, and streamed per-directory output.
 
 use crate::commands::expand_directory;
 use crate::config::{Config, Rgb, Theme};
-use crate::docker::{ComposeDir, ComposeStatus};
+use crate::docker::{ComposeDir, ComposeStatus, RunningContainer};
 use crate::shell::shorten_path;
 use crate::ui::font::{FontEngine, FontStyle};
+use std::collections::{HashSet, VecDeque};
 use crate::ui::renderer::{
-    Canvas, DockerRowHitZone, Rect, STATUS_BAR_H, TabBarHitZones, top_reserved,
+    Canvas, DockerContainerRowHitZone, DockerRowHitZone, Rect, STATUS_BAR_H, TabBarHitZones, top_reserved,
 };
 
 pub struct DockerFormView<'a> {
@@ -19,6 +21,14 @@ pub struct DockerFormView<'a> {
     pub error: Option<&'a str>,
 }
 
+/// Which card keyboard input drives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DockerFocus {
+    #[default]
+    Dirs,
+    Containers,
+}
+
 pub struct DockerViewState<'a> {
     pub entries: &'a [ComposeDir],
     pub selected: usize,
@@ -26,6 +36,18 @@ pub struct DockerViewState<'a> {
     pub log_scroll: usize,
     pub form: Option<DockerFormView<'a>>,
     pub cursor_blink_on: bool,
+    /// None = engine never scanned yet.
+    pub containers: &'a Option<Result<Vec<RunningContainer>, String>>,
+    pub stopping: &'a HashSet<String>,
+    /// Compose project names with a rebuild in flight.
+    pub rebuilding: &'a HashSet<String>,
+    /// Output of rebuilds of projects that are not registered directories.
+    pub container_logs: &'a VecDeque<String>,
+    /// True while such an unregistered rebuild is running.
+    pub container_job_running: bool,
+    pub container_selected: usize,
+    pub container_scroll: usize,
+    pub focus: DockerFocus,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -316,22 +338,47 @@ pub fn render_docker_view(
         cur_y += form_h + 12;
     }
 
-    // ---------- Body: compose directories list (top) + selected output (bottom) ----------
+    // ---------- Body: compose directories (top), running containers (middle), output (bottom) ----------
     let avail = (content_bottom - cur_y).max(160);
-    let log_h = if dv.entries.is_empty() {
+    let gap = 12;
+    let list_hdr_h = sc(42).max(28);
+    let row_h = sc(68).max(46);
+    // Shown when directories exist or containers are listed, so toggling focus
+    // never resizes the cards.
+    let has_containers = matches!(dv.containers, Some(Ok(l)) if !l.is_empty());
+    let mut log_h = if dv.entries.is_empty() && !has_containers {
         0
     } else {
         (avail * 40 / 100).clamp(sc(130).min(avail / 2), sc(260).max(150))
     };
-    let list_h = if log_h > 0 {
-        (avail - log_h - 12).max(80)
-    } else {
-        avail
-    };
+    let one_row_h = list_hdr_h + row_h + 16;
+    let cont_min = list_hdr_h + 2 * row_h + 16;
+    let dirs_needed = list_hdr_h + (dv.entries.len().max(1) as i32) * row_h + 16;
+    // Drop OUTPUT first when the three cards cannot fit
+    if log_h > 0 && avail < one_row_h + gap + one_row_h + gap + log_h {
+        log_h = 0;
+    }
+    let rest = if log_h > 0 { avail - log_h - gap } else { avail };
+    let dirs_cap = (rest * 45 / 100).max(one_row_h);
+    let mut list_h = dirs_needed
+        .min(dirs_cap)
+        .min(rest - gap - cont_min)
+        .max(one_row_h);
+    let mut cont_h = (rest - list_h - gap).max(one_row_h);
+    if list_h + gap + cont_h > rest {
+        // Still too tall: shrink both proportionally, keeping the title row visible
+        let total = rest - gap;
+        let sum = (list_h + cont_h).max(1);
+        list_h = (total * list_h / sum).max(list_hdr_h);
+        cont_h = (total - list_h).max(list_hdr_h);
+    }
+    let dirs_focused = dv.focus == DockerFocus::Dirs;
 
     let list_rect = Rect { x: content_x, y: cur_y, w: content_w, h: list_h };
+    hit_zones.docker_dirs_area = Some(list_rect);
     canvas.fill_rounded_rect(list_rect.x, list_rect.y, list_rect.w, list_rect.h, 10, theme.surface, 255);
-    canvas.stroke_rounded_rect(list_rect.x, list_rect.y, list_rect.w, list_rect.h, 10, theme.border, 220);
+    let dirs_border = if dirs_focused { theme.accent } else { theme.border };
+    canvas.stroke_rounded_rect(list_rect.x, list_rect.y, list_rect.w, list_rect.h, 10, dirs_border, 220);
 
     let title = format!("COMPOSE DIRECTORIES ({})", dv.entries.len());
     canvas.draw_text_clipped(
@@ -344,7 +391,7 @@ pub fn render_docker_view(
         content_x + 320,
         theme.fg_muted,
     );
-    let hint = "a add  ·  u up  ·  b build  ·  d down  ·  R restart  ·  l logs  ·  e edit  ·  x remove  ·  Esc close";
+    let hint = "Tab switch pane  ·  a add  ·  u up  ·  b rebuild  ·  d down  ·  R restart  ·  l logs  ·  e edit  ·  x remove  ·  Esc close";
     let hw = font.measure_text(hint, fs(15.5));
     if content_w > hw + 320 {
         canvas.draw_text_clipped(
@@ -359,13 +406,12 @@ pub fn render_docker_view(
         );
     }
 
-    let list_hdr_h = sc(42).max(28);
     canvas.fill_rect(content_x + 10, cur_y + list_hdr_h, content_w - 20, 1, theme.border);
 
     let list_y = cur_y + list_hdr_h + 8;
-    let row_h = sc(68).max(46);
-    let max_rows = ((list_h - list_hdr_h - 16) / row_h).max(1) as usize;
-    hit_zones.docker_page_rows = max_rows;
+    // Rows that actually fit (0 when the card was shrunk below one row)
+    let max_rows = ((list_h - list_hdr_h - 16) / row_h).max(0) as usize;
+    hit_zones.docker_page_rows = max_rows.max(1);
 
     if dv.entries.is_empty() {
         canvas.draw_text_clipped(
@@ -391,10 +437,12 @@ pub fn render_docker_view(
                 h: row_h - 6,
             };
 
-            if sel {
+            if sel && dirs_focused {
                 canvas.fill_rounded_rect(row.x, row.y, row.w, row.h, 8, theme.accent_soft, 255);
                 canvas.stroke_rounded_rect(row.x, row.y, row.w, row.h, 8, theme.accent, 160);
                 canvas.fill_rounded_rect(row.x, row.y + 6, 3, (row.h - 12).max(4), 1, theme.accent, 255);
+            } else if sel {
+                canvas.fill_rounded_rect(row.x, row.y, row.w, row.h, 8, theme.accent_soft, 100);
             } else if vi % 2 == 1 {
                 canvas.fill_rounded_rect(row.x, row.y, row.w, row.h, 6, theme.bg, 90);
             }
@@ -451,6 +499,22 @@ pub fn render_docker_view(
                 theme.surface,
                 theme.danger,
                 theme.danger,
+            );
+
+            let rebuild_lbl = "⟳ Rebuild";
+            let rebuild_w = font.measure_text(rebuild_lbl, fs(15.5)) + 20;
+            bx -= rebuild_w + 6;
+            let rebuild_btn = Rect { x: bx, y: rbtn_y, w: rebuild_w, h: rbtn_h };
+            button(
+                canvas,
+                font,
+                rebuild_lbl,
+                fs(15.5),
+                rebuild_btn,
+                rbtn_base,
+                theme.surface,
+                theme.info,
+                theme.info,
             );
 
             let up_lbl = "▶ Up";
@@ -541,6 +605,7 @@ pub fn render_docker_view(
                 id: entry.id,
                 row_rect: row,
                 up_btn,
+                rebuild_btn,
                 down_btn,
                 edit_btn,
                 delete_btn,
@@ -548,21 +613,247 @@ pub fn render_docker_view(
         }
     }
 
+    // ---------- Running containers card ----------
+    let cont_rect = Rect { x: content_x, y: cur_y + list_h + gap, w: content_w, h: cont_h };
+    hit_zones.docker_containers_area = Some(cont_rect);
+    canvas.fill_rounded_rect(cont_rect.x, cont_rect.y, cont_rect.w, cont_rect.h, 10, theme.surface, 255);
+    let cont_border = if dirs_focused { theme.border } else { theme.accent };
+    canvas.stroke_rounded_rect(cont_rect.x, cont_rect.y, cont_rect.w, cont_rect.h, 10, cont_border, 220);
+
+    let loaded = match dv.containers {
+        Some(Ok(list)) => Some(list.as_slice()),
+        _ => None,
+    };
+    let ctitle = match loaded {
+        Some(list) => format!("RUNNING CONTAINERS ({})", list.len()),
+        None => "RUNNING CONTAINERS".to_string(),
+    };
+    canvas.draw_text_clipped(
+        font,
+        &ctitle,
+        FontStyle::Bold,
+        fs(18.0),
+        content_x + 14,
+        cont_rect.y + sc(28),
+        content_x + 360,
+        theme.fg_muted,
+    );
+    let chint = "Tab switch pane  ·  b rebuild  ·  s stop  ·  r refresh";
+    let chw = font.measure_text(chint, fs(15.5));
+    if content_w > chw + 400 {
+        canvas.draw_text_clipped(
+            font,
+            chint,
+            FontStyle::Regular,
+            fs(15.5),
+            content_x + content_w - chw - 14,
+            cont_rect.y + sc(28),
+            content_x + content_w - 10,
+            theme.fg_muted,
+        );
+    }
+    canvas.fill_rect(cont_rect.x + 10, cont_rect.y + list_hdr_h, cont_rect.w - 20, 1, theme.border);
+
+    let cont_y = cont_rect.y + list_hdr_h + 8;
+    let cont_rows = ((cont_h - list_hdr_h - 16) / row_h).max(0) as usize;
+    hit_zones.docker_container_page_rows = cont_rows.max(1);
+    let msg_x = content_x + 18;
+    let msg_max = content_x + content_w - 18;
+    match dv.containers {
+        None => {
+            canvas.draw_text_clipped(
+                font,
+                "Loading containers…",
+                FontStyle::Italic,
+                fs(18.5),
+                msg_x,
+                cont_y + sc(28),
+                msg_max,
+                theme.fg_muted,
+            );
+        }
+        Some(Err(e)) => {
+            canvas.draw_text_clipped(
+                font,
+                &format!("Docker unavailable: {e}"),
+                FontStyle::Regular,
+                fs(18.5),
+                msg_x,
+                cont_y + sc(28),
+                msg_max,
+                theme.warning,
+            );
+        }
+        Some(Ok(list)) if list.is_empty() => {
+            canvas.draw_text_clipped(
+                font,
+                "No running containers.",
+                FontStyle::Italic,
+                fs(18.5),
+                msg_x,
+                cont_y + sc(28),
+                msg_max,
+                theme.fg_muted,
+            );
+        }
+        Some(Ok(list)) => {
+            let start = dv.container_scroll.min(list.len().saturating_sub(1));
+            for (vi, c) in list.iter().skip(start).take(cont_rows).enumerate() {
+                let idx = start + vi;
+                let ry = cont_y + (vi as i32) * row_h;
+                let sel = idx == dv.container_selected;
+                let row = Rect { x: content_x + 10, y: ry, w: content_w - 20, h: row_h - 6 };
+                if sel && !dirs_focused {
+                    canvas.fill_rounded_rect(row.x, row.y, row.w, row.h, 8, theme.accent_soft, 255);
+                    canvas.stroke_rounded_rect(row.x, row.y, row.w, row.h, 8, theme.accent, 160);
+                    canvas.fill_rounded_rect(row.x, row.y + 6, 3, (row.h - 12).max(4), 1, theme.accent, 255);
+                } else if sel {
+                    canvas.fill_rounded_rect(row.x, row.y, row.w, row.h, 8, theme.accent_soft, 100);
+                } else if vi % 2 == 1 {
+                    canvas.fill_rounded_rect(row.x, row.y, row.w, row.h, 6, theme.bg, 90);
+                }
+
+                let stopping = dv.stopping.contains(&c.id);
+                let rebuilding = dv.rebuilding.contains(&c.project) && c.can_rebuild();
+                let busy = stopping || rebuilding;
+                let rbtn_h = sc(30).max(20);
+                let rbtn_y = row.y + (row.h - rbtn_h) / 2;
+                let rbtn_base = rbtn_y + (rbtn_h * 7) / 10;
+                let stop_lbl = "■ Stop";
+                let stop_w = font.measure_text(stop_lbl, fs(15.5)) + 20;
+                let bx = row.x + row.w - 10 - stop_w;
+                let stop_btn = Rect { x: bx, y: rbtn_y, w: stop_w, h: rbtn_h };
+                let (stroke, text) = if busy {
+                    (theme.fg_muted, theme.fg_muted)
+                } else {
+                    (theme.danger, theme.danger)
+                };
+                button(
+                    canvas,
+                    font,
+                    stop_lbl,
+                    fs(15.5),
+                    stop_btn,
+                    rbtn_base,
+                    theme.surface,
+                    stroke,
+                    text,
+                );
+
+                let rebuild_btn = if c.can_rebuild() {
+                    let rb_lbl = "⟳ Rebuild";
+                    let rb_w = font.measure_text(rb_lbl, fs(15.5)) + 20;
+                    let r = Rect { x: bx - 6 - rb_w, y: rbtn_y, w: rb_w, h: rbtn_h };
+                    let col = if busy { theme.fg_muted } else { theme.info };
+                    button(canvas, font, rb_lbl, fs(15.5), r, rbtn_base, theme.surface, col, col);
+                    Some(r)
+                } else {
+                    None
+                };
+                let btns_x = rebuild_btn.map_or(bx, |r| r.x);
+
+                let (st_lbl, st_col) = if stopping {
+                    ("STOPPING", theme.warning)
+                } else if rebuilding {
+                    ("REBUILDING", theme.warning)
+                } else {
+                    ("RUNNING", theme.success)
+                };
+                let pill_w = font.measure_text("REBUILDING", fs(14.5)) + 18;
+                let pill_h = sc(24).max(16);
+                let pill_x = row.x + 12;
+                let pill_y = row.y + (row.h - pill_h) / 2;
+                canvas.fill_rounded_rect(pill_x, pill_y, pill_w, pill_h, 5, theme.bg, 220);
+                canvas.stroke_rounded_rect(pill_x, pill_y, pill_w, pill_h, 5, st_col, 200);
+                canvas.draw_text_clipped(
+                    font,
+                    st_lbl,
+                    FontStyle::Bold,
+                    fs(14.5),
+                    pill_x + 9,
+                    pill_y + (pill_h * 7) / 10,
+                    pill_x + pill_w - 4,
+                    st_col,
+                );
+
+                let text_x = pill_x + pill_w + 14;
+                let text_max = (btns_x - 12).max(text_x + 40);
+                let top_y = row.y + sc(25).max(16);
+                let name_end = canvas.draw_text_clipped(
+                    font,
+                    &c.name,
+                    FontStyle::Bold,
+                    fs(18.5),
+                    text_x,
+                    top_y,
+                    text_max,
+                    theme.fg,
+                );
+                if name_end + 20 < text_max && !c.image.is_empty() {
+                    canvas.draw_text_clipped(
+                        font,
+                        &format!("  ·  {}", c.image),
+                        FontStyle::Regular,
+                        fs(15.5),
+                        name_end + 2,
+                        top_y,
+                        text_max,
+                        theme.fg_muted,
+                    );
+                }
+                let mut parts: Vec<String> = Vec::new();
+                if !c.status.is_empty() {
+                    parts.push(c.status.clone());
+                }
+                if !c.ports.is_empty() {
+                    parts.push(c.ports.clone());
+                }
+                if !c.project.is_empty() {
+                    parts.push(format!("project {}", c.project));
+                }
+                canvas.draw_text_clipped(
+                    font,
+                    &parts.join("  ·  "),
+                    FontStyle::Regular,
+                    fs(15.5),
+                    text_x,
+                    row.y + sc(48).max(33),
+                    text_max,
+                    theme.fg_muted,
+                );
+
+                hit_zones.docker_container_rows.push(DockerContainerRowHitZone {
+                    index: idx,
+                    row_rect: row,
+                    rebuild_btn,
+                    stop_btn,
+                });
+            }
+        }
+    }
+
     // ---------- Output Card (for selected directory) ----------
     if log_h > 0 {
-        let by = cur_y + list_h + 12;
+        let by = cont_rect.y + cont_h + gap;
         let out_rect = Rect { x: content_x, y: by, w: content_w, h: log_h };
         hit_zones.docker_log_area = Some(out_rect);
         canvas.fill_rounded_rect(out_rect.x, out_rect.y, out_rect.w, out_rect.h, 10, theme.surface, 255);
         canvas.stroke_rounded_rect(out_rect.x, out_rect.y, out_rect.w, out_rect.h, 10, theme.border, 220);
 
         let sel_entry = dv.entries.get(dv.selected);
-        let ot = match sel_entry {
-            Some(e) if e.jobs_running > 0 => format!("OUTPUT — {}  ·  running…", e.display_name()),
-            Some(e) => format!("OUTPUT — {}", e.display_name()),
-            None => "OUTPUT".to_string(),
+        let (ot, is_running) = if dirs_focused {
+            match sel_entry {
+                Some(e) if e.jobs_running > 0 => {
+                    (format!("OUTPUT — {}  ·  running…", e.display_name()), true)
+                }
+                Some(e) => (format!("OUTPUT — {}", e.display_name()), false),
+                None => ("OUTPUT".to_string(), false),
+            }
+        } else if dv.container_job_running {
+            ("OUTPUT — containers  ·  running…".to_string(), true)
+        } else {
+            ("OUTPUT — containers".to_string(), false)
         };
-        let is_running = sel_entry.is_some_and(|e| e.jobs_running > 0);
         canvas.draw_text_clipped(
             font,
             &ot,
@@ -573,7 +864,7 @@ pub fn render_docker_view(
             out_rect.x + out_rect.w - 10,
             if is_running { theme.warning } else { theme.fg_muted },
         );
-        let ohint = "PgUp/PgDn scroll  ·  c clear";
+        let ohint = if dirs_focused { "PgUp/PgDn scroll  ·  c clear" } else { "PgUp/PgDn scroll" };
         let ohw = font.measure_text(ohint, fs(15.5));
         if content_w > ohw + 260 {
             canvas.draw_text_clipped(
@@ -593,11 +884,20 @@ pub fn render_docker_view(
         let line_h = sc(24).max(15);
         let visible = ((out_rect.h - ohdr - 14) / line_h).max(1) as usize;
 
-        let logs = sel_entry.map(|e| &e.logs);
+        let logs = if dirs_focused {
+            sel_entry.map(|e| &e.logs)
+        } else {
+            Some(dv.container_logs)
+        };
         if logs.is_none_or(|l| l.is_empty()) {
+            let empty_hint = if dirs_focused {
+                "Press 'u' (Up), 'b' (Rebuild), 'd' (Down), 'R' (Restart), or 'l' (Logs) to run compose here."
+            } else {
+                "Press 'b' to rebuild the selected container's compose project."
+            };
             canvas.draw_text_clipped(
                 font,
-                "Press 'u' (Up), 'b' (Up --build), 'd' (Down), 'R' (Restart), or 'l' (Logs) to run compose here.",
+                empty_hint,
                 FontStyle::Italic,
                 fs(17.0),
                 out_rect.x + 14,

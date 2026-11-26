@@ -5,10 +5,11 @@ pub mod renderer;
 
 use crate::commands::{CommandEvent, CommandManager, CommandStatus, expand_directory};
 use crate::docker::{
-    ComposeAction, ComposeStatus, DockerEvent, DockerManager, complete_directory,
-    find_compose_file, spawn_compose_job,
+    CONTAINER_JOB_ID, ComposeAction, ComposeStatus, DockerEvent, DockerManager, MAX_LOG_LINES,
+    RunningContainer, complete_directory, find_compose_file, project_rebuild_args, reselect,
+    spawn_compose_job, spawn_compose_job_args, spawn_container_stop, spawn_ps_scan,
 };
-use crate::ui::docker_view::{DockerFormView, DockerViewState};
+use crate::ui::docker_view::{DockerFocus, DockerFormView, DockerViewState};
 use crate::config::{
     Config, DEFAULT_COMMANDS_FONT_SIZE, DEFAULT_DOCKER_FONT_SIZE, DEFAULT_MONITOR_FONT_SIZE,
     DEFAULT_SHORTCUT_COMMANDS, DEFAULT_SHORTCUT_DOCKER, DEFAULT_SHORTCUT_MONITOR,
@@ -27,6 +28,7 @@ use crate::ui::renderer::{
 use crate::usage::{TimeRange, UsageReport, scan_local_usage};
 use arboard::Clipboard;
 use softbuffer::{Context, Surface};
+use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(target_os = "linux")]
 use std::io::Write;
 use std::num::NonZeroU32;
@@ -50,6 +52,12 @@ pub enum UserEvent {
     UsageUpdated(UsageReport),
     CommandEvent(CommandEvent),
     Docker(DockerEvent),
+    DockerContainers(Result<Vec<RunningContainer>, String>),
+    DockerContainerStopped {
+        id: String,
+        name: String,
+        result: Result<(), String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -332,6 +340,22 @@ struct DockerTabState {
     scroll: usize,
     log_scroll: usize,
     form: Option<DockerFormState>,
+    /// None = engine never scanned yet.
+    containers: Option<Result<Vec<RunningContainer>, String>>,
+    containers_scanning: bool,
+    containers_last_scan: Option<Instant>,
+    /// Ids of containers with a stop in flight.
+    stopping: HashSet<String>,
+    /// Compose project names with a rebuild in flight.
+    rebuilding: HashSet<String>,
+    /// Registered-directory rebuild jobs in flight: dir id -> project name.
+    rebuild_dirs: HashMap<u64, String>,
+    /// Output of rebuilds of projects that are not registered directories.
+    container_logs: VecDeque<String>,
+    container_jobs_running: usize,
+    container_selected: usize,
+    container_scroll: usize,
+    focus: DockerFocus,
 }
 
 impl DockerTabState {
@@ -343,6 +367,60 @@ impl DockerTabState {
             scroll: 0,
             log_scroll: 0,
             form: None,
+            containers: None,
+            containers_scanning: false,
+            containers_last_scan: None,
+            stopping: HashSet::new(),
+            rebuilding: HashSet::new(),
+            rebuild_dirs: HashMap::new(),
+            container_logs: VecDeque::new(),
+            container_jobs_running: 0,
+            container_selected: 0,
+            container_scroll: 0,
+            focus: DockerFocus::Dirs,
+        }
+    }
+
+    fn container_list(&self) -> &[RunningContainer] {
+        match &self.containers {
+            Some(Ok(list)) => list,
+            _ => &[],
+        }
+    }
+
+    fn selected_container(&self) -> Option<&RunningContainer> {
+        self.container_list().get(self.container_selected)
+    }
+
+    fn set_focus(&mut self, focus: DockerFocus) {
+        if self.focus != focus {
+            self.focus = focus;
+            self.log_scroll = 0;
+        }
+    }
+
+    fn push_container_log(&mut self, line: String) {
+        if self.container_logs.len() >= MAX_LOG_LINES {
+            self.container_logs.pop_front();
+        }
+        self.container_logs.push_back(line);
+    }
+
+    fn move_container_selection(&mut self, delta: isize, page: usize) {
+        let len = self.container_list().len();
+        if len == 0 {
+            return;
+        }
+        if delta < 0 {
+            self.container_selected = self.container_selected.saturating_sub((-delta) as usize);
+        } else {
+            self.container_selected = (self.container_selected + delta as usize).min(len - 1);
+        }
+        let page = page.max(1);
+        if self.container_selected < self.container_scroll {
+            self.container_scroll = self.container_selected;
+        } else if self.container_selected >= self.container_scroll + page {
+            self.container_scroll = self.container_selected + 1 - page;
         }
     }
 
@@ -863,8 +941,53 @@ impl TerminalApp {
             self.monitor.open = false;
             self.commands.open = false;
             self.settings.close();
+            self.trigger_container_scan();
         }
         self.request_redraw();
+    }
+
+    fn trigger_container_scan(&mut self) {
+        if self.docker.containers_scanning {
+            return;
+        }
+        self.docker.containers_scanning = true;
+        let proxy = self.proxy.clone();
+        spawn_ps_scan(move |res| {
+            let _ = proxy.send_event(UserEvent::DockerContainers(res));
+        });
+    }
+
+    fn stop_container(&mut self, id: String, name: String) {
+        // Stopping mid-recreate would race the compose rebuild.
+        let rebuilding = self
+            .docker
+            .container_list()
+            .iter()
+            .find(|c| c.id == id)
+            .is_some_and(|c| !c.project.is_empty() && self.docker.rebuilding.contains(&c.project));
+        if rebuilding {
+            self.show_toast("Rebuilding — wait");
+            return;
+        }
+        if !self.docker.stopping.insert(id.clone()) {
+            return;
+        }
+        self.show_toast(format!("Stopping {name}…"));
+        let proxy = self.proxy.clone();
+        spawn_container_stop(id, name, move |id, name, result| {
+            let _ = proxy.send_event(UserEvent::DockerContainerStopped { id, name, result });
+        });
+        self.request_redraw();
+    }
+
+    fn stop_selected_container(&mut self) {
+        if let Some((id, name)) = self
+            .docker
+            .selected_container()
+            .map(|c| (c.id.clone(), c.name.clone()))
+        {
+            self.stop_container(id, name);
+        }
     }
 
     fn docker_event_cb(&self) -> Arc<dyn Fn(DockerEvent) + Send + Sync> {
@@ -874,14 +997,15 @@ impl TerminalApp {
         })
     }
 
-    fn run_docker_action(&mut self, id: u64, action: ComposeAction) {
+    /// Starts the compose job; returns false when nothing was spawned.
+    fn run_docker_action(&mut self, id: u64, action: ComposeAction) -> bool {
         let Some((name, dir_str)) = self
             .docker
             .manager
             .find_by_id(id)
             .map(|e| (e.display_name(), e.directory.clone()))
         else {
-            return;
+            return false;
         };
         let resolved = expand_directory(&dir_str);
         if !resolved.is_dir() {
@@ -892,7 +1016,7 @@ impl TerminalApp {
             }
             self.show_toast(msg);
             self.request_redraw();
-            return;
+            return false;
         }
         if find_compose_file(&resolved).is_none() {
             let msg = format!("No compose file found in {}", resolved.display());
@@ -902,13 +1026,13 @@ impl TerminalApp {
             }
             self.show_toast(msg);
             self.request_redraw();
-            return;
+            return false;
         }
 
         if let Some(entry) = self.docker.manager.find_by_id_mut(id) {
             entry.jobs_running += 1;
             match action {
-                ComposeAction::Up | ComposeAction::UpBuild | ComposeAction::Restart => {
+                ComposeAction::Up | ComposeAction::Rebuild | ComposeAction::Restart => {
                     entry.status = ComposeStatus::Starting;
                 }
                 ComposeAction::Down => {
@@ -923,6 +1047,100 @@ impl TerminalApp {
         let cb = self.docker_event_cb();
         spawn_compose_job(id, action, label, resolved, cb);
         self.request_redraw();
+        true
+    }
+
+    /// Rebuild a registered directory, marking the matching containers' project
+    /// as rebuilding. Skipped while a rebuild or any job of it is still running.
+    fn rebuild_docker_dir(&mut self, id: u64) {
+        let busy = self.docker.rebuild_dirs.contains_key(&id)
+            || self.docker.manager.find_by_id(id).is_some_and(|e| e.jobs_running > 0);
+        if busy {
+            self.show_toast("Already running");
+            return;
+        }
+        let project = self
+            .docker
+            .container_list()
+            .iter()
+            .find(|c| {
+                c.can_rebuild()
+                    && self.docker.manager.find_id_by_directory(&c.working_dir) == Some(id)
+            })
+            .map(|c| c.project.clone());
+        if !self.run_docker_action(id, ComposeAction::Rebuild) {
+            return;
+        }
+        if let Some(project) = project {
+            self.docker.rebuilding.insert(project.clone());
+            self.docker.rebuild_dirs.insert(id, project.clone());
+            self.show_toast(format!("Rebuilding {project}…"));
+        }
+    }
+
+    /// Rebuild the compose project of the container at `index` in the list.
+    fn rebuild_container_project(&mut self, index: usize) {
+        let Some(c) = self.docker.container_list().get(index).cloned() else {
+            return;
+        };
+        if !c.can_rebuild() {
+            self.show_toast("Not a compose container — can't rebuild");
+            return;
+        }
+        let project = c.project.clone();
+        if self.docker.rebuilding.contains(&project) || self.docker.stopping.contains(&c.id) {
+            return;
+        }
+        if let Some(dir_id) = self.docker.manager.find_id_by_directory(&c.working_dir) {
+            // Registered directory: its own status and OUTPUT log track the job.
+            self.rebuild_docker_dir(dir_id);
+            return;
+        }
+        let dir = PathBuf::from(&c.working_dir);
+        if !dir.is_dir() {
+            self.show_toast(format!("Directory does not exist: {}", dir.display()));
+            return;
+        }
+        self.docker.rebuilding.insert(project.clone());
+        self.docker.container_jobs_running += 1;
+        self.docker.log_scroll = 0;
+        self.show_toast(format!("Rebuilding {project}…"));
+        let args = project_rebuild_args(&project, &c.config_files);
+        let cb = self.docker_event_cb();
+        spawn_compose_job_args(
+            CONTAINER_JOB_ID,
+            ComposeAction::Rebuild,
+            project,
+            dir,
+            args,
+            cb,
+        );
+        self.request_redraw();
+    }
+
+    fn rebuild_selected_container(&mut self) {
+        self.rebuild_container_project(self.docker.container_selected);
+    }
+
+    /// Handles a compose event of a job started from a container row (not
+    /// registered as a directory): log, toast, clear `rebuilding`, rescan.
+    fn handle_container_job_event(&mut self, ev: DockerEvent) {
+        match ev {
+            DockerEvent::Output { line, .. } => self.docker.push_container_log(line),
+            DockerEvent::Done { label: project, code, .. } => {
+                let ok = code == Some(0);
+                self.docker.container_jobs_running = self.docker.container_jobs_running.saturating_sub(1);
+                self.docker.rebuilding.remove(&project);
+                if ok {
+                    self.docker.push_container_log(format!("✔ Rebuilt {project}"));
+                    self.show_toast(format!("Rebuilt {project}"));
+                } else {
+                    let c = code.unwrap_or(-1);
+                    self.docker.push_container_log(format!("✖ Rebuild failed ({project}): exit {c}"));
+                    self.show_toast(format!("Rebuild failed ({project}): exit {c}"));
+                }
+            }
+        }
     }
 
     fn down_all_docker(&mut self) {
@@ -1811,6 +2029,65 @@ impl TerminalApp {
             return;
         }
 
+        if matches!(key, Key::Named(NamedKey::Tab)) {
+            self.docker.focus = match self.docker.focus {
+                DockerFocus::Dirs => DockerFocus::Containers,
+                DockerFocus::Containers => DockerFocus::Dirs,
+            };
+            self.docker.log_scroll = 0;
+            self.request_redraw();
+            return;
+        }
+
+        if self.docker.focus == DockerFocus::Containers {
+            let cpage = self.hit_zones.docker_container_page_rows.max(1);
+            let plain = !ctrl && !alt && !self.super_held();
+            match key {
+                Key::Named(NamedKey::ArrowUp) => {
+                    self.docker.move_container_selection(-1, cpage);
+                    self.request_redraw();
+                    return;
+                }
+                Key::Named(NamedKey::ArrowDown) => {
+                    self.docker.move_container_selection(1, cpage);
+                    self.request_redraw();
+                    return;
+                }
+                Key::Named(NamedKey::Space) | Key::Named(NamedKey::Delete) if plain => {
+                    self.stop_selected_container();
+                    return;
+                }
+                Key::Character(c) if plain => match c.as_str() {
+                    "a" | "A" => {}
+                    "j" => {
+                        self.docker.move_container_selection(1, cpage);
+                        self.request_redraw();
+                        return;
+                    }
+                    "k" => {
+                        self.docker.move_container_selection(-1, cpage);
+                        self.request_redraw();
+                        return;
+                    }
+                    "s" | "S" | "d" | "D" | "x" => {
+                        self.stop_selected_container();
+                        return;
+                    }
+                    "b" | "B" => {
+                        self.rebuild_selected_container();
+                        return;
+                    }
+                    "r" => {
+                        self.trigger_container_scan();
+                        return;
+                    }
+                    // Directory-only keys do nothing while containers are focused
+                    _ => return,
+                },
+                _ => {}
+            }
+        }
+
         let page = self.hit_zones.docker_page_rows.max(1);
         match key {
             Key::Named(NamedKey::Escape) => {
@@ -1836,7 +2113,7 @@ impl TerminalApp {
                 self.docker.log_scroll = self.docker.log_scroll.saturating_sub(5);
                 self.request_redraw();
             }
-            Key::Named(NamedKey::Space) => {
+            Key::Named(NamedKey::Space) if !ctrl && !alt && !self.super_held() => {
                 if let Some(id) = self.docker.selected_id() {
                     let is_up = self
                         .docker
@@ -1846,7 +2123,7 @@ impl TerminalApp {
                     self.run_docker_action(id, if is_up { ComposeAction::Down } else { ComposeAction::Up });
                 }
             }
-            Key::Named(NamedKey::Delete) => {
+            Key::Named(NamedKey::Delete) if !ctrl && !alt && !self.super_held() => {
                 if let Some(id) = self.docker.selected_id() {
                     self.delete_docker_dir(id);
                 }
@@ -1893,7 +2170,7 @@ impl TerminalApp {
                 }
                 "b" | "B" => {
                     if let Some(id) = self.docker.selected_id() {
-                        self.run_docker_action(id, ComposeAction::UpBuild);
+                        self.rebuild_docker_dir(id);
                     }
                 }
                 "d" | "D" => {
@@ -2916,6 +3193,14 @@ impl TerminalApp {
                     }
                 }),
                 cursor_blink_on: cursor_on,
+                containers: &self.docker.containers,
+                stopping: &self.docker.stopping,
+                rebuilding: &self.docker.rebuilding,
+                container_logs: &self.docker.container_logs,
+                container_job_running: self.docker.container_jobs_running > 0,
+                container_selected: self.docker.container_selected,
+                container_scroll: self.docker.container_scroll,
+                focus: self.docker.focus,
             })
         } else {
             None
@@ -3075,8 +3360,75 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
                 self.request_redraw();
             }
             UserEvent::Docker(ev) => {
-                if let Some(toast) = self.docker.manager.apply_event(ev) {
-                    self.show_toast(toast);
+                let done = matches!(ev, DockerEvent::Done { .. });
+                let is_container_job = matches!(
+                    ev,
+                    DockerEvent::Output { id: CONTAINER_JOB_ID, .. }
+                        | DockerEvent::Done { id: CONTAINER_JOB_ID, .. }
+                );
+                if is_container_job {
+                    self.handle_container_job_event(ev);
+                } else {
+                    let rebuilt = match &ev {
+                        DockerEvent::Done { id, action: ComposeAction::Rebuild, code, .. } => self
+                            .docker
+                            .rebuild_dirs
+                            .remove(id)
+                            .map(|project| (project, *code)),
+                        _ => None,
+                    };
+                    if let Some(toast) = self.docker.manager.apply_event(ev) {
+                        self.show_toast(toast);
+                    }
+                    if let Some((project, code)) = rebuilt {
+                        self.docker.rebuilding.remove(&project);
+                        if code == Some(0) {
+                            self.show_toast(format!("Rebuilt {project}"));
+                        } else {
+                            self.show_toast(format!(
+                                "Rebuild failed ({project}): exit {}",
+                                code.unwrap_or(-1)
+                            ));
+                        }
+                    }
+                }
+                if done && self.docker.open {
+                    self.trigger_container_scan();
+                }
+                self.request_redraw();
+            }
+            UserEvent::DockerContainers(res) => {
+                self.docker.containers_scanning = false;
+                self.docker.containers_last_scan = Some(Instant::now());
+                if res.is_err() {
+                    self.docker.stopping.clear();
+                }
+                if let Ok(list) = &res {
+                    let prev = self
+                        .docker
+                        .selected_container()
+                        .map(|c| (c.id.clone(), c.name.clone()));
+                    self.docker.container_selected = reselect(
+                        prev.as_ref().map(|(i, n)| (i.as_str(), n.as_str())),
+                        list,
+                        self.docker.container_selected,
+                    );
+                    self.docker.container_scroll = self.docker.container_scroll.min(self.docker.container_selected);
+                    self.docker.stopping.retain(|id| list.iter().any(|c| &c.id == id));
+                }
+                self.docker.containers = Some(res);
+                self.request_redraw();
+            }
+            UserEvent::DockerContainerStopped { id, name, result } => {
+                match result {
+                    Ok(()) => self.show_toast(format!("Stopped {name}")),
+                    Err(e) => {
+                        self.docker.stopping.remove(&id);
+                        self.show_toast(format!("Stop failed ({name}): {e}"));
+                    }
+                }
+                if self.docker.open {
+                    self.trigger_container_scan();
                 }
                 self.request_redraw();
             }
@@ -3120,6 +3472,17 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
                 None => {
                     self.trigger_usage_scan();
                 }
+            }
+        }
+
+        // Poll the Docker engine every 3 seconds while the Docker tab is open
+        if self.docker.open && !self.docker.containers_scanning {
+            let interval = Duration::from_secs(3);
+            match self.docker.containers_last_scan {
+                Some(last) if now.duration_since(last) < interval => {
+                    next_wake = next_wake.min(last + interval);
+                }
+                _ => self.trigger_container_scan(),
             }
         }
 
@@ -3438,11 +3801,55 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
                                     }
                                 }
                             }
+                            let cont_rows = self.hit_zones.docker_container_rows.clone();
+                            for row in cont_rows {
+                                if row.rebuild_btn.is_some_and(|r| r.contains(px, py)) {
+                                    self.docker.set_focus(DockerFocus::Containers);
+                                    self.docker.container_selected = row.index;
+                                    self.rebuild_container_project(row.index);
+                                    self.request_redraw();
+                                    return;
+                                }
+                                if row.stop_btn.contains(px, py) {
+                                    self.docker.set_focus(DockerFocus::Containers);
+                                    self.docker.container_selected = row.index;
+                                    if let Some((id, name)) = self
+                                        .docker
+                                        .container_list()
+                                        .get(row.index)
+                                        .map(|c| (c.id.clone(), c.name.clone()))
+                                    {
+                                        self.stop_container(id, name);
+                                    }
+                                    self.request_redraw();
+                                    return;
+                                }
+                                if row.row_rect.contains(px, py) {
+                                    self.docker.set_focus(DockerFocus::Containers);
+                                    self.docker.container_selected = row.index;
+                                    self.request_redraw();
+                                    return;
+                                }
+                            }
+                            if self
+                                .hit_zones
+                                .docker_dirs_area
+                                .is_some_and(|r| r.contains(px, py))
+                            {
+                                self.docker.set_focus(DockerFocus::Dirs);
+                                self.request_redraw();
+                            }
                             let dock_rows = self.hit_zones.docker_rows.clone();
                             for row in dock_rows {
                                 if row.up_btn.contains(px, py) {
                                     self.docker.selected = row.index;
                                     self.run_docker_action(row.id, ComposeAction::Up);
+                                    return;
+                                }
+                                if row.rebuild_btn.contains(px, py) {
+                                    self.docker.selected = row.index;
+                                    self.docker.set_focus(DockerFocus::Dirs);
+                                    self.rebuild_docker_dir(row.id);
                                     return;
                                 }
                                 if row.down_btn.contains(px, py) {
@@ -3738,7 +4145,23 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
                         .docker_log_area
                         .map(|r| r.contains(px, py))
                         .unwrap_or(false);
-                    if over_logs {
+                    let over_containers = self
+                        .hit_zones
+                        .docker_containers_area
+                        .is_some_and(|r| r.contains(px, py));
+                    if over_containers {
+                        let max_scroll = self.docker.container_list().len().saturating_sub(1);
+                        if lines > 0 {
+                            self.docker.container_scroll =
+                                self.docker.container_scroll.saturating_sub(lines as usize);
+                        } else if lines < 0 {
+                            self.docker.container_scroll = self
+                                .docker
+                                .container_scroll
+                                .saturating_add((-lines) as usize)
+                                .min(max_scroll);
+                        }
+                    } else if over_logs {
                         if lines > 0 {
                             self.docker.log_scroll =
                                 self.docker.log_scroll.saturating_add(lines as usize);

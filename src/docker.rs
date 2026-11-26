@@ -1,7 +1,7 @@
 //! Docker Compose directory manager: persists user-added directories containing
 //! a compose file (`docker.toml`) and runs `compose up -d` / `down` / `restart`
 //! / `logs` in the background, streaming output line by line to the UI.
-//! Never scans the Docker engine automatically.
+//! Only queries the Docker engine (`docker ps`) while the Docker tab is open.
 
 use crate::commands::{expand_directory, strip_ansi};
 use crate::shell::executor::build_enriched_path;
@@ -15,7 +15,11 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 
-const MAX_LOG_LINES: usize = 400;
+pub const MAX_LOG_LINES: usize = 400;
+
+/// Job id for compose jobs started from a container row whose project is not a
+/// registered compose directory; the UI routes these to its own log.
+pub const CONTAINER_JOB_ID: u64 = u64::MAX;
 
 /// Compose file names probed (in order) in a directory.
 pub const COMPOSE_FILES: &[&str] = &[
@@ -28,7 +32,7 @@ pub const COMPOSE_FILES: &[&str] = &[
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComposeAction {
     Up,
-    UpBuild,
+    Rebuild,
     Down,
     Restart,
     Logs,
@@ -38,7 +42,7 @@ impl ComposeAction {
     pub fn label(self) -> &'static str {
         match self {
             Self::Up => "compose up -d",
-            Self::UpBuild => "compose up -d --build",
+            Self::Rebuild => "compose rebuild",
             Self::Down => "compose down",
             Self::Restart => "compose restart",
             Self::Logs => "compose logs",
@@ -48,7 +52,7 @@ impl ComposeAction {
     pub fn sub_args(self) -> &'static [&'static str] {
         match self {
             Self::Up => &["up", "-d"],
-            Self::UpBuild => &["up", "-d", "--build"],
+            Self::Rebuild => &["up", "-d", "--build", "--force-recreate"],
             Self::Down => &["down"],
             Self::Restart => &["restart"],
             Self::Logs => &["logs", "--tail", "200"],
@@ -224,18 +228,23 @@ impl DockerManager {
         self.entries.iter_mut().find(|e| e.id == id)
     }
 
+    /// Id of the registered directory that resolves to the same path as `dir`
+    /// (same comparison `add` uses to dedupe).
+    pub fn find_id_by_directory(&self, dir: &str) -> Option<u64> {
+        let wanted = expand_directory(dir);
+        self.entries
+            .iter()
+            .find(|e| expand_directory(&e.directory) == wanted)
+            .map(|e| e.id)
+    }
+
     /// Add a directory (if its canonical/expanded path isn't already saved).
     /// Returns `(id, added_new)`.
     pub fn add(&mut self, directory: String) -> (u64, bool) {
         let trimmed = directory.trim().trim_end_matches('/').to_string();
         let dir = if trimmed.is_empty() { "/".to_string() } else { trimmed };
-        let new_expanded = expand_directory(&dir);
-        if let Some(existing) = self
-            .entries
-            .iter()
-            .find(|e| expand_directory(&e.directory) == new_expanded)
-        {
-            return (existing.id, false);
+        if let Some(existing) = self.find_id_by_directory(&dir) {
+            return (existing, false);
         }
         let id = self.next_id;
         self.next_id += 1;
@@ -287,7 +296,7 @@ impl DockerManager {
                     entry.jobs_running = entry.jobs_running.saturating_sub(1);
                     if ok {
                         match action {
-                            ComposeAction::Up | ComposeAction::UpBuild | ComposeAction::Restart => {
+                            ComposeAction::Up | ComposeAction::Rebuild | ComposeAction::Restart => {
                                 entry.status = ComposeStatus::Up;
                             }
                             ComposeAction::Down => {
@@ -352,6 +361,98 @@ fn run_capture(args: &[&str]) -> Result<String, String> {
     }
 }
 
+/// A running container as reported by `docker ps`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningContainer {
+    pub id: String,
+    pub name: String,
+    pub image: String,
+    pub status: String,
+    pub ports: String,
+    /// Compose project label (empty when not started by compose).
+    pub project: String,
+    /// Compose project working directory label (empty when not started by compose).
+    pub working_dir: String,
+    /// Absolute compose file paths the project was started with.
+    pub config_files: Vec<String>,
+}
+
+impl RunningContainer {
+    /// True when the compose labels needed to rebuild its project are present.
+    pub fn can_rebuild(&self) -> bool {
+        !self.project.is_empty() && !self.working_dir.is_empty()
+    }
+}
+
+const PS_FORMAT: &str = "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}\t{{.Label \"com.docker.compose.project\"}}\t{{.Label \"com.docker.compose.project.working_dir\"}}\t{{.Label \"com.docker.compose.project.config_files\"}}";
+
+/// Parse tab-separated `docker ps --format` output (see `PS_FORMAT`), sorted by
+/// name then id so the order is stable across polls.
+pub fn parse_ps_output(out: &str) -> Vec<RunningContainer> {
+    let mut list: Vec<RunningContainer> = out
+        .lines()
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split('\t').map(str::trim).collect();
+            if f.len() < 4 || f[0].is_empty() {
+                return None;
+            }
+            let get = |i: usize| f.get(i).copied().unwrap_or("").to_string();
+            Some(RunningContainer {
+                id: get(0),
+                name: get(1),
+                image: get(2),
+                status: get(3),
+                ports: get(4),
+                project: get(5),
+                working_dir: get(6),
+                config_files: get(7)
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+            })
+        })
+        .collect();
+    list.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+    list
+}
+
+/// Index to select after the list changed: stay on the previously selected
+/// container id when it is still present, else on the same name (names survive
+/// a recreate, ids do not), otherwise clamp the old index.
+pub fn reselect(
+    prev: Option<(&str, &str)>,
+    list: &[RunningContainer],
+    prev_idx: usize,
+) -> usize {
+    prev.and_then(|(id, name)| {
+        list.iter()
+            .position(|c| c.id == id)
+            .or_else(|| list.iter().position(|c| c.name == name))
+    })
+        .unwrap_or_else(|| prev_idx.min(list.len().saturating_sub(1)))
+}
+
+/// List running containers in the background.
+pub fn spawn_ps_scan(on_done: impl FnOnce(Result<Vec<RunningContainer>, String>) + Send + 'static) {
+    thread::spawn(move || {
+        on_done(run_capture(&["docker", "ps", "--format", PS_FORMAT]).map(|o| parse_ps_output(&o)));
+    });
+}
+
+/// `docker stop <id>` in the background.
+pub fn spawn_container_stop(
+    id: String,
+    name: String,
+    on_done: impl FnOnce(String, String, Result<(), String>) + Send + 'static,
+) {
+    thread::spawn(move || {
+        let result = run_capture(&["docker", "stop", &id]).map(|_| ());
+        on_done(id, name, result);
+    });
+}
+
 /// Base command for compose: `docker compose` (v2 plugin) or legacy `docker-compose`.
 pub fn compose_base() -> &'static [String] {
     static BASE: OnceLock<Vec<String>> = OnceLock::new();
@@ -364,6 +465,20 @@ pub fn compose_base() -> &'static [String] {
             vec!["docker".to_string(), "compose".to_string()]
         }
     })
+}
+
+/// Arguments to rebuild a compose project that is not a registered directory:
+/// `<compose> -p <project> [-f <file>]... up -d --build --force-recreate`.
+pub fn project_rebuild_args(project: &str, config_files: &[String]) -> Vec<String> {
+    let mut v: Vec<String> = compose_base().to_vec();
+    v.push("-p".to_string());
+    v.push(project.to_string());
+    for f in config_files {
+        v.push("-f".to_string());
+        v.push(f.clone());
+    }
+    v.extend(ComposeAction::Rebuild.sub_args().iter().map(|s| s.to_string()));
+    v
 }
 
 /// Build `<compose> up -d` / `<compose> down` / ... arguments.
@@ -390,8 +505,20 @@ pub fn spawn_compose_job(
     dir: PathBuf,
     on_event: Arc<dyn Fn(DockerEvent) + Send + Sync>,
 ) {
+    let args = compose_args(action.sub_args());
+    spawn_compose_job_args(id, action, label, dir, args, on_event);
+}
+
+/// Like `spawn_compose_job` with explicit full command arguments.
+pub fn spawn_compose_job_args(
+    id: u64,
+    action: ComposeAction,
+    label: String,
+    dir: PathBuf,
+    args: Vec<String>,
+    on_event: Arc<dyn Fn(DockerEvent) + Send + Sync>,
+) {
     thread::spawn(move || {
-        let args = compose_args(action.sub_args());
         if args.is_empty() {
             on_event(DockerEvent::Output {
                 id,
