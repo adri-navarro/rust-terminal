@@ -29,7 +29,7 @@ impl RawModeGuard {
             raw.c_lflag &= !(libc::ECHO | libc::ICANON | libc::IEXTEN | libc::ISIG);
             raw.c_cc[libc::VMIN] = 1;
             raw.c_cc[libc::VTIME] = 0;
-            libc::tcsetattr(fd, libc::TCSAFLUSH, &raw);
+            libc::tcsetattr(fd, libc::TCSADRAIN, &raw);
             Self {
                 fd,
                 orig: Some(orig),
@@ -42,7 +42,7 @@ impl Drop for RawModeGuard {
     fn drop(&mut self) {
         if let Some(orig) = self.orig {
             unsafe {
-                libc::tcsetattr(self.fd, libc::TCSAFLUSH, &orig);
+                libc::tcsetattr(self.fd, libc::TCSADRAIN, &orig);
             }
         }
     }
@@ -91,8 +91,6 @@ pub fn run_interactive_shell() -> i32 {
 
         // Bracketed paste is only on while the prompt is reading input, so
         // child programs (nano, cat, ...) never inherit it.
-        let _ = write!(io::stdout(), "\x1b[?2004h");
-        let _ = io::stdout().flush();
         let result = read_line(&mut state, &mut completer, in_gui);
         let _ = write!(io::stdout(), "\x1b[?2004l");
         let _ = io::stdout().flush();
@@ -207,6 +205,7 @@ fn read_line(state: &mut ShellState, completer: &mut Completer, in_gui: bool) ->
     let mut stdin = RawStdin::new();
     let mut stdout = io::stdout();
 
+    let _ = write!(stdout, "\x1b[?2004h");
     let prompt_visible_len = render_prompt(&mut stdout, &state.cwd, state.last_status);
     let _ = stdout.flush();
 

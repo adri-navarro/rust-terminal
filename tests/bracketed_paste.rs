@@ -65,8 +65,14 @@ fn bracketed_paste_disabled_before_command_runs() {
         until(out)
     };
 
-    // Wait for the prompt to enable paste mode, then run a command.
-    assert!(pump(&mut out, &|o| find(o, on, 0).is_some()), "no prompt");
+    // Wait for the prompt to enable paste mode and finish rendering, then run a command.
+    let prompt = "❯".as_bytes();
+    assert!(
+        pump(&mut out, &|o| {
+            find(o, on, 0).is_some_and(|p| find(o, prompt, p).is_some())
+        }),
+        "no prompt"
+    );
     let cmd_start = out.len();
     writer.write_all(b"echo MARK\"ER_OK\"\r").unwrap();
     writer.flush().unwrap();

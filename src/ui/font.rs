@@ -787,6 +787,26 @@ mod tests {
 mod linux_tests {
     use super::*;
 
+    fn system_has_outline_font(ch: char) -> bool {
+        let pattern = format!(":charset={:x}:color=false", ch as u32);
+        let Ok(out) = Command::new("fc-list")
+            .args(["-f", "%{file}\n", &pattern])
+            .output()
+        else {
+            return false;
+        };
+        if !out.status.success() {
+            return false;
+        }
+        String::from_utf8_lossy(&out.stdout).lines().any(|line| {
+            let path = PathBuf::from(line.trim());
+            fs::read(&path)
+                .ok()
+                .and_then(|b| FontVec::try_from_vec_and_index(b, 0).ok())
+                .is_some_and(|f| font_has_outline(&f, ch))
+        })
+    }
+
     #[test]
     fn missing_claude_icons_fall_back_and_fit_one_cell_on_linux() {
         let primary = [
@@ -806,10 +826,14 @@ mod linux_tests {
             .metrics
             .advance_width;
         for ch in ['✻', '⏵', '⎿', '●', '✓', '╭', '❯', '⏺', '⧉'] {
+            let missing_in_primary = engine.regular.glyph_id(ch).0 == 0;
+            if missing_in_primary && !system_has_outline_font(ch) {
+                continue;
+            }
             let tofu = rasterize_ab_glyph(&engine.regular, ch, 16.0);
             let g = engine.rasterize(ch, FontStyle::Regular, 16.0).clone();
             let m = g.metrics;
-            if engine.regular.glyph_id(ch).0 == 0 {
+            if missing_in_primary {
                 assert!(
                     g.bitmap != tofu.bitmap || m.width != tofu.metrics.width,
                     "{ch} (U+{:04X}) still renders as primary .notdef",
@@ -828,6 +852,30 @@ mod linux_tests {
                 m.advance_width
             );
         }
+    }
+
+    #[test]
+    fn fallback_glyph_scales_and_centers_to_cell() {
+        let Ok(mut engine) = FontEngine::new(None, 16.0, 1.25) else {
+            return;
+        };
+        let cell = engine
+            .rasterize('M', FontStyle::Regular, 16.0)
+            .metrics
+            .advance_width;
+        let g = rasterize_fallback_glyph(&engine.regular, &engine.icons, icon::COMMANDS, 16.0);
+        let m = g.metrics;
+        assert!(m.width > 0 && m.height > 0, "fallback rendered blank: {m:?}");
+        assert!(m.xmin >= 0, "fallback spills left: {m:?}");
+        assert!(
+            m.xmin + m.width as i32 <= m.advance_width.ceil() as i32,
+            "fallback spills right: {m:?}"
+        );
+        assert!(
+            (m.advance_width - cell).abs() < 0.01,
+            "fallback advance {} != cell {cell}",
+            m.advance_width
+        );
     }
 
     #[test]
