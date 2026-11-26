@@ -31,7 +31,7 @@ OPTIONS:
     -h, --help          Show this help message
 
 KEYBINDINGS:
-    Ctrl+R              Open fuzzy history command palette
+    Cmd+R / Ctrl+R      Open fuzzy history command palette (Cmd on macOS; configurable in Settings)
     Tab / Shift+Tab     Open & cycle floating autocomplete popup
     Right / End         Accept Fish-style inline history autosuggestion
     Alt+Right           Accept next word of autosuggestion
@@ -43,12 +43,13 @@ KEYBINDINGS:
     F2                  Cycle color theme live
     Ctrl+U / F3         Toggle Agent & Model Usage tab (customizable in Settings)
     Ctrl+M / F4         Toggle System Monitor tab (customizable in Settings)
+                        In it: type to filter processes; Alt+C/M/P/N sort, Alt+R refresh, Del / Alt+K terminate, Alt+Shift+K kill
     Ctrl+P / F5         Toggle Commands tab (customizable in Settings)
     Ctrl+D / F7         Toggle Docker tab (compose directories up/down)
     Ctrl+, / F6         Toggle Settings tab (font sizes, theme, shortcuts)
     Ctrl+Shift+R        Reload ~/.config/itsadri-terminal/config.toml"
     );
-    // On macOS the app shortcuts use Cmd; Ctrl+C stays SIGINT and Ctrl+R stays in-terminal.
+    // On macOS the app shortcuts use Cmd; Ctrl+C stays SIGINT and Ctrl+R goes to the shell (Cmd+R opens the history palette).
     #[cfg(target_os = "macos")]
     let help = help
         .replace("Ctrl+T / Ctrl+W     New", "Cmd+T / Cmd+W       New")

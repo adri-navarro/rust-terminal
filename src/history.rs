@@ -185,7 +185,7 @@ impl HistoryStore {
         None
     }
 
-    /// Ranked fuzzy search for Ctrl+R History Palette.
+    /// Ranked fuzzy search for the History Palette.
     pub fn fuzzy_search(&self, query: &str, limit: usize) -> Vec<FuzzyMatch> {
         let query = query.trim();
         let total = self.entries.len().max(1) as i64;

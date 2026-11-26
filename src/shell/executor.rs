@@ -431,7 +431,7 @@ fn run_builtin(cmd: &SimpleCommand, state: &mut ShellState) -> i32 {
             let _ = writeln!(out, "  Right / End / Ctrl+F   Accept Fish-style inline suggestion");
             let _ = writeln!(out, "  Alt+Right              Accept next word of suggestion");
             let _ = writeln!(out, "  Tab / Shift+Tab        Open & cycle autocomplete popup");
-            let _ = writeln!(out, "  Ctrl+R                 Fuzzy history search palette");
+            let _ = writeln!(out, "  Cmd+R / Ctrl+R         Fuzzy history search palette (Cmd on macOS; configurable)");
             let _ = writeln!(out, "  Up / Down              Navigate command history");
             let _ = writeln!(out, "\nTerminal GUI shortcuts:");
             if cfg!(target_os = "macos") {

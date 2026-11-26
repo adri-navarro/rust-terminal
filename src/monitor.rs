@@ -65,12 +65,30 @@ pub struct ProcessInfo {
     pub threads: u32,
 }
 
+/// Indices into `procs` (in their current order) matching the filter query:
+/// case-insensitive name substring, or a digit-only query contained in the pid.
+pub fn filter_process_indices(procs: &[ProcessInfo], query: &str) -> Vec<usize> {
+    let q = query.trim();
+    if q.is_empty() {
+        return (0..procs.len()).collect();
+    }
+    let q_lower = q.to_lowercase();
+    let digits = q.chars().all(|c| c.is_ascii_digit());
+    procs
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| {
+            p.name.to_lowercase().contains(&q_lower) || (digits && p.pid.to_string().contains(q))
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 pub struct SystemSnapshot {
     pub cpu_total_pct: f32,
     pub cpu_cores_pct: Vec<f32>,
     pub cpu_history: Vec<f32>,
-    pub ram_history: Vec<f32>,
     pub load_avg: (f32, f32, f32),
     pub uptime_secs: u64,
     pub memory: MemoryInfo,
@@ -95,7 +113,6 @@ pub struct SystemMonitor {
     prev_proc_ticks: HashMap<i32, u64>,
     prev_sample_time: Option<Instant>,
     cpu_history: VecDeque<f32>,
-    ram_history: VecDeque<f32>,
     #[cfg(not(target_os = "macos"))]
     page_size: u64,
     /// Total CPU % computed by the previous `read_processes` (macOS has no cheap system-wide counter).
@@ -122,7 +139,6 @@ impl SystemMonitor {
             prev_proc_ticks: HashMap::new(),
             prev_sample_time: None,
             cpu_history: VecDeque::with_capacity(48),
-            ram_history: VecDeque::with_capacity(48),
             #[cfg(not(target_os = "macos"))]
             page_size,
             #[cfg(target_os = "macos")]
@@ -151,11 +167,6 @@ impl SystemMonitor {
         }
         self.cpu_history.push_back(cpu_total_pct);
 
-        if self.ram_history.len() >= 48 {
-            self.ram_history.pop_front();
-        }
-        self.ram_history.push_back(memory.used_pct);
-
         let (mut processes, total_processes, running_processes) =
             self.read_processes(dt_secs, memory.total_bytes);
 
@@ -165,7 +176,6 @@ impl SystemMonitor {
             cpu_total_pct,
             cpu_cores_pct,
             cpu_history: self.cpu_history.iter().copied().collect(),
-            ram_history: self.ram_history.iter().copied().collect(),
             load_avg,
             uptime_secs,
             memory,

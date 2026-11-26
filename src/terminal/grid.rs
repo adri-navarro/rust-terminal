@@ -97,6 +97,9 @@ pub struct TerminalGrid {
 
     pub bracketed_paste: bool,
     pub app_cursor_keys: bool,
+    pub mouse_sgr: bool,
+    /// Bitmask of enabled tracking modes: 1 = 1000, 2 = 1002, 4 = 1003.
+    mouse_modes: u8,
     pub title: String,
     pub cwd: String,
     pub git_branch: String,
@@ -130,6 +133,8 @@ impl TerminalGrid {
             cur_flags: 0,
             bracketed_paste: false,
             app_cursor_keys: false,
+            mouse_sgr: false,
+            mouse_modes: 0,
             title: "itsadri".to_string(),
             cwd: String::new(),
             git_branch: String::new(),
@@ -219,6 +224,11 @@ impl TerminalGrid {
         } else {
             self.cells.get(virtual_idx - sb_len).map(|v| v.as_slice())
         }
+    }
+
+    /// True while any of mouse modes 1000, 1002 or 1003 is enabled.
+    pub fn mouse_tracking(&self) -> bool {
+        self.mouse_modes != 0
     }
 
     pub fn scroll_view(&mut self, delta: isize) {
@@ -556,6 +566,19 @@ impl Perform for TerminalGrid {
                                     self.leave_alt_screen();
                                 }
                             }
+                            1000 | 1002 | 1003 => {
+                                let bit = match p[0] {
+                                    1000 => 1,
+                                    1002 => 2,
+                                    _ => 4,
+                                };
+                                if enable {
+                                    self.mouse_modes |= bit;
+                                } else {
+                                    self.mouse_modes &= !bit;
+                                }
+                            }
+                            1006 => self.mouse_sgr = enable,
                             2004 => self.bracketed_paste = enable,
                             _ => {}
                         }
@@ -563,6 +586,12 @@ impl Perform for TerminalGrid {
                 }
                 _ => {}
             }
+            return;
+        }
+
+        // Prefixed CSI (`>`, `<`, `=`, ...) is not a standard sequence; ignore it
+        // rather than misreading e.g. `CSI > 4 m` as SGR or `CSI < u` as restore-cursor.
+        if !intermediates.is_empty() {
             return;
         }
 

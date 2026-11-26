@@ -81,10 +81,6 @@ pub fn run_interactive_shell() -> i32 {
         return state.exit_code;
     }
 
-    // Enable bracketed paste
-    let _ = write!(io::stdout(), "\x1b[?2004h");
-    let _ = io::stdout().flush();
-
     loop {
         if state.should_exit {
             break;
@@ -93,7 +89,15 @@ pub fn run_interactive_shell() -> i32 {
         // Sync CWD & git branch to GUI via OSC 7 and OSC 777
         emit_shell_metadata(&state.cwd, in_gui);
 
-        let line = match read_line(&mut state, &mut completer, in_gui) {
+        // Bracketed paste is only on while the prompt is reading input, so
+        // child programs (nano, cat, ...) never inherit it.
+        let _ = write!(io::stdout(), "\x1b[?2004h");
+        let _ = io::stdout().flush();
+        let result = read_line(&mut state, &mut completer, in_gui);
+        let _ = write!(io::stdout(), "\x1b[?2004l");
+        let _ = io::stdout().flush();
+
+        let line = match result {
             ReadResult::Line(l) => l,
             ReadResult::Eof => {
                 println!();
@@ -408,7 +412,7 @@ fn read_line(state: &mut ShellState, completer: &mut Completer, in_gui: bool) ->
                 let _ = render_prompt(&mut stdout, &state.cwd, state.last_status);
                 redraw_line(&mut stdout, prompt_visible_len, &buf, cursor, &state.history);
             }
-            // Ctrl+R (standalone CLI reverse search; GUI intercepts Ctrl+R directly)
+            // Ctrl+R (standalone CLI reverse search; GUI intercepts the configured history shortcut, Cmd+R by default on macOS, where real Ctrl+R reaches this shell)
             18 => {
                 if let Some(chosen) = inline_reverse_search(&mut stdin, &mut stdout, &state.history)
                 {

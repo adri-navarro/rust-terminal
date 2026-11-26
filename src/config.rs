@@ -417,6 +417,8 @@ pub const DEFAULT_USAGE_FONT_SIZE: f32 = 18.0;
 pub const DEFAULT_SHORTCUT_COMMANDS: &str = "Ctrl+P";
 pub const DEFAULT_SHORTCUT_MONITOR: &str = "Ctrl+M";
 pub const DEFAULT_SHORTCUT_USAGE: &str = "Ctrl+U";
+/// "Ctrl" = primary modifier: Cmd on macOS, Ctrl elsewhere.
+pub const DEFAULT_SHORTCUT_HISTORY: &str = "Ctrl+R";
 pub const DEFAULT_DOCKER_FONT_SIZE: f32 = 18.0;
 pub const DEFAULT_SHORTCUT_DOCKER: &str = "Ctrl+D";
 
@@ -431,6 +433,7 @@ pub struct Config {
     pub shortcut_commands: String,
     pub shortcut_monitor: String,
     pub shortcut_usage: String,
+    pub shortcut_history: String,
     pub docker_font_size: f32,
     pub shortcut_docker: String,
     pub font_path: Option<String>,
@@ -459,6 +462,7 @@ impl Default for Config {
             shortcut_commands: DEFAULT_SHORTCUT_COMMANDS.to_string(),
             shortcut_monitor: DEFAULT_SHORTCUT_MONITOR.to_string(),
             shortcut_usage: DEFAULT_SHORTCUT_USAGE.to_string(),
+            shortcut_history: DEFAULT_SHORTCUT_HISTORY.to_string(),
             docker_font_size: DEFAULT_DOCKER_FONT_SIZE,
             shortcut_docker: DEFAULT_SHORTCUT_DOCKER.to_string(),
             font_path: None,
@@ -492,6 +496,11 @@ impl Config {
     pub fn usage_shortcut(&self) -> Shortcut {
         Shortcut::parse(&self.shortcut_usage)
             .unwrap_or_else(|| Shortcut::parse(DEFAULT_SHORTCUT_USAGE).unwrap())
+    }
+
+    pub fn history_shortcut(&self) -> Shortcut {
+        Shortcut::parse(&self.shortcut_history)
+            .unwrap_or_else(|| Shortcut::parse(DEFAULT_SHORTCUT_HISTORY).unwrap())
     }
 
     pub fn docker_shortcut(&self) -> Shortcut {

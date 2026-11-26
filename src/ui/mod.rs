@@ -1,3 +1,4 @@
+pub mod boxdraw;
 pub mod docker_view;
 pub mod font;
 pub mod renderer;
@@ -11,24 +12,26 @@ use crate::ui::docker_view::{DockerFormView, DockerViewState};
 use crate::config::{
     Config, DEFAULT_COMMANDS_FONT_SIZE, DEFAULT_DOCKER_FONT_SIZE, DEFAULT_MONITOR_FONT_SIZE,
     DEFAULT_SHORTCUT_COMMANDS, DEFAULT_SHORTCUT_DOCKER, DEFAULT_SHORTCUT_MONITOR,
-    DEFAULT_SHORTCUT_USAGE, DEFAULT_TERMINAL_FONT_SIZE, DEFAULT_USAGE_FONT_SIZE, Shortcut,
+    DEFAULT_SHORTCUT_HISTORY, DEFAULT_SHORTCUT_USAGE, DEFAULT_TERMINAL_FONT_SIZE, DEFAULT_USAGE_FONT_SIZE, Shortcut,
     ShortcutKey, Theme,
 };
 use crate::history::{FuzzyMatch, HistoryStore};
-use crate::monitor::{ProcessSort, SystemMonitor, SystemSnapshot, send_process_signal, sort_processes};
+use crate::monitor::{ProcessInfo, ProcessSort, filter_process_indices, SystemMonitor, SystemSnapshot, send_process_signal, sort_processes};
 use crate::terminal::TerminalTab;
 use crate::ui::font::{FontEngine, FontPreset, available_font_presets};
 use crate::ui::renderer::{
     CommandFormField, CommandFormView, CommandsViewState, HistoryPaletteView, MonitorViewState,
     SettingsFontTarget, SettingsShortcutTarget, SettingsViewState, TabBarHitZones,
-    TabSummary, UsageViewState, render_frame, top_reserved, viewport_bounds,
+    TabSummary, UsageViewState, UtilButton, render_frame, top_reserved, viewport_bounds,
 };
 use crate::usage::{TimeRange, UsageReport, scan_local_usage};
 use arboard::Clipboard;
 use softbuffer::{Context, Surface};
+#[cfg(target_os = "linux")]
 use std::io::Write;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
+#[cfg(target_os = "linux")]
 use std::process::{Command, Stdio};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -122,6 +125,8 @@ struct MonitorTabState {
     selected: usize,
     scroll: usize,
     last_sample: Option<Instant>,
+    filter: String,
+    visible: Vec<usize>,
 }
 
 impl MonitorTabState {
@@ -134,12 +139,60 @@ impl MonitorTabState {
             selected: 0,
             scroll: 0,
             last_sample: None,
+            filter: String::new(),
+            visible: Vec::new(),
+        }
+    }
+
+    fn recompute_visible(&mut self) {
+        self.visible = match self.snapshot.as_ref() {
+            Some(s) => filter_process_indices(&s.processes, &self.filter),
+            None => Vec::new(),
+        };
+    }
+
+    fn visible_len(&self) -> usize {
+        self.visible.len()
+    }
+
+    fn selected_process(&self) -> Option<&ProcessInfo> {
+        let idx = *self.visible.get(self.selected)?;
+        self.snapshot.as_ref()?.processes.get(idx)
+    }
+
+    fn filter_changed(&mut self) {
+        self.recompute_visible();
+        self.selected = 0;
+        self.scroll = 0;
+    }
+
+    fn push_filter(&mut self, text: &str) {
+        let clean: String = text.chars().filter(|c| !c.is_control()).collect();
+        if clean.is_empty() {
+            return;
+        }
+        self.filter.push_str(&clean);
+        self.filter_changed();
+    }
+
+    fn pop_filter(&mut self) {
+        if self.filter.pop().is_some() {
+            self.filter_changed();
+        }
+    }
+
+    fn clear_filter(&mut self) {
+        if !self.filter.is_empty() {
+            self.filter.clear();
+            self.filter_changed();
         }
     }
 
     fn refresh(&mut self) {
         let snap = self.collector.sample(self.sort);
-        let len = snap.processes.len();
+        self.snapshot = Some(snap);
+        self.recompute_visible();
+        let len = self.visible_len();
         if len == 0 {
             self.selected = 0;
             self.scroll = 0;
@@ -147,7 +200,6 @@ impl MonitorTabState {
             self.selected = self.selected.min(len - 1);
             self.scroll = self.scroll.min(len - 1);
         }
-        self.snapshot = Some(snap);
         self.last_sample = Some(Instant::now());
     }
 
@@ -156,12 +208,13 @@ impl MonitorTabState {
         if let Some(ref mut snap) = self.snapshot {
             sort_processes(&mut snap.processes, sort);
         }
+        self.recompute_visible();
         self.selected = 0;
         self.scroll = 0;
     }
 
     fn move_selection(&mut self, delta: isize) {
-        let len = self.snapshot.as_ref().map(|s| s.processes.len()).unwrap_or(0);
+        let len = self.visible_len();
         if len == 0 {
             return;
         }
@@ -187,7 +240,7 @@ struct SettingsTabState {
 }
 
 impl SettingsTabState {
-    const ROW_COUNT: usize = 11;
+    const ROW_COUNT: usize = 12;
 
     fn new() -> Self {
         Self {
@@ -212,6 +265,30 @@ impl SettingsTabState {
             self.selected = (self.selected + delta as usize).min(Self::ROW_COUNT - 1);
         }
     }
+}
+
+/// Max settings scroll (in 32px steps) for the given content and viewport heights.
+pub(crate) fn settings_max_scroll(content_h: i32, viewport_h: i32) -> usize {
+    ((content_h - viewport_h).max(0) as usize).div_ceil(32)
+}
+
+/// New settings scroll (32px steps) so the row spanning `top..bottom` (content coords) is visible.
+pub(crate) fn settings_scroll_for_selection(
+    top: i32,
+    bottom: i32,
+    scroll: usize,
+    viewport_h: i32,
+    max_scroll: usize,
+) -> usize {
+    let scroll_px = scroll as i32 * 32;
+    let new = if top < scroll_px {
+        (top.max(0) / 32) as usize
+    } else if bottom > scroll_px + viewport_h {
+        ((bottom - viewport_h + 8).max(0) as usize).div_ceil(32)
+    } else {
+        scroll
+    };
+    new.min(max_scroll)
 }
 
 struct UsageTabState {
@@ -365,6 +442,7 @@ struct TerminalApp {
     tabs: Vec<TerminalTab>,
     active_tab: usize,
     hit_zones: TabBarHitZones,
+    hovered_util: Option<UtilButton>,
 
     modifiers: ModifiersState,
     cursor_pos: (f64, f64),
@@ -420,6 +498,7 @@ impl TerminalApp {
             tabs: Vec::new(),
             active_tab: 0,
             hit_zones: TabBarHitZones::empty(),
+            hovered_util: None,
             modifiers: ModifiersState::empty(),
             cursor_pos: (0.0, 0.0),
             selecting: false,
@@ -502,6 +581,21 @@ impl TerminalApp {
     fn show_toast(&mut self, msg: impl Into<String>) {
         self.toast = Some((msg.into(), Instant::now()));
         self.request_redraw();
+    }
+
+    /// Which utility icon button, if any, is under the given pixel position.
+    fn util_button_at(&self, px: f64, py: f64) -> Option<UtilButton> {
+        let z = &self.hit_zones;
+        [
+            (UtilButton::Settings, z.settings_btn),
+            (UtilButton::Usage, z.usage_btn),
+            (UtilButton::Monitor, z.monitor_btn),
+            (UtilButton::Docker, z.docker_btn),
+            (UtilButton::Commands, z.commands_btn),
+        ]
+        .into_iter()
+        .find(|(_, r)| r.is_some_and(|r| r.contains(px, py)))
+        .map(|(b, _)| b)
     }
 
     fn request_redraw(&self) {
@@ -1045,11 +1139,12 @@ impl TerminalApp {
 
     fn assign_shortcut(&mut self, target: SettingsShortcutTarget, sc: Shortcut) {
         // Check for duplicate bindings across the customizable tab shortcuts
-        let others: [(SettingsShortcutTarget, &str, Shortcut); 4] = [
+        let others: [(SettingsShortcutTarget, &str, Shortcut); 5] = [
             (SettingsShortcutTarget::Commands, "Commands", self.cfg.commands_shortcut()),
             (SettingsShortcutTarget::Docker, "Docker", self.cfg.docker_shortcut()),
             (SettingsShortcutTarget::Monitor, "Monitor", self.cfg.monitor_shortcut()),
             (SettingsShortcutTarget::Usage, "Usage", self.cfg.usage_shortcut()),
+            (SettingsShortcutTarget::History, "History Search", self.cfg.history_shortcut()),
         ];
         for (other_t, other_name, other_sc) in others {
             if other_t != target && other_sc == sc {
@@ -1080,11 +1175,35 @@ impl TerminalApp {
                 self.cfg.shortcut_usage = formatted.clone();
                 "Usage"
             }
+            SettingsShortcutTarget::History => {
+                self.cfg.shortcut_history = formatted.clone();
+                "History Search"
+            }
         };
         self.settings.recording_shortcut = None;
         self.settings.error = None;
         let _ = self.cfg.save();
         self.show_toast(format!("{label} shortcut: {}", sc.display()));
+    }
+
+    /// Scroll Settings so the keyboard-selected row is fully visible.
+    fn ensure_settings_selection_visible(&mut self) {
+        let hz = &self.hit_zones;
+        let Some(&(top, bottom)) = hz.settings_row_spans.get(self.settings.selected) else {
+            return;
+        };
+        if self.settings.selected == 0 {
+            self.settings.scroll = 0;
+            return;
+        }
+        let max_scroll = settings_max_scroll(hz.settings_content_h, hz.settings_viewport_h);
+        self.settings.scroll = settings_scroll_for_selection(
+            top,
+            bottom,
+            self.settings.scroll,
+            hz.settings_viewport_h,
+            max_scroll,
+        );
     }
 
     fn reset_shortcut(&mut self, target: SettingsShortcutTarget) {
@@ -1104,6 +1223,10 @@ impl TerminalApp {
             SettingsShortcutTarget::Usage => {
                 self.cfg.shortcut_usage = DEFAULT_SHORTCUT_USAGE.to_string();
                 ("Usage", DEFAULT_SHORTCUT_USAGE)
+            }
+            SettingsShortcutTarget::History => {
+                self.cfg.shortcut_history = DEFAULT_SHORTCUT_HISTORY.to_string();
+                ("History Search", DEFAULT_SHORTCUT_HISTORY)
             }
         };
         self.settings.recording_shortcut = None;
@@ -1125,6 +1248,7 @@ impl TerminalApp {
         self.cfg.shortcut_docker = def.shortcut_docker;
         self.cfg.shortcut_monitor = def.shortcut_monitor;
         self.cfg.shortcut_usage = def.shortcut_usage;
+        self.cfg.shortcut_history = def.shortcut_history;
         self.theme = Theme::by_name(&self.cfg.theme);
         if let Ok(new_font) = FontEngine::new(
             self.cfg.font_path.as_deref(),
@@ -1832,6 +1956,7 @@ impl TerminalApp {
         &mut self,
         key: &Key,
         physical_key: PhysicalKey,
+        text: Option<&str>,
         event_loop: &ActiveEventLoop,
     ) {
         let ctrl = self.modifiers.control_key();
@@ -1841,6 +1966,12 @@ impl TerminalApp {
         if self.try_handle_global_tab_shortcut(key, physical_key) {
             return;
         }
+        // Cmd+Backspace (macOS) clears the filter.
+        if self.super_held() && matches!(key, Key::Named(NamedKey::Backspace)) {
+            self.monitor.clear_filter();
+            self.request_redraw();
+            return;
+        }
         // On macOS, Cmd+<non-character> (Enter, Delete, arrows...) must not trigger plain-key actions.
         if self.super_held() && !matches!(key, Key::Character(_)) {
             return;
@@ -1848,11 +1979,19 @@ impl TerminalApp {
 
         match key {
             Key::Named(NamedKey::Escape) => {
-                self.monitor.open = false;
+                if self.monitor.filter.is_empty() {
+                    self.monitor.open = false;
+                } else {
+                    self.monitor.clear_filter();
+                }
                 self.request_redraw();
             }
             Key::Named(NamedKey::F2) => {
                 self.cycle_theme();
+            }
+            Key::Named(NamedKey::Backspace) => {
+                self.monitor.pop_filter();
+                self.request_redraw();
             }
             Key::Named(NamedKey::ArrowUp) => {
                 self.monitor.move_selection(-1);
@@ -1882,6 +2021,7 @@ impl TerminalApp {
                     }
                 }
             }
+            _ if alt && !ctrl && !self.super_held() && self.try_monitor_alt_shortcut(key, physical_key, shift) => {}
             Key::Character(c) if self.cmd_or_ctrl() && !alt => match c.to_ascii_lowercase().as_str() {
                 "t" => {
                     self.monitor.open = false;
@@ -1897,52 +2037,57 @@ impl TerminalApp {
                 "r" if shift => {
                     self.reload_config();
                 }
-                _ => {}
-            },
-            Key::Character(c) if !ctrl && !alt && !self.super_held() => match c.as_str() {
-                "c" | "C" => {
-                    self.monitor.set_sort(ProcessSort::Cpu);
+                "v" => {
+                    if let Some(clip) = self.get_clipboard_text() {
+                        let line = clip.lines().next().unwrap_or("");
+                        self.monitor.push_filter(line);
+                        self.request_redraw();
+                    }
+                }
+                "u" if ctrl => {
+                    self.monitor.clear_filter();
                     self.request_redraw();
-                }
-                "m" | "M" => {
-                    self.monitor.set_sort(ProcessSort::Memory);
-                    self.request_redraw();
-                }
-                "p" | "P" => {
-                    self.monitor.set_sort(ProcessSort::Pid);
-                    self.request_redraw();
-                }
-                "n" | "N" => {
-                    self.monitor.set_sort(ProcessSort::Name);
-                    self.request_redraw();
-                }
-                "r" | "R" => {
-                    self.monitor.refresh();
-                    self.show_toast("Refreshed system monitor");
-                }
-                "j" => {
-                    self.monitor.move_selection(1);
-                    self.request_redraw();
-                }
-                "k" if !shift => {
-                    self.kill_selected_process(libc::SIGTERM);
-                }
-                "K" => {
-                    self.kill_selected_process(libc::SIGKILL);
                 }
                 _ => {}
             },
+            _ if !ctrl && !alt && !self.super_held() => {
+                if let Some(t) = text {
+                    self.monitor.push_filter(t);
+                    self.request_redraw();
+                }
+            }
             _ => {}
         }
     }
 
+    /// Alt+letter shortcuts of the monitor tab. Returns true when consumed.
+    fn try_monitor_alt_shortcut(&mut self, key: &Key, physical_key: PhysicalKey, shift: bool) -> bool {
+        let is = |c: char, code: KeyCode| matches_shortcut_key(key, physical_key, c, code);
+        if is('c', KeyCode::KeyC) {
+            self.monitor.set_sort(ProcessSort::Cpu);
+            self.request_redraw();
+        } else if is('m', KeyCode::KeyM) {
+            self.monitor.set_sort(ProcessSort::Memory);
+            self.request_redraw();
+        } else if is('p', KeyCode::KeyP) {
+            self.monitor.set_sort(ProcessSort::Pid);
+            self.request_redraw();
+        } else if is('n', KeyCode::KeyN) {
+            self.monitor.set_sort(ProcessSort::Name);
+            self.request_redraw();
+        } else if is('r', KeyCode::KeyR) {
+            self.monitor.refresh();
+            self.show_toast("Refreshed system monitor");
+        } else if is('k', KeyCode::KeyK) {
+            self.kill_selected_process(if shift { libc::SIGKILL } else { libc::SIGTERM });
+        } else {
+            return false;
+        }
+        true
+    }
+
     fn kill_selected_process(&mut self, sig: i32) {
-        let target = self
-            .monitor
-            .snapshot
-            .as_ref()
-            .and_then(|s| s.processes.get(self.monitor.selected))
-            .map(|p| (p.pid, p.name.clone()));
+        let target = self.monitor.selected_process().map(|p| (p.pid, p.name.clone()));
         if let Some((pid, name)) = target {
             let sig_name = if sig == libc::SIGKILL { "SIGKILL" } else { "SIGTERM" };
             match send_process_signal(pid, sig) {
@@ -2129,10 +2274,12 @@ impl TerminalApp {
             }
             Key::Named(NamedKey::ArrowUp) => {
                 self.settings.move_selection(-1);
+                self.ensure_settings_selection_visible();
                 self.request_redraw();
             }
             Key::Named(NamedKey::ArrowDown) => {
                 self.settings.move_selection(1);
+                self.ensure_settings_selection_visible();
                 self.request_redraw();
             }
             Key::Named(NamedKey::ArrowLeft) => {
@@ -2185,6 +2332,11 @@ impl TerminalApp {
                     self.settings.error = None;
                     self.request_redraw();
                 }
+                11 => {
+                    self.settings.recording_shortcut = Some(SettingsShortcutTarget::History);
+                    self.settings.error = None;
+                    self.request_redraw();
+                }
                 _ => {}
             },
             Key::Named(NamedKey::Backspace) | Key::Named(NamedKey::Delete) => {
@@ -2193,6 +2345,7 @@ impl TerminalApp {
                     8 => self.reset_shortcut(SettingsShortcutTarget::Docker),
                     9 => self.reset_shortcut(SettingsShortcutTarget::Monitor),
                     10 => self.reset_shortcut(SettingsShortcutTarget::Usage),
+                    11 => self.reset_shortcut(SettingsShortcutTarget::History),
                     _ => {}
                 }
             }
@@ -2225,10 +2378,12 @@ impl TerminalApp {
             Key::Character(c) if !ctrl && !alt && !self.super_held() => match c.as_str() {
                 "j" => {
                     self.settings.move_selection(1);
+                    self.ensure_settings_selection_visible();
                     self.request_redraw();
                 }
                 "k" => {
                     self.settings.move_selection(-1);
+                    self.ensure_settings_selection_visible();
                     self.request_redraw();
                 }
                 "-" | "_" => match self.settings.selected {
@@ -2379,7 +2534,7 @@ impl TerminalApp {
             return;
         }
 
-        // Ctrl+R -> Open Fuzzy History Palette (unless app is in alternate screen like vim!)
+        // Configurable history shortcut -> Open Fuzzy History Palette (unless app is in alternate screen like vim!)
         let is_alt_screen = self
             .tabs
             .get(self.active_tab)
@@ -2387,14 +2542,12 @@ impl TerminalApp {
             .map(|g| g.is_alt_screen())
             .unwrap_or(false);
 
-        if ctrl && !shift && !alt && !is_alt_screen {
-            if let Key::Character(c) = key {
-                if c.eq_ignore_ascii_case("r") {
-                    self.palette.open(&mut self.history);
-                    self.request_redraw();
-                    return;
-                }
-            }
+        if !is_alt_screen
+            && matches_configured_shortcut(self.cfg.history_shortcut(), key, physical_key, cmd, shift, alt)
+        {
+            self.palette.open(&mut self.history);
+            self.request_redraw();
+            return;
         }
 
         // Cmd+Q -> quit, same path as CloseRequested
@@ -2700,6 +2853,8 @@ impl TerminalApp {
                 sort: self.monitor.sort,
                 selected: self.monitor.selected,
                 scroll: self.monitor.scroll,
+                filter: &self.monitor.filter,
+                visible: &self.monitor.visible,
             })
         } else {
             None
@@ -2792,6 +2947,7 @@ impl TerminalApp {
                 active_commands_count,
                 docker_running,
                 toast_str,
+                self.hovered_util,
             );
         }
 
@@ -3039,7 +3195,7 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
                 } else if self.commands.open {
                     self.handle_commands_key(&event.logical_key, event.physical_key, text, event_loop);
                 } else if self.monitor.open {
-                    self.handle_monitor_key(&event.logical_key, event.physical_key, event_loop);
+                    self.handle_monitor_key(&event.logical_key, event.physical_key, text, event_loop);
                 } else if self.usage.open {
                     self.handle_usage_key(&event.logical_key, event.physical_key, event_loop);
                 } else {
@@ -3048,6 +3204,11 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = (position.x, position.y);
+                let hovered = self.util_button_at(position.x, position.y);
+                if hovered != self.hovered_util {
+                    self.hovered_util = hovered;
+                    self.request_redraw();
+                }
                 if self.selecting && !self.palette.open {
                     if let Some(cell) = self.pixel_to_cell(position.x, position.y) {
                         if let Some(tab) = self.tabs.get_mut(self.active_tab) {
@@ -3059,8 +3220,16 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
                     }
                 }
             }
+            WindowEvent::CursorLeft { .. } => {
+                if self.hovered_util.take().is_some() {
+                    self.request_redraw();
+                }
+            }
             WindowEvent::MouseInput { state, button, .. } => {
                 let (px, py) = self.cursor_pos;
+                if self.hovered_util.take().is_some() {
+                    self.request_redraw();
+                }
                 match (button, state) {
                     (MouseButton::Left, ElementState::Pressed) => {
                         if self.palette.open {
@@ -3420,7 +3589,9 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
                             let proc_rows = self.hit_zones.monitor_proc_rows.clone();
                             for (idx, r) in proc_rows {
                                 if r.contains(px, py) {
-                                    self.monitor.selected = idx;
+                                    if idx < self.monitor.visible_len() {
+                                        self.monitor.selected = idx;
+                                    }
                                     self.request_redraw();
                                     return;
                                 }
@@ -3542,8 +3713,16 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
                         self.settings.scroll = self.settings.scroll.saturating_sub(lines as usize);
                         self.request_redraw();
                     } else if lines < 0 {
-                        self.settings.scroll =
-                            (self.settings.scroll.saturating_add((-lines) as usize)).min(16);
+                        let max_scroll = if self.hit_zones.settings_row_spans.is_empty() {
+                            18
+                        } else {
+                            settings_max_scroll(
+                                self.hit_zones.settings_content_h,
+                                self.hit_zones.settings_viewport_h,
+                            )
+                        };
+                        self.settings.scroll = (self.settings.scroll.saturating_add((-lines) as usize))
+                            .min(max_scroll);
                         self.request_redraw();
                     }
                     return;
@@ -3619,12 +3798,7 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
                         MouseScrollDelta::LineDelta(_, y) => y as isize,
                         MouseScrollDelta::PixelDelta(p) => (p.y / 24.0).round() as isize,
                     };
-                    let max_scroll = self
-                        .monitor
-                        .snapshot
-                        .as_ref()
-                        .map(|s| s.processes.len().saturating_sub(1))
-                        .unwrap_or(0);
+                    let max_scroll = self.monitor.visible_len().saturating_sub(1);
                     if lines > 0 {
                         self.monitor.scroll = self.monitor.scroll.saturating_sub(lines as usize);
                         self.request_redraw();
@@ -3654,6 +3828,32 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
                     MouseScrollDelta::PixelDelta(p) => (p.y / 14.0).round() as isize,
                 };
                 if lines != 0 {
+                    let tracking = self.tabs.get(self.active_tab).and_then(|tab| {
+                        tab.grid
+                            .lock()
+                            .ok()
+                            .and_then(|g| g.mouse_tracking().then_some(g.mouse_sgr))
+                    });
+                    if let Some(sgr) = tracking {
+                        let (row, col) = self
+                            .pixel_to_cell(self.cursor_pos.0, self.cursor_pos.1)
+                            .unwrap_or((0, 0));
+                        let report = encode_mouse_wheel(
+                            lines > 0,
+                            col,
+                            row,
+                            self.modifiers.shift_key(),
+                            self.modifiers.alt_key(),
+                            self.modifiers.control_key(),
+                            sgr,
+                        );
+                        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                            for _ in 0..lines.unsigned_abs().min(10) {
+                                tab.write_bytes(&report);
+                            }
+                        }
+                        return;
+                    }
                     if let Some(tab) = self.tabs.get(self.active_tab) {
                         if let Ok(mut g) = tab.grid.lock() {
                             g.scroll_view(lines);
@@ -3908,6 +4108,34 @@ pub(crate) fn matches_configured_shortcut(
                 false
             }
         }
+    }
+}
+
+/// Encode one mouse wheel report (xterm). `col`/`row` are 0-based cells.
+pub(crate) fn encode_mouse_wheel(
+    up: bool,
+    col: usize,
+    row: usize,
+    shift: bool,
+    alt: bool,
+    ctrl: bool,
+    sgr: bool,
+) -> Vec<u8> {
+    let mut b: usize = if up { 64 } else { 65 };
+    if shift {
+        b += 4;
+    }
+    if alt {
+        b += 8;
+    }
+    if ctrl {
+        b += 16;
+    }
+    if sgr {
+        format!("\x1b[<{};{};{}M", b, col + 1, row + 1).into_bytes()
+    } else {
+        let clamp = |v: usize| (32 + v).min(255) as u8;
+        vec![0x1b, b'[', b'M', clamp(b), clamp(col + 1), clamp(row + 1)]
     }
 }
 

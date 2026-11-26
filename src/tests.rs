@@ -3,7 +3,7 @@ use crate::config::{Config, Rgb, Theme};
 use crate::history::{HistoryStore, fuzzy_score};
 use crate::shell::clamp_ghost;
 use crate::shell::parser::{LogicalOp, parse_command_line};
-use crate::terminal::grid::{ColorSpec, FLAG_BOLD, FLAG_ITALIC, TerminalGrid};
+use crate::terminal::grid::{ColorSpec, FLAG_BOLD, FLAG_DIM, FLAG_ITALIC, FLAG_UNDERLINE, TerminalGrid};
 use crate::usage::{
     ScanCache, TimeRange, format_cost, format_tokens, parse_iso8601, scan_usage_from_home,
     scan_usage_from_home_cached,
@@ -528,6 +528,33 @@ fn test_settings_config_font_sizes_and_custom_shortcuts() {
     assert_eq!(decoded.monitor_shortcut().format(), "Alt+M");
     assert_eq!(decoded.usage_shortcut().format(), "F8");
 
+    // History palette shortcut
+    assert_eq!(def.history_shortcut().format(), "Ctrl+R");
+    let legacy_hist: Config = toml::from_str("theme = \"tokyo-night\"\n").unwrap();
+    assert_eq!(legacy_hist.shortcut_history, "Ctrl+R");
+    let mut hist = Config::default();
+    hist.shortcut_history = "Alt+R".to_string();
+    let hist_dec: Config = toml::from_str(&toml::to_string_pretty(&hist).unwrap()).unwrap();
+    assert_eq!(hist_dec.history_shortcut().format(), "Alt+R");
+    hist.shortcut_history = "R".to_string();
+    assert_eq!(hist.history_shortcut().format(), "Ctrl+R");
+    assert!(matches_configured_shortcut(
+        def.history_shortcut(),
+        &Key::Character("r".into()),
+        PhysicalKey::Code(KeyCode::KeyR),
+        true,
+        false,
+        false
+    ));
+    assert!(!matches_configured_shortcut(
+        def.history_shortcut(),
+        &Key::Character("r".into()),
+        PhysicalKey::Code(KeyCode::KeyR),
+        false,
+        false,
+        false
+    ));
+
     // Shortcut parsing & validation
     assert_eq!(
         Shortcut::parse("ctrl+shift+p"),
@@ -749,4 +776,149 @@ fn test_font_presets_and_default_discovery() {
         let engine = FontEngine::new(None, 18.0, 1.25).expect("default font should load");
         assert_eq!(engine.active_path, presets[0].regular);
     }
+}
+
+#[test]
+fn test_mouse_tracking_modes_tracked_separately() {
+    let mut grid = TerminalGrid::new(40, 10, 100);
+    let mut parser = vte::Parser::new();
+    assert!(!grid.mouse_tracking());
+    parser.advance(&mut grid, b"\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h");
+    assert!(grid.mouse_tracking());
+    assert!(grid.mouse_sgr);
+    assert!(grid.is_alt_screen());
+    parser.advance(&mut grid, b"\x1b[?1003l");
+    assert!(grid.mouse_tracking());
+    parser.advance(&mut grid, b"\x1b[?1000l\x1b[?1002l\x1b[?1006l");
+    assert!(!grid.mouse_tracking());
+    assert!(!grid.mouse_sgr);
+}
+
+#[test]
+fn test_encode_mouse_wheel() {
+    use crate::ui::encode_mouse_wheel;
+    assert_eq!(
+        encode_mouse_wheel(true, 4, 9, false, false, false, true),
+        b"\x1b[<64;5;10M".to_vec()
+    );
+    assert_eq!(
+        encode_mouse_wheel(false, 0, 0, false, false, true, true),
+        b"\x1b[<81;1;1M".to_vec()
+    );
+    assert_eq!(
+        encode_mouse_wheel(true, 0, 0, false, false, false, false),
+        vec![0x1b, b'[', b'M', 96, 33, 33]
+    );
+    assert_eq!(encode_mouse_wheel(true, 300, 0, false, false, false, false)[4], 255);
+}
+
+#[test]
+fn test_embedded_icon_font_has_all_icon_glyphs() {
+    use crate::ui::font::{ICON_FONT_BYTES, icon};
+    use ab_glyph::{Font, FontRef};
+    let font = FontRef::try_from_slice(ICON_FONT_BYTES).expect("embedded icon font should parse");
+    for ch in [icon::COMMANDS, icon::DOCKER, icon::MONITOR, icon::USAGE, icon::SETTINGS] {
+        assert_ne!(font.glyph_id(ch).0, 0, "missing icon glyph U+{:04X}", ch as u32);
+    }
+}
+
+#[test]
+fn test_icon_rasterizes_to_visible_bitmap() {
+    use crate::ui::font::{FontEngine, icon};
+    let mut engine = FontEngine::new(None, 18.0, 1.25).expect("default font should load");
+    let g = engine.rasterize_icon(icon::DOCKER, 18.0);
+    assert!(g.metrics.width > 8 && g.metrics.height > 8);
+    assert!(g.bitmap.iter().any(|&c| c > 0));
+}
+
+#[test]
+fn test_badge_label_caps_at_nine_plus() {
+    use crate::ui::renderer::badge_label;
+    assert_eq!(badge_label(1), "1");
+    assert_eq!(badge_label(9), "9");
+    assert_eq!(badge_label(10), "9+");
+    assert_eq!(badge_label(250), "9+");
+}
+
+#[test]
+fn test_settings_scroll_math() {
+    use crate::ui::{settings_max_scroll, settings_scroll_for_selection as f};
+    // visible -> unchanged
+    assert_eq!(f(100, 140, 2, 400, 10), 2);
+    // below viewport -> bottom fits
+    // ceil((640 - 400 + 8) / 32) = ceil(248 / 32) = 8
+    assert_eq!(f(600, 640, 0, 400, 20), 8);
+    // top exactly at scroll boundary stays unchanged
+    assert_eq!(f(64, 100, 2, 400, 20), 2);
+    // bottom exactly at viewport edge stays unchanged
+    assert_eq!(f(300, 432, 1, 400, 20), 1);
+    // above -> scrolls up
+    assert_eq!(f(64, 100, 5, 400, 20), 2);
+    // clamped
+    assert_eq!(f(600, 640, 0, 400, 3), 3);
+    // content shorter than viewport
+    assert_eq!(settings_max_scroll(300, 400), 0);
+    assert_eq!(settings_max_scroll(433, 400), 2);
+}
+
+fn mk_proc(pid: i32, name: &str) -> crate::monitor::ProcessInfo {
+    crate::monitor::ProcessInfo {
+        pid,
+        name: name.to_string(),
+        state: 'S',
+        cpu_pct: 0.0,
+        mem_bytes: 0,
+        mem_pct: 0.0,
+        threads: 1,
+    }
+}
+
+#[test]
+fn test_filter_process_indices() {
+    use crate::monitor::filter_process_indices;
+    let procs = vec![
+        mk_proc(100, "Firefox"),
+        mk_proc(2001, "bash"),
+        mk_proc(310, "firewalld"),
+        mk_proc(42, "zsh"),
+    ];
+    assert_eq!(filter_process_indices(&procs, ""), vec![0, 1, 2, 3]);
+    assert_eq!(filter_process_indices(&procs, "   "), vec![0, 1, 2, 3]);
+    assert_eq!(filter_process_indices(&procs, "FIRE"), vec![0, 2]);
+    assert_eq!(filter_process_indices(&procs, " bash "), vec![1]);
+    assert_eq!(filter_process_indices(&procs, "10"), vec![0, 2]);
+    assert_eq!(filter_process_indices(&procs, "42"), vec![3]);
+    assert_eq!(filter_process_indices(&procs, "0"), vec![0, 1, 2]);
+    assert!(filter_process_indices(&procs, "nomatch").is_empty());
+    assert!(filter_process_indices(&procs, "9999").is_empty());
+}
+
+#[test]
+fn test_csi_prefixed_sequences_are_ignored() {
+    // modifyOtherKeys enable/reset must not apply SGR 4/2
+    let mut grid = TerminalGrid::new(40, 10, 100);
+    let mut parser = vte::Parser::new();
+    parser.advance(&mut grid, b"\x1b[>4;2mAB\x1b[>4m");
+    for c in 0..2 {
+        assert_eq!(grid.cells[0][c].flags & (FLAG_UNDERLINE | FLAG_DIM), 0);
+    }
+
+    // kitty keyboard push/pop must not restore the saved cursor
+    let mut grid = TerminalGrid::new(40, 10, 100);
+    let mut parser = vte::Parser::new();
+    parser.advance(&mut grid, b"\x1b[4;6H\x1b[>1u\x1b[>5u\x1b[<uY");
+    assert_eq!(grid.cells[3][5].ch, 'Y');
+}
+
+#[test]
+fn test_csi_plain_sgr_underline_and_cursor_restore_still_work() {
+    let mut grid = TerminalGrid::new(40, 10, 100);
+    let mut parser = vte::Parser::new();
+    parser.advance(&mut grid, b"\x1b[4mU\x1b[24m");
+    assert_ne!(grid.cells[0][0].flags & FLAG_UNDERLINE, 0);
+
+    let mut grid = TerminalGrid::new(40, 10, 100);
+    let mut parser = vte::Parser::new();
+    parser.advance(&mut grid, b"\x1b[2;3H\x1b[s\x1b[5;5H\x1b[uZ");
+    assert_eq!(grid.cells[1][2].ch, 'Z');
 }

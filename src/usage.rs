@@ -326,6 +326,7 @@ pub fn scan_local_usage() -> UsageReport {
     scan_usage_from_home_inner(&home, true, &mut cache)
 }
 
+#[cfg(test)]
 pub fn scan_usage_from_home(home: &Path) -> UsageReport {
     scan_usage_from_home_inner(home, false, &mut ScanCache::default())
 }

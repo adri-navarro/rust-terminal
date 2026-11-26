@@ -3,6 +3,19 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Arc;
+
+/// Embedded Lucide icon subset (ISC licence, see assets/icons/LICENSE-lucide.txt).
+pub const ICON_FONT_BYTES: &[u8] = include_bytes!("../../assets/icons/lucide-subset.ttf");
+
+/// Codepoints of the glyphs in the embedded icon font.
+pub mod icon {
+    pub const COMMANDS: char = '\u{E20A}';
+    pub const DOCKER: char = '\u{E4D5}';
+    pub const MONITOR: char = '\u{E038}';
+    pub const USAGE: char = '\u{E1BF}';
+    pub const SETTINGS: char = '\u{E154}';
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FontStyle {
@@ -36,6 +49,12 @@ pub struct FontPreset {
     pub bold_italic: Option<PathBuf>,
 }
 
+struct FallbackFont {
+    path: PathBuf,
+    font: Option<FontVec>,
+    tried: bool,
+}
+
 pub struct FontEngine {
     regular: FontVec,
     bold: Option<FontVec>,
@@ -50,6 +69,9 @@ pub struct FontEngine {
     italic_loaded: bool,
     bold_italic_loaded: bool,
 
+    // Glyph fallback chain, loaded lazily on first miss
+    fallbacks: Vec<FallbackFont>,
+
     pub active_path: PathBuf,
     pub size: f32,
     pub cell_w: usize,
@@ -57,15 +79,24 @@ pub struct FontEngine {
     pub baseline: i32,
 
     cache: HashMap<(char, FontStyle, u32), CachedGlyph>,
+    // Procedural cell-filling glyphs keyed by (char, cell_w, cell_h)
+    builtin_cache: HashMap<(char, usize, usize), Option<Arc<Vec<u8>>>>,
+
+    icons: FontVec,
+    icon_cache: HashMap<(char, u32), CachedGlyph>,
 }
 
 impl FontEngine {
     pub fn new(custom_path: Option<&str>, size: f32, line_height: f32) -> Result<Self, String> {
-        let (reg_path, bold_path, italic_path, bold_italic_path) = discover_font_paths(custom_path)?;
+        let (reg_path, bold_path, italic_path, bold_italic_path) =
+            discover_font_paths(custom_path)?;
         let reg_bytes = fs::read(&reg_path)
             .map_err(|e| format!("failed to read font {}: {e}", reg_path.display()))?;
         let regular = FontVec::try_from_vec(reg_bytes)
             .map_err(|e| format!("invalid font {}: {e}", reg_path.display()))?;
+
+        let icons = FontVec::try_from_vec(ICON_FONT_BYTES.to_vec())
+            .map_err(|e| format!("invalid embedded icon font: {e}"))?;
 
         let mut engine = Self {
             regular,
@@ -78,12 +109,23 @@ impl FontEngine {
             bold_loaded: false,
             italic_loaded: false,
             bold_italic_loaded: false,
+            fallbacks: fallback_font_paths(&reg_path)
+                .into_iter()
+                .map(|path| FallbackFont {
+                    path,
+                    font: None,
+                    tried: false,
+                })
+                .collect(),
             active_path: reg_path,
             size,
             cell_w: 9,
             cell_h: 18,
             baseline: 14,
             cache: HashMap::with_capacity(256),
+            builtin_cache: HashMap::new(),
+            icons,
+            icon_cache: HashMap::new(),
         };
         engine.set_size(size, line_height);
         Ok(engine)
@@ -106,6 +148,20 @@ impl FontEngine {
         self.cell_h = cell_h;
         self.baseline = baseline;
         self.cache.clear();
+        self.builtin_cache.clear();
+    }
+
+    /// Cell-sized coverage bitmap for block-element / box-drawing characters,
+    /// built once per (char, cell size) and cached.
+    pub fn builtin_glyph(&mut self, ch: char) -> Option<Arc<Vec<u8>>> {
+        if !('\u{2500}'..='\u{259F}').contains(&ch) {
+            return None;
+        }
+        let (w, h) = (self.cell_w, self.cell_h);
+        self.builtin_cache
+            .entry((ch, w, h))
+            .or_insert_with(|| crate::ui::boxdraw::builtin_glyph(ch, w, h).map(Arc::new))
+            .clone()
     }
 
     fn ensure_style_loaded(&mut self, style: FontStyle) {
@@ -139,6 +195,22 @@ impl FontEngine {
         }
     }
 
+    /// First fallback font (loaded lazily) that has a real glyph for `ch`.
+    fn find_fallback(&mut self, ch: char) -> Option<usize> {
+        for (i, fb) in self.fallbacks.iter_mut().enumerate() {
+            if !fb.tried {
+                fb.tried = true;
+                fb.font = fs::read(&fb.path)
+                    .ok()
+                    .and_then(|b| FontVec::try_from_vec_and_index(b, 0).ok());
+            }
+            if fb.font.as_ref().is_some_and(|f| f.glyph_id(ch).0 != 0) {
+                return Some(i);
+            }
+        }
+        None
+    }
+
     pub fn rasterize(&mut self, ch: char, style: FontStyle, px_size: f32) -> &CachedGlyph {
         let size_key = (px_size * 10.0).round() as u32;
         let key = (ch, style, size_key);
@@ -158,10 +230,47 @@ impl FontEngine {
                     .or(self.bold.as_ref())
                     .unwrap_or(&self.regular),
             };
-            let glyph = rasterize_ab_glyph(font, ch, px_size);
+            let missing = font.glyph_id(ch).0 == 0
+                && self.regular.glyph_id(ch).0 == 0
+                && !ch.is_control()
+                && ch != ' ';
+            let fb = if missing {
+                self.find_fallback(ch)
+            } else {
+                None
+            };
+            let glyph = match fb {
+                Some(idx) => {
+                    let fb_font = self.fallbacks[idx].font.as_ref().unwrap();
+                    rasterize_fallback_glyph(&self.regular, fb_font, ch, px_size)
+                }
+                None => {
+                    let font = match style {
+                        FontStyle::Regular => &self.regular,
+                        FontStyle::Bold => self.bold.as_ref().unwrap_or(&self.regular),
+                        FontStyle::Italic => self.italic.as_ref().unwrap_or(&self.regular),
+                        FontStyle::BoldItalic => self
+                            .bold_italic
+                            .as_ref()
+                            .or(self.bold.as_ref())
+                            .unwrap_or(&self.regular),
+                    };
+                    rasterize_ab_glyph(font, ch, px_size)
+                }
+            };
             self.cache.insert(key, glyph);
         }
         &self.cache[&key]
+    }
+
+    /// Rasterizes a glyph from the embedded icon font.
+    pub fn rasterize_icon(&mut self, ch: char, px_size: f32) -> &CachedGlyph {
+        let key = (ch, (px_size * 10.0).round() as u32);
+        if !self.icon_cache.contains_key(&key) {
+            let glyph = rasterize_ab_glyph(&self.icons, ch, px_size);
+            self.icon_cache.insert(key, glyph);
+        }
+        &self.icon_cache[&key]
     }
 
     pub fn measure_text(&mut self, text: &str, px_size: f32) -> i32 {
@@ -221,6 +330,76 @@ fn rasterize_ab_glyph(font: &FontVec, ch: char, px_size: f32) -> CachedGlyph {
             bitmap: Vec::new(),
         }
     }
+}
+
+/// Rasterize a glyph from a fallback font, scaled down if needed so it fits
+/// the primary font's cell, and centred horizontally within that cell.
+fn rasterize_fallback_glyph(
+    primary: &FontVec,
+    fallback: &FontVec,
+    ch: char,
+    px_size: f32,
+) -> CachedGlyph {
+    let cell_adv = primary
+        .as_scaled(PxScale::from(px_size))
+        .h_advance(primary.glyph_id('M'));
+    let mut glyph = rasterize_ab_glyph(fallback, ch, px_size);
+    let natural = glyph.metrics.advance_width.max(glyph.metrics.width as f32);
+    if cell_adv > 0.0 && natural > cell_adv {
+        glyph = rasterize_ab_glyph(fallback, ch, px_size * cell_adv / natural);
+    }
+    // The ceil'd bitmap can still be a pixel wider than the cell; shrink a bit
+    // more so it never spills into the neighbour.
+    let limit = cell_adv.round().max(1.0);
+    let mut size = px_size
+        * if natural > cell_adv {
+            cell_adv / natural
+        } else {
+            1.0
+        };
+    for _ in 0..4 {
+        if cell_adv <= 0.0 || glyph.metrics.width as f32 <= limit {
+            break;
+        }
+        size *= limit / glyph.metrics.width as f32 * 0.98;
+        glyph = rasterize_ab_glyph(fallback, ch, size);
+    }
+    if glyph.metrics.width > 0 {
+        glyph.metrics.xmin =
+            (((cell_adv - glyph.metrics.width as f32) / 2.0).round() as i32).max(0);
+    }
+    glyph.metrics.advance_width = cell_adv;
+    glyph
+}
+
+/// Ordered glyph-fallback font files that exist on this system, excluding
+/// `primary`.
+fn fallback_font_paths(primary: &std::path::Path) -> Vec<PathBuf> {
+    let candidates: &[&str] = if cfg!(target_os = "macos") {
+        &[
+            "/System/Library/Fonts/Menlo.ttc",
+            "/System/Library/Fonts/Apple Symbols.ttf",
+            "/System/Library/Fonts/Supplemental/STIXTwoMath.otf",
+            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        ]
+    } else {
+        &[
+            "/usr/share/fonts/TTF/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf",
+            "/usr/share/fonts/noto/NotoSansSymbols-Regular.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSansSymbols-Regular.ttf",
+            "/usr/share/fonts/noto/NotoSansMath-Regular.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSansMath-Regular.ttf",
+            "/usr/share/fonts/TTF/SymbolsNerdFont-Regular.ttf",
+        ]
+    };
+    candidates
+        .iter()
+        .map(PathBuf::from)
+        .filter(|p| p.is_file() && p != primary)
+        .collect()
 }
 
 pub fn available_font_presets() -> Vec<FontPreset> {
@@ -486,5 +665,68 @@ mod tests {
         }
         let (reg, _, _, _) = discover_font_paths(None).expect("font discovered");
         assert!(reg.is_file());
+    }
+
+    #[test]
+    fn fallback_paths_exist_and_skip_primary() {
+        let primary = PathBuf::from("/System/Library/Fonts/Menlo.ttc");
+        let paths = fallback_font_paths(&primary);
+        assert!(paths.iter().all(|p| p.is_file() && *p != primary));
+        assert!(
+            fallback_font_paths(&PathBuf::from("/nonexistent"))
+                .iter()
+                .all(|p| p.is_file())
+        );
+    }
+
+    const MONACO: &str = "/System/Library/Fonts/Monaco.ttf";
+
+    #[test]
+    fn missing_icons_fall_back_and_fit_one_cell() {
+        if !PathBuf::from(MONACO).is_file() {
+            return;
+        }
+        let mut engine = FontEngine::new(Some(MONACO), 16.0, 1.25).expect("engine");
+        let cell = engine
+            .rasterize('M', FontStyle::Regular, 16.0)
+            .metrics
+            .advance_width;
+        for ch in ['✻', '⏵', '⎿', '●', '✓', '╭', '❯', '⏺', '⧉'] {
+            let tofu = rasterize_ab_glyph(&engine.regular, ch, 16.0);
+            let g = engine.rasterize(ch, FontStyle::Regular, 16.0).clone();
+            let m = g.metrics;
+            if engine.regular.glyph_id(ch).0 == 0 {
+                assert!(
+                    g.bitmap != tofu.bitmap || m.width != tofu.metrics.width,
+                    "{ch} still renders as the primary .notdef"
+                );
+            }
+            assert!(m.width > 0 && m.height > 0, "{ch} rendered blank: {m:?}");
+            assert!(m.xmin >= 0, "{ch} spills left: {m:?}");
+            assert!(
+                m.xmin + m.width as i32 <= m.advance_width.ceil() as i32,
+                "{ch} spills right: {m:?}"
+            );
+            assert!(
+                (m.advance_width - cell).abs() < 0.01,
+                "{ch} advance {} != cell {cell}",
+                m.advance_width
+            );
+        }
+    }
+
+    #[test]
+    fn primary_glyphs_are_unchanged() {
+        if !PathBuf::from(MONACO).is_file() {
+            return;
+        }
+        let mut engine = FontEngine::new(Some(MONACO), 16.0, 1.25).expect("engine");
+        let direct = rasterize_ab_glyph(&engine.regular, 'A', 16.0);
+        let got = engine.rasterize('A', FontStyle::Regular, 16.0).clone();
+        assert_eq!(got.metrics.width, direct.metrics.width);
+        assert_eq!(got.metrics.height, direct.metrics.height);
+        assert_eq!(got.metrics.xmin, direct.metrics.xmin);
+        assert_eq!(got.metrics.advance_width, direct.metrics.advance_width);
+        assert_eq!(got.bitmap, direct.bitmap);
     }
 }
