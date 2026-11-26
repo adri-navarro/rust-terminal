@@ -70,11 +70,137 @@ enum CommandFormMode {
 
 struct CommandFormState {
     mode: CommandFormMode,
-    name_input: String,
-    command_input: String,
-    directory_input: String,
+    name_input: TextInput,
+    command_input: TextInput,
+    directory_input: TextInput,
     active_field: CommandFormField,
     error: Option<String>,
+}
+
+impl CommandFormState {
+    fn active_input_mut(&mut self) -> &mut TextInput {
+        match self.active_field {
+            CommandFormField::Name => &mut self.name_input,
+            CommandFormField::Command => &mut self.command_input,
+            CommandFormField::Directory => &mut self.directory_input,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TextInputOutcome {
+    Unhandled,
+    CursorMoved,
+    Edited,
+}
+
+/// Applies standard single-line cursor movement and editing keys to `input`.
+pub(crate) fn apply_text_input_key(
+    input: &mut TextInput,
+    key: &Key,
+    text: Option<&str>,
+    ctrl: bool,
+    alt: bool,
+    super_held: bool,
+) -> TextInputOutcome {
+    match key {
+        Key::Named(NamedKey::ArrowLeft) => {
+            if super_held {
+                input.move_home();
+            } else if ctrl || alt {
+                input.move_word_left();
+            } else {
+                input.move_left();
+            }
+            TextInputOutcome::CursorMoved
+        }
+        Key::Named(NamedKey::ArrowRight) => {
+            if super_held {
+                input.move_end();
+            } else if ctrl || alt {
+                input.move_word_right();
+            } else {
+                input.move_right();
+            }
+            TextInputOutcome::CursorMoved
+        }
+        Key::Named(NamedKey::Home) => {
+            input.move_home();
+            TextInputOutcome::CursorMoved
+        }
+        Key::Named(NamedKey::End) => {
+            input.move_end();
+            TextInputOutcome::CursorMoved
+        }
+        Key::Named(NamedKey::Backspace) => {
+            let changed = if super_held {
+                input.clear()
+            } else if ctrl || alt {
+                input.delete_word_back()
+            } else {
+                input.backspace()
+            };
+            if changed {
+                TextInputOutcome::Edited
+            } else {
+                TextInputOutcome::CursorMoved
+            }
+        }
+        Key::Named(NamedKey::Delete) => {
+            if input.delete() {
+                TextInputOutcome::Edited
+            } else {
+                TextInputOutcome::CursorMoved
+            }
+        }
+        Key::Named(NamedKey::Space) if !ctrl && !alt && !super_held => {
+            input.insert_char(' ');
+            TextInputOutcome::Edited
+        }
+        Key::Character(c) if ctrl && !alt => match c.to_ascii_lowercase().as_str() {
+            "u" => {
+                let changed = input.delete_to_start() || input.clear();
+                if changed {
+                    TextInputOutcome::Edited
+                } else {
+                    TextInputOutcome::CursorMoved
+                }
+            }
+            "k" => {
+                if input.delete_to_end() {
+                    TextInputOutcome::Edited
+                } else {
+                    TextInputOutcome::CursorMoved
+                }
+            }
+            "w" => {
+                if input.delete_word_back() {
+                    TextInputOutcome::Edited
+                } else {
+                    TextInputOutcome::CursorMoved
+                }
+            }
+            "a" => {
+                input.move_home();
+                TextInputOutcome::CursorMoved
+            }
+            "e" => {
+                input.move_end();
+                TextInputOutcome::CursorMoved
+            }
+            _ => TextInputOutcome::Unhandled,
+        },
+        _ => {
+            if !ctrl && !alt && !super_held {
+                if let Some(t) = text {
+                    if input.insert_filtered(t) {
+                        return TextInputOutcome::Edited;
+                    }
+                }
+            }
+            TextInputOutcome::Unhandled
+        }
+    }
 }
 
 struct CommandsTabState {
@@ -800,12 +926,11 @@ impl TerminalApp {
         if self.commands.open {
             if let Some(ref mut form) = self.commands.form {
                 let clean = text.replace(['\r', '\n'], " ");
-                match form.active_field {
-                    CommandFormField::Name => form.name_input.push_str(&clean),
-                    CommandFormField::Command => form.command_input.push_str(&clean),
-                    CommandFormField::Directory => form.directory_input.push_str(&clean),
+                if form.active_input_mut().insert_filtered(&clean) {
+                    form.error = None;
                 }
-                form.error = None;
+                self.last_input = Instant::now();
+                self.cursor_blink_on = true;
                 self.request_redraw();
             }
             return;
@@ -1600,9 +1725,9 @@ impl TerminalApp {
             .unwrap_or_else(|| "~".to_string());
         self.commands.form = Some(CommandFormState {
             mode: CommandFormMode::Add,
-            name_input: String::new(),
-            command_input: String::new(),
-            directory_input: default_dir,
+            name_input: TextInput::new(),
+            command_input: TextInput::new(),
+            directory_input: TextInput::from_string(default_dir),
             active_field: CommandFormField::Command,
             error: None,
         });
@@ -1615,9 +1740,9 @@ impl TerminalApp {
         if let Some(entry) = self.commands.manager.find_by_id(id) {
             self.commands.form = Some(CommandFormState {
                 mode: CommandFormMode::Edit(id),
-                name_input: entry.name.clone(),
-                command_input: entry.command.clone(),
-                directory_input: entry.directory.clone(),
+                name_input: TextInput::from_string(entry.name.clone()),
+                command_input: TextInput::from_string(entry.command.clone()),
+                directory_input: TextInput::from_string(entry.directory.clone()),
                 active_field: CommandFormField::Command,
                 error: None,
             });
@@ -1631,9 +1756,9 @@ impl TerminalApp {
         let Some(ref mut form) = self.commands.form else {
             return;
         };
-        let name = form.name_input.trim().to_string();
-        let cmd = form.command_input.trim().to_string();
-        let dir = form.directory_input.trim().to_string();
+        let name = form.name_input.as_str().trim().to_string();
+        let cmd = form.command_input.as_str().trim().to_string();
+        let dir = form.directory_input.as_str().trim().to_string();
         if cmd.is_empty() {
             form.error = Some("Command cannot be empty.".to_string());
             form.active_field = CommandFormField::Command;
@@ -1759,13 +1884,25 @@ impl TerminalApp {
                 Key::Named(NamedKey::Tab)
                 | Key::Named(NamedKey::ArrowUp)
                 | Key::Named(NamedKey::ArrowDown) => {
+                    let backwards = matches!(key, Key::Named(NamedKey::ArrowUp))
+                        || (matches!(key, Key::Named(NamedKey::Tab)) && shift);
                     if let Some(ref mut form) = self.commands.form {
-                        form.active_field = match form.active_field {
-                            CommandFormField::Name => CommandFormField::Command,
-                            CommandFormField::Command => CommandFormField::Directory,
-                            CommandFormField::Directory => CommandFormField::Name,
+                        form.active_field = if backwards {
+                            match form.active_field {
+                                CommandFormField::Name => CommandFormField::Directory,
+                                CommandFormField::Command => CommandFormField::Name,
+                                CommandFormField::Directory => CommandFormField::Command,
+                            }
+                        } else {
+                            match form.active_field {
+                                CommandFormField::Name => CommandFormField::Command,
+                                CommandFormField::Command => CommandFormField::Directory,
+                                CommandFormField::Directory => CommandFormField::Name,
+                            }
                         };
                     }
+                    self.last_input = Instant::now();
+                    self.cursor_blink_on = true;
                     self.request_redraw();
                 }
                 Key::Named(NamedKey::Enter) => {
@@ -1777,70 +1914,35 @@ impl TerminalApp {
                         .unwrap_or(false);
                     self.submit_command_form(is_add);
                 }
-                Key::Named(NamedKey::Backspace) => {
-                    if let Some(ref mut form) = self.commands.form {
-                        match form.active_field {
-                            CommandFormField::Name => {
-                                form.name_input.pop();
-                            }
-                            CommandFormField::Command => {
-                                form.command_input.pop();
-                            }
-                            CommandFormField::Directory => {
-                                form.directory_input.pop();
-                            }
-                        }
-                        form.error = None;
-                    }
-                    self.last_input = Instant::now();
-                    self.cursor_blink_on = true;
-                    self.request_redraw();
-                }
-                Key::Named(NamedKey::Space) => {
-                    if let Some(ref mut form) = self.commands.form {
-                        match form.active_field {
-                            CommandFormField::Name => form.name_input.push(' '),
-                            CommandFormField::Command => form.command_input.push(' '),
-                            CommandFormField::Directory => form.directory_input.push(' '),
-                        }
-                        form.error = None;
-                    }
-                    self.last_input = Instant::now();
-                    self.cursor_blink_on = true;
-                    self.request_redraw();
-                }
-                _ if self.cmd_or_ctrl() && !alt && matches_shortcut_key(key, physical_key, 'v', KeyCode::KeyV) => {
+                _ if self.cmd_or_ctrl()
+                    && !alt
+                    && matches_shortcut_key(key, physical_key, 'v', KeyCode::KeyV) =>
+                {
                     self.paste_clipboard();
                 }
-                Key::Character(c) if ctrl && c.eq_ignore_ascii_case("u") => {
-                    if let Some(ref mut form) = self.commands.form {
-                        match form.active_field {
-                            CommandFormField::Name => form.name_input.clear(),
-                            CommandFormField::Command => form.command_input.clear(),
-                            CommandFormField::Directory => form.directory_input.clear(),
-                        }
-                        form.error = None;
-                    }
-                    self.request_redraw();
-                }
                 _ => {
-                    if !ctrl && !alt && !self.super_held() {
-                        if let Some(t) = text {
-                            let filtered: String = t.chars().filter(|c| !c.is_control()).collect();
-                            if !filtered.is_empty() {
-                                if let Some(ref mut form) = self.commands.form {
-                                    match form.active_field {
-                                        CommandFormField::Name => form.name_input.push_str(&filtered),
-                                        CommandFormField::Command => form.command_input.push_str(&filtered),
-                                        CommandFormField::Directory => form.directory_input.push_str(&filtered),
-                                    }
-                                    form.error = None;
-                                }
-                                self.last_input = Instant::now();
-                                self.cursor_blink_on = true;
-                                self.request_redraw();
+                    let super_held = self.super_held();
+                    let outcome = self.commands.form.as_mut().map_or(
+                        TextInputOutcome::Unhandled,
+                        |form| {
+                            let res = apply_text_input_key(
+                                form.active_input_mut(),
+                                key,
+                                text,
+                                ctrl,
+                                alt,
+                                super_held,
+                            );
+                            if res == TextInputOutcome::Edited {
+                                form.error = None;
                             }
-                        }
+                            res
+                        },
+                    );
+                    if outcome != TextInputOutcome::Unhandled {
+                        self.last_input = Instant::now();
+                        self.cursor_blink_on = true;
+                        self.request_redraw();
                     }
                 }
             }
@@ -2000,159 +2102,35 @@ impl TerminalApp {
                 Key::Named(NamedKey::Enter) => {
                     self.submit_docker_form();
                 }
-                Key::Named(NamedKey::ArrowLeft) => {
-                    if let Some(ref mut form) = self.docker.form {
-                        if ctrl || alt {
-                            form.dir_input.move_word_left();
-                        } else {
-                            form.dir_input.move_left();
-                        }
-                    }
-                    self.last_input = Instant::now();
-                    self.cursor_blink_on = true;
-                    self.request_redraw();
-                }
-                Key::Named(NamedKey::ArrowRight) => {
-                    if let Some(ref mut form) = self.docker.form {
-                        if ctrl || alt {
-                            form.dir_input.move_word_right();
-                        } else {
-                            form.dir_input.move_right();
-                        }
-                    }
-                    self.last_input = Instant::now();
-                    self.cursor_blink_on = true;
-                    self.request_redraw();
-                }
-                Key::Named(NamedKey::Home) => {
-                    if let Some(ref mut form) = self.docker.form {
-                        form.dir_input.move_home();
-                    }
-                    self.last_input = Instant::now();
-                    self.cursor_blink_on = true;
-                    self.request_redraw();
-                }
-                Key::Named(NamedKey::End) => {
-                    if let Some(ref mut form) = self.docker.form {
-                        form.dir_input.move_end();
-                    }
-                    self.last_input = Instant::now();
-                    self.cursor_blink_on = true;
-                    self.request_redraw();
-                }
-                Key::Named(NamedKey::Backspace) => {
-                    let super_held = self.super_held();
-                    if let Some(ref mut form) = self.docker.form {
-                        let changed = if super_held {
-                            form.dir_input.clear()
-                        } else if ctrl || alt {
-                            form.dir_input.delete_word_back()
-                        } else {
-                            form.dir_input.backspace()
-                        };
-                        if changed {
-                            form.error = None;
-                        }
-                    }
-                    self.last_input = Instant::now();
-                    self.cursor_blink_on = true;
-                    self.request_redraw();
-                }
-                Key::Named(NamedKey::Delete) => {
-                    if let Some(ref mut form) = self.docker.form {
-                        if form.dir_input.delete() {
-                            form.error = None;
-                        }
-                    }
-                    self.last_input = Instant::now();
-                    self.cursor_blink_on = true;
-                    self.request_redraw();
-                }
-                Key::Named(NamedKey::Space) => {
-                    if let Some(ref mut form) = self.docker.form {
-                        form.dir_input.insert_char(' ');
-                        form.error = None;
-                    }
-                    self.last_input = Instant::now();
-                    self.cursor_blink_on = true;
-                    self.request_redraw();
-                }
                 _ if self.cmd_or_ctrl()
                     && !alt
                     && matches_shortcut_key(key, physical_key, 'v', KeyCode::KeyV) =>
                 {
                     self.paste_clipboard();
                 }
-                Key::Character(c) if ctrl && !alt => match c.to_ascii_lowercase().as_str() {
-                    "u" => {
-                        if let Some(ref mut form) = self.docker.form {
-                            if !form.dir_input.delete_to_start() {
-                                form.dir_input.clear();
-                            }
-                            form.error = None;
-                        }
-                        self.last_input = Instant::now();
-                        self.cursor_blink_on = true;
-                        self.request_redraw();
-                    }
-                    "k" => {
-                        if let Some(ref mut form) = self.docker.form {
-                            if form.dir_input.delete_to_end() {
-                                form.error = None;
-                            }
-                        }
-                        self.last_input = Instant::now();
-                        self.cursor_blink_on = true;
-                        self.request_redraw();
-                    }
-                    "w" => {
-                        if let Some(ref mut form) = self.docker.form {
-                            if form.dir_input.delete_word_back() {
-                                form.error = None;
-                            }
-                        }
-                        self.last_input = Instant::now();
-                        self.cursor_blink_on = true;
-                        self.request_redraw();
-                    }
-                    "a" => {
-                        if let Some(ref mut form) = self.docker.form {
-                            form.dir_input.move_home();
-                        }
-                        self.last_input = Instant::now();
-                        self.cursor_blink_on = true;
-                        self.request_redraw();
-                    }
-                    "e" => {
-                        if let Some(ref mut form) = self.docker.form {
-                            form.dir_input.move_end();
-                        }
-                        self.last_input = Instant::now();
-                        self.cursor_blink_on = true;
-                        self.request_redraw();
-                    }
-                    _ => {}
-                },
                 _ => {
-                    if !ctrl && !alt && !self.super_held() {
-                        if let Some(t) = text {
-                            let inserted = self
-                                .docker
-                                .form
-                                .as_mut()
-                                .is_some_and(|form| {
-                                    let changed = form.dir_input.insert_filtered(t);
-                                    if changed {
-                                        form.error = None;
-                                    }
-                                    changed
-                                });
-                            if inserted {
-                                self.last_input = Instant::now();
-                                self.cursor_blink_on = true;
-                                self.request_redraw();
+                    let super_held = self.super_held();
+                    let outcome = self.docker.form.as_mut().map_or(
+                        TextInputOutcome::Unhandled,
+                        |form| {
+                            let res = apply_text_input_key(
+                                &mut form.dir_input,
+                                key,
+                                text,
+                                ctrl,
+                                alt,
+                                super_held,
+                            );
+                            if res == TextInputOutcome::Edited {
+                                form.error = None;
                             }
-                        }
+                            res
+                        },
+                    );
+                    if outcome != TextInputOutcome::Unhandled {
+                        self.last_input = Instant::now();
+                        self.cursor_blink_on = true;
+                        self.request_redraw();
                     }
                 }
             }
@@ -3324,9 +3302,12 @@ impl TerminalApp {
                 log_scroll: self.commands.log_scroll,
                 form: self.commands.form.as_ref().map(|f| CommandFormView {
                     is_edit: matches!(f.mode, CommandFormMode::Edit(_)),
-                    name_input: &f.name_input,
-                    command_input: &f.command_input,
-                    directory_input: &f.directory_input,
+                    name_input: f.name_input.as_str(),
+                    name_cursor: f.name_input.cursor(),
+                    command_input: f.command_input.as_str(),
+                    command_cursor: f.command_input.cursor(),
+                    directory_input: f.directory_input.as_str(),
+                    directory_cursor: f.directory_input.cursor(),
                     active_field: f.active_field,
                     error: f.error.as_deref(),
                 }),
@@ -4082,6 +4063,8 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
                                         if let Some(ref mut f) = self.commands.form {
                                             f.active_field = CommandFormField::Name;
                                         }
+                                        self.last_input = Instant::now();
+                                        self.cursor_blink_on = true;
                                         self.request_redraw();
                                         return;
                                     }
@@ -4091,6 +4074,8 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
                                         if let Some(ref mut f) = self.commands.form {
                                             f.active_field = CommandFormField::Command;
                                         }
+                                        self.last_input = Instant::now();
+                                        self.cursor_blink_on = true;
                                         self.request_redraw();
                                         return;
                                     }
@@ -4100,6 +4085,8 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
                                         if let Some(ref mut f) = self.commands.form {
                                             f.active_field = CommandFormField::Directory;
                                         }
+                                        self.last_input = Instant::now();
+                                        self.cursor_blink_on = true;
                                         self.request_redraw();
                                         return;
                                     }

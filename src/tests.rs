@@ -1048,3 +1048,67 @@ fn command_names_persist_and_fallback() {
 
     let _ = std::fs::remove_file(&tmp);
 }
+
+#[test]
+fn apply_text_input_key_moves_cursor_and_edits_in_place() {
+    use crate::ui::{TextInputOutcome, apply_text_input_key};
+    use crate::ui::text_input::TextInput;
+    use winit::keyboard::{Key, NamedKey};
+
+    let mut inp = TextInput::from_string("cargo run".to_string());
+
+    // Move left by word, insert flag at cursor
+    assert_eq!(
+        apply_text_input_key(&mut inp, &Key::Named(NamedKey::ArrowLeft), None, false, true, false),
+        TextInputOutcome::CursorMoved
+    );
+    assert_eq!(
+        apply_text_input_key(&mut inp, &Key::Character("--release".into()), Some("--release"), false, false, false),
+        TextInputOutcome::Edited
+    );
+    assert_eq!(
+        apply_text_input_key(&mut inp, &Key::Named(NamedKey::Space), Some(" "), false, false, false),
+        TextInputOutcome::Edited
+    );
+    assert_eq!(inp.as_str(), "cargo --release run");
+
+    // Jump home via Cmd+Left (super) and delete forward
+    assert_eq!(
+        apply_text_input_key(&mut inp, &Key::Named(NamedKey::ArrowLeft), None, false, false, true),
+        TextInputOutcome::CursorMoved
+    );
+    assert_eq!(inp.cursor(), 0);
+    assert_eq!(
+        apply_text_input_key(&mut inp, &Key::Named(NamedKey::Delete), None, false, false, false),
+        TextInputOutcome::Edited
+    );
+    assert_eq!(inp.as_str(), "argo --release run");
+
+    // Ctrl+E to end, ArrowLeft once, Backspace removes 'u'
+    assert_eq!(
+        apply_text_input_key(&mut inp, &Key::Character("e".into()), None, true, false, false),
+        TextInputOutcome::CursorMoved
+    );
+    assert_eq!(inp.cursor(), inp.as_str().len());
+    assert_eq!(
+        apply_text_input_key(&mut inp, &Key::Named(NamedKey::ArrowLeft), None, false, false, false),
+        TextInputOutcome::CursorMoved
+    );
+    assert_eq!(
+        apply_text_input_key(&mut inp, &Key::Named(NamedKey::Backspace), None, false, false, false),
+        TextInputOutcome::Edited
+    );
+    assert_eq!(inp.as_str(), "argo --release rn");
+
+    // Ctrl+K deletes to end, Ctrl+U deletes to start
+    assert_eq!(
+        apply_text_input_key(&mut inp, &Key::Character("k".into()), None, true, false, false),
+        TextInputOutcome::Edited
+    );
+    assert_eq!(inp.as_str(), "argo --release r");
+    assert_eq!(
+        apply_text_input_key(&mut inp, &Key::Character("u".into()), None, true, false, false),
+        TextInputOutcome::Edited
+    );
+    assert_eq!(inp.as_str(), "");
+}

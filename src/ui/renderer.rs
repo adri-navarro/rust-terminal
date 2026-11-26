@@ -294,8 +294,11 @@ pub enum CommandFormField {
 pub struct CommandFormView<'a> {
     pub is_edit: bool,
     pub name_input: &'a str,
+    pub name_cursor: usize,
     pub command_input: &'a str,
+    pub command_cursor: usize,
     pub directory_input: &'a str,
+    pub directory_cursor: usize,
     pub active_field: CommandFormField,
     pub error: Option<&'a str>,
 }
@@ -3095,204 +3098,134 @@ fn render_commands_view(
         let field_y = cur_y + sc(60);
         let field_h = sc(42).max(28);
 
-        // Name input
-        canvas.draw_text_clipped(
-            font,
-            "Name",
-            FontStyle::Bold,
-            fs(17.0),
-            inner_x,
-            field_y - 8,
-            inner_x + name_fw,
-            if form.active_field == CommandFormField::Name {
-                theme.accent
+        let draw_form_field = |canvas: &mut Canvas<'_>,
+                                   font: &mut FontEngine,
+                                   label: &str,
+                                   placeholder: &str,
+                                   text: &str,
+                                   cursor: usize,
+                                   rect: Rect,
+                                   focused: bool| {
+            canvas.draw_text_clipped(
+                font,
+                label,
+                FontStyle::Bold,
+                fs(17.0),
+                rect.x,
+                rect.y - 8,
+                rect.x + rect.w,
+                if focused { theme.accent } else { theme.fg_muted },
+            );
+            canvas.fill_rounded_rect(rect.x, rect.y, rect.w, rect.h, 6, theme.bg, 255);
+            canvas.stroke_rounded_rect(
+                rect.x,
+                rect.y,
+                rect.w,
+                rect.h,
+                6,
+                if focused { theme.accent } else { theme.border },
+                255,
+            );
+            let text_base = rect.y + sc(28).max(18);
+            if text.is_empty() && !focused {
+                canvas.draw_text_clipped(
+                    font,
+                    placeholder,
+                    FontStyle::Italic,
+                    fs(18.5),
+                    rect.x + 10,
+                    text_base,
+                    rect.x + rect.w - 10,
+                    theme.fg_muted,
+                );
             } else {
-                theme.fg_muted
-            },
-        );
+                let max_text_w = (rect.w - 24).max(1);
+                let (shown, cursor_px) = crate::ui::text_input::visible_slice_for_cursor(
+                    text,
+                    cursor,
+                    font,
+                    fs(18.5),
+                    max_text_w,
+                );
+                canvas.draw_text_clipped(
+                    font,
+                    shown,
+                    FontStyle::Regular,
+                    fs(18.5),
+                    rect.x + 10,
+                    text_base,
+                    rect.x + rect.w - 10,
+                    theme.fg,
+                );
+                if focused && cv.cursor_blink_on {
+                    canvas.fill_rect(
+                        (rect.x + 10 + cursor_px).min(rect.x + rect.w - 6),
+                        rect.y + 7,
+                        2,
+                        (field_h - 14).max(12),
+                        theme.accent,
+                    );
+                }
+            }
+        };
+
+        // Name input
         let name_field_rect = Rect {
             x: inner_x,
             y: field_y,
             w: name_fw,
             h: field_h,
         };
-        let name_focused = form.active_field == CommandFormField::Name;
-        canvas.fill_rounded_rect(name_field_rect.x, name_field_rect.y, name_field_rect.w, name_field_rect.h, 6, theme.bg, 255);
-        canvas.stroke_rounded_rect(
-            name_field_rect.x,
-            name_field_rect.y,
-            name_field_rect.w,
-            name_field_rect.h,
-            6,
-            if name_focused { theme.accent } else { theme.border },
-            255,
+        draw_form_field(
+            canvas,
+            font,
+            "Name",
+            "optional",
+            form.name_input,
+            form.name_cursor,
+            name_field_rect,
+            form.active_field == CommandFormField::Name,
         );
-        if form.name_input.is_empty() && !name_focused {
-            canvas.draw_text_clipped(
-                font,
-                "optional",
-                FontStyle::Italic,
-                fs(18.5),
-                name_field_rect.x + 10,
-                name_field_rect.y + sc(28).max(18),
-                name_field_rect.x + name_field_rect.w - 10,
-                theme.fg_muted,
-            );
-        } else {
-            let end_x = canvas.draw_text_clipped(
-                font,
-                form.name_input,
-                FontStyle::Regular,
-                fs(18.5),
-                name_field_rect.x + 10,
-                name_field_rect.y + sc(28).max(18),
-                name_field_rect.x + name_field_rect.w - 12,
-                theme.fg,
-            );
-            if name_focused && cv.cursor_blink_on {
-                canvas.fill_rect(
-                    (end_x + 1).min(name_field_rect.x + name_field_rect.w - 6),
-                    name_field_rect.y + 7,
-                    2,
-                    (field_h - 14).max(12),
-                    theme.accent,
-                );
-            }
-        }
         hit_zones.cmd_form_name_field = Some(name_field_rect);
 
         // Command input
         let cmd_x = inner_x + name_fw + gap;
-        canvas.draw_text_clipped(
-            font,
-            "Command",
-            FontStyle::Bold,
-            fs(17.0),
-            cmd_x,
-            field_y - 8,
-            cmd_x + cmd_fw,
-            if form.active_field == CommandFormField::Command {
-                theme.accent
-            } else {
-                theme.fg_muted
-            },
-        );
         let cmd_field_rect = Rect {
             x: cmd_x,
             y: field_y,
             w: cmd_fw,
             h: field_h,
         };
-        let cmd_focused = form.active_field == CommandFormField::Command;
-        canvas.fill_rounded_rect(cmd_field_rect.x, cmd_field_rect.y, cmd_field_rect.w, cmd_field_rect.h, 6, theme.bg, 255);
-        canvas.stroke_rounded_rect(
-            cmd_field_rect.x,
-            cmd_field_rect.y,
-            cmd_field_rect.w,
-            cmd_field_rect.h,
-            6,
-            if cmd_focused { theme.accent } else { theme.border },
-            255,
+        draw_form_field(
+            canvas,
+            font,
+            "Command",
+            "e.g. docker-compose up -d",
+            form.command_input,
+            form.command_cursor,
+            cmd_field_rect,
+            form.active_field == CommandFormField::Command,
         );
-        if form.command_input.is_empty() && !cmd_focused {
-            canvas.draw_text_clipped(
-                font,
-                "e.g. docker-compose up -d",
-                FontStyle::Italic,
-                fs(18.5),
-                cmd_field_rect.x + 10,
-                cmd_field_rect.y + sc(28).max(18),
-                cmd_field_rect.x + cmd_field_rect.w - 10,
-                theme.fg_muted,
-            );
-        } else {
-            let end_x = canvas.draw_text_clipped(
-                font,
-                form.command_input,
-                FontStyle::Regular,
-                fs(18.5),
-                cmd_field_rect.x + 10,
-                cmd_field_rect.y + sc(28).max(18),
-                cmd_field_rect.x + cmd_field_rect.w - 12,
-                theme.fg,
-            );
-            if cmd_focused && cv.cursor_blink_on {
-                canvas.fill_rect(
-                    (end_x + 1).min(cmd_field_rect.x + cmd_field_rect.w - 6),
-                    cmd_field_rect.y + 7,
-                    2,
-                    (field_h - 14).max(12),
-                    theme.accent,
-                );
-            }
-        }
         hit_zones.cmd_form_cmd_field = Some(cmd_field_rect);
 
         // Directory input
         let dir_x = cmd_x + cmd_fw + gap;
-        canvas.draw_text_clipped(
-            font,
-            "Working Directory",
-            FontStyle::Bold,
-            fs(17.0),
-            dir_x,
-            field_y - 8,
-            dir_x + dir_fw,
-            if form.active_field == CommandFormField::Directory {
-                theme.accent
-            } else {
-                theme.fg_muted
-            },
-        );
         let dir_field_rect = Rect {
             x: dir_x,
             y: field_y,
             w: dir_fw,
             h: field_h,
         };
-        let dir_focused = form.active_field == CommandFormField::Directory;
-        canvas.fill_rounded_rect(dir_field_rect.x, dir_field_rect.y, dir_field_rect.w, dir_field_rect.h, 6, theme.bg, 255);
-        canvas.stroke_rounded_rect(
-            dir_field_rect.x,
-            dir_field_rect.y,
-            dir_field_rect.w,
-            dir_field_rect.h,
-            6,
-            if dir_focused { theme.accent } else { theme.border },
-            255,
+        draw_form_field(
+            canvas,
+            font,
+            "Working Directory",
+            "e.g. ~/projects/my-app",
+            form.directory_input,
+            form.directory_cursor,
+            dir_field_rect,
+            form.active_field == CommandFormField::Directory,
         );
-        if form.directory_input.is_empty() && !dir_focused {
-            canvas.draw_text_clipped(
-                font,
-                "e.g. ~/projects/my-app",
-                FontStyle::Italic,
-                fs(18.5),
-                dir_field_rect.x + 10,
-                dir_field_rect.y + sc(28).max(18),
-                dir_field_rect.x + dir_field_rect.w - 10,
-                theme.fg_muted,
-            );
-        } else {
-            let end_x = canvas.draw_text_clipped(
-                font,
-                form.directory_input,
-                FontStyle::Regular,
-                fs(18.5),
-                dir_field_rect.x + 10,
-                dir_field_rect.y + sc(28).max(18),
-                dir_field_rect.x + dir_field_rect.w - 12,
-                theme.fg,
-            );
-            if dir_focused && cv.cursor_blink_on {
-                canvas.fill_rect(
-                    (end_x + 1).min(dir_field_rect.x + dir_field_rect.w - 6),
-                    dir_field_rect.y + 7,
-                    2,
-                    (field_h - 14).max(12),
-                    theme.accent,
-                );
-            }
-        }
         hit_zones.cmd_form_dir_field = Some(dir_field_rect);
 
         // Error message if any
