@@ -15,6 +15,7 @@ use crate::ui::renderer::{
 pub struct DockerFormView<'a> {
     pub is_edit: bool,
     pub dir_input: &'a str,
+    pub dir_cursor: usize,
     /// Compose file detected in the typed directory (None = not found / not a dir)
     pub detected_file: Option<&'a str>,
     pub dir_exists: bool,
@@ -235,15 +236,16 @@ pub fn render_docker_view(
         canvas.fill_rounded_rect(field.x, field.y, field.w, field.h, 6, theme.bg, 255);
         canvas.stroke_rounded_rect(field.x, field.y, field.w, field.h, 6, theme.accent, 255);
         let text_base = field.y + sc(28).max(18);
-        // Keep the end of long paths visible
-        let max_text_w = field.w - 24;
-        let mut shown: &str = form.dir_input;
-        while !shown.is_empty() && font.measure_text(shown, fs(18.5)) > max_text_w {
-            let mut it = shown.char_indices();
-            it.next();
-            shown = it.next().map(|(i, _)| &shown[i..]).unwrap_or("");
-        }
-        let end_x = canvas.draw_text_clipped(
+        // Keep the cursor visible inside long paths
+        let max_text_w = (field.w - 24).max(1);
+        let (shown, cursor_px) = crate::ui::text_input::visible_slice_for_cursor(
+            form.dir_input,
+            form.dir_cursor,
+            font,
+            fs(18.5),
+            max_text_w,
+        );
+        canvas.draw_text_clipped(
             font,
             shown,
             FontStyle::Regular,
@@ -255,7 +257,7 @@ pub fn render_docker_view(
         );
         if dv.cursor_blink_on {
             canvas.fill_rect(
-                (end_x + 1).min(field.x + field.w - 6),
+                (field.x + 10 + cursor_px).min(field.x + field.w - 6),
                 field.y + 7,
                 2,
                 (field_h - 14).max(12),

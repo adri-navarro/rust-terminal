@@ -322,6 +322,7 @@ pub struct MonitorViewState<'a> {
     pub selected: usize,
     pub scroll: usize,
     pub filter: &'a str,
+    pub filter_cursor: usize,
     pub visible: &'a [usize],
 }
 
@@ -2683,19 +2684,17 @@ fn render_monitor_view(
         let text_base = pill_y + pill_h - sc(8).max(5);
         let text_max = pill_x + pill_w - 8;
         if has_filter {
-            // Show the tail of the query when it is wider than the pill.
-            let mut shown: &str = mv.filter;
+            // Keep the cursor visible when the query is wider than the pill.
             let avail = (text_max - text_x - 6).max(1);
-            while font.measure_text(shown, fs(17.0)) > avail {
-                let mut it = shown.chars();
-                if it.next().is_none() {
-                    break;
-                }
-                shown = it.as_str();
-            }
-            let tw = font.measure_text(shown, fs(17.0));
+            let (shown, cursor_px) = crate::ui::text_input::visible_slice_for_cursor(
+                mv.filter,
+                mv.filter_cursor,
+                font,
+                fs(17.0),
+                avail,
+            );
             canvas.draw_text_clipped(font, shown, FontStyle::Regular, fs(17.0), text_x, text_base, text_max, theme.fg);
-            let caret_x = (text_x + tw + 2).min(text_max - 2);
+            let caret_x = (text_x + cursor_px).min(text_max - 2);
             canvas.fill_rect(caret_x, pill_y + 5, 2, (pill_h - 10).max(4), theme.accent);
         } else {
             canvas.draw_text_clipped(

@@ -195,7 +195,7 @@ impl FontEngine {
         }
     }
 
-    /// First fallback font (loaded lazily) that has a real glyph for `ch`.
+    /// First fallback font (loaded lazily) that has a real outline glyph for `ch`.
     fn find_fallback(&mut self, ch: char) -> Option<usize> {
         for (i, fb) in self.fallbacks.iter_mut().enumerate() {
             if !fb.tried {
@@ -204,8 +204,25 @@ impl FontEngine {
                     .ok()
                     .and_then(|b| FontVec::try_from_vec_and_index(b, 0).ok());
             }
-            if fb.font.as_ref().is_some_and(|f| f.glyph_id(ch).0 != 0) {
+            if fb.font.as_ref().is_some_and(|f| font_has_outline(f, ch)) {
                 return Some(i);
+            }
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(path) = fc_match_for_char(ch) {
+            if path != self.active_path && !self.fallbacks.iter().any(|fb| fb.path == path) {
+                let font = fs::read(&path)
+                    .ok()
+                    .and_then(|b| FontVec::try_from_vec_and_index(b, 0).ok());
+                let matched = font.as_ref().is_some_and(|f| font_has_outline(f, ch));
+                self.fallbacks.push(FallbackFont {
+                    path,
+                    font,
+                    tried: true,
+                });
+                if matched {
+                    return Some(self.fallbacks.len() - 1);
+                }
             }
         }
         None
@@ -230,10 +247,9 @@ impl FontEngine {
                     .or(self.bold.as_ref())
                     .unwrap_or(&self.regular),
             };
-            let missing = font.glyph_id(ch).0 == 0
-                && self.regular.glyph_id(ch).0 == 0
-                && !ch.is_control()
-                && ch != ' ';
+            let style_has = font.glyph_id(ch).0 != 0;
+            let regular_has = self.regular.glyph_id(ch).0 != 0;
+            let missing = !style_has && !regular_has && !ch.is_control() && ch != ' ';
             let fb = if missing {
                 self.find_fallback(ch)
             } else {
@@ -245,15 +261,19 @@ impl FontEngine {
                     rasterize_fallback_glyph(&self.regular, fb_font, ch, px_size)
                 }
                 None => {
-                    let font = match style {
-                        FontStyle::Regular => &self.regular,
-                        FontStyle::Bold => self.bold.as_ref().unwrap_or(&self.regular),
-                        FontStyle::Italic => self.italic.as_ref().unwrap_or(&self.regular),
-                        FontStyle::BoldItalic => self
-                            .bold_italic
-                            .as_ref()
-                            .or(self.bold.as_ref())
-                            .unwrap_or(&self.regular),
+                    let font = if style_has {
+                        match style {
+                            FontStyle::Regular => &self.regular,
+                            FontStyle::Bold => self.bold.as_ref().unwrap_or(&self.regular),
+                            FontStyle::Italic => self.italic.as_ref().unwrap_or(&self.regular),
+                            FontStyle::BoldItalic => self
+                                .bold_italic
+                                .as_ref()
+                                .or(self.bold.as_ref())
+                                .unwrap_or(&self.regular),
+                        }
+                    } else {
+                        &self.regular
                     };
                     rasterize_ab_glyph(font, ch, px_size)
                 }
@@ -274,12 +294,13 @@ impl FontEngine {
     }
 
     pub fn measure_text(&mut self, text: &str, px_size: f32) -> i32 {
-        let mut w = 0.0f32;
+        let mut w = 0i32;
         for ch in text.chars() {
+            let ch = if ch == '\0' { ' ' } else { ch };
             let g = self.rasterize(ch, FontStyle::Regular, px_size);
-            w += g.metrics.advance_width;
+            w += g.metrics.advance_width.round() as i32;
         }
-        w.ceil() as i32
+        w
     }
 }
 
@@ -372,6 +393,29 @@ fn rasterize_fallback_glyph(
     glyph
 }
 
+fn font_has_outline(font: &FontVec, ch: char) -> bool {
+    let id = font.glyph_id(ch);
+    if id.0 == 0 {
+        return false;
+    }
+    font.outline_glyph(id.with_scale_and_position(PxScale::from(16.0), point(0.0, 0.0)))
+        .is_some()
+}
+
+#[cfg(target_os = "linux")]
+fn fc_match_for_char(ch: char) -> Option<PathBuf> {
+    let pattern = format!(":charset={:x}:color=false", ch as u32);
+    let out = Command::new("fc-match")
+        .args(["-f", "%{file}", &pattern])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    path.is_file().then_some(path)
+}
+
 /// Ordered glyph-fallback font files that exist on this system, excluding
 /// `primary`.
 fn fallback_font_paths(primary: &std::path::Path) -> Vec<PathBuf> {
@@ -384,6 +428,7 @@ fn fallback_font_paths(primary: &std::path::Path) -> Vec<PathBuf> {
         ]
     } else {
         &[
+            "/usr/share/fonts/Adwaita/AdwaitaMono-Regular.ttf",
             "/usr/share/fonts/TTF/DejaVuSans.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
             "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf",
@@ -392,7 +437,14 @@ fn fallback_font_paths(primary: &std::path::Path) -> Vec<PathBuf> {
             "/usr/share/fonts/truetype/noto/NotoSansSymbols-Regular.ttf",
             "/usr/share/fonts/noto/NotoSansMath-Regular.ttf",
             "/usr/share/fonts/truetype/noto/NotoSansMath-Regular.ttf",
+            "/usr/share/fonts/gnu-free/FreeMono.otf",
+            "/usr/share/fonts/gnu-free/FreeSans.otf",
+            "/usr/share/fonts/gnu-free/FreeSerif.otf",
+            "/usr/share/fonts/opentype/freefont/FreeMono.otf",
+            "/usr/share/fonts/truetype/freefont/FreeMono.ttf",
             "/usr/share/fonts/TTF/SymbolsNerdFont-Regular.ttf",
+            "/usr/share/fonts/TTF/Symbola.ttf",
+            "/usr/share/fonts/truetype/ancient-scripts/Symbola_hint.ttf",
         ]
     };
     candidates
@@ -728,5 +780,82 @@ mod tests {
         assert_eq!(got.metrics.xmin, direct.metrics.xmin);
         assert_eq!(got.metrics.advance_width, direct.metrics.advance_width);
         assert_eq!(got.bitmap, direct.bitmap);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    use super::*;
+
+    #[test]
+    fn missing_claude_icons_fall_back_and_fit_one_cell_on_linux() {
+        let primary = [
+            "/usr/share/fonts/TTF/JetBrainsMonoNerdFontMono-Medium.ttf",
+            "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf",
+            "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        ]
+        .into_iter()
+        .find(|p| PathBuf::from(p).is_file());
+        let Some(primary) = primary else {
+            return;
+        };
+        let mut engine = FontEngine::new(Some(primary), 16.0, 1.25).expect("engine");
+        let cell = engine
+            .rasterize('M', FontStyle::Regular, 16.0)
+            .metrics
+            .advance_width;
+        for ch in ['✻', '⏵', '⎿', '●', '✓', '╭', '❯', '⏺', '⧉'] {
+            let tofu = rasterize_ab_glyph(&engine.regular, ch, 16.0);
+            let g = engine.rasterize(ch, FontStyle::Regular, 16.0).clone();
+            let m = g.metrics;
+            if engine.regular.glyph_id(ch).0 == 0 {
+                assert!(
+                    g.bitmap != tofu.bitmap || m.width != tofu.metrics.width,
+                    "{ch} (U+{:04X}) still renders as primary .notdef",
+                    ch as u32
+                );
+                assert!(m.xmin >= 0, "{ch} spills left: {m:?}");
+                assert!(
+                    m.xmin + m.width as i32 <= m.advance_width.ceil() as i32,
+                    "{ch} spills right: {m:?}"
+                );
+            }
+            assert!(m.width > 0 && m.height > 0, "{ch} rendered blank: {m:?}");
+            assert!(
+                (m.advance_width - cell).abs() < 0.01,
+                "{ch} advance {} != cell {cell}",
+                m.advance_width
+            );
+        }
+    }
+
+    #[test]
+    fn measure_text_matches_draw_text_clipped_advance() {
+        let Ok(mut engine) = FontEngine::new(None, 16.0, 1.25) else {
+            return;
+        };
+        let mut buf = vec![0u32; 800 * 60];
+        let mut canvas = crate::ui::renderer::Canvas::new(&mut buf, 800, 60);
+        let sample = "/home/adri/personal-projects/itsadri-terminal";
+        for size in [13.5f32, 15.0, 17.0, 18.5, 19.3, 21.0] {
+            let measured = engine.measure_text(sample, size);
+            let start_x = 10;
+            let end_x = canvas.draw_text_clipped(
+                &mut engine,
+                sample,
+                FontStyle::Regular,
+                size,
+                start_x,
+                30,
+                800,
+                crate::config::Rgb { r: 255, g: 255, b: 255 },
+            );
+            assert_eq!(
+                measured,
+                end_x - start_x,
+                "measure_text drifted from draw_text_clipped at size {size}"
+            );
+        }
     }
 }

@@ -2,8 +2,10 @@ pub mod boxdraw;
 pub mod docker_view;
 pub mod font;
 pub mod renderer;
+pub mod text_input;
 
 use crate::commands::{CommandEvent, CommandManager, CommandStatus, expand_directory};
+use crate::ui::text_input::TextInput;
 use crate::docker::{
     CONTAINER_JOB_ID, ComposeAction, ComposeStatus, DockerEvent, DockerManager, MAX_LOG_LINES,
     RunningContainer, complete_directory, find_compose_file, project_rebuild_args, reselect,
@@ -134,7 +136,7 @@ struct MonitorTabState {
     selected: usize,
     scroll: usize,
     last_sample: Option<Instant>,
-    filter: String,
+    filter: TextInput,
     visible: Vec<usize>,
 }
 
@@ -148,14 +150,14 @@ impl MonitorTabState {
             selected: 0,
             scroll: 0,
             last_sample: None,
-            filter: String::new(),
+            filter: TextInput::new(),
             visible: Vec::new(),
         }
     }
 
     fn recompute_visible(&mut self) {
         self.visible = match self.snapshot.as_ref() {
-            Some(s) => filter_process_indices(&s.processes, &self.filter),
+            Some(s) => filter_process_indices(&s.processes, self.filter.as_str()),
             None => Vec::new(),
         };
     }
@@ -176,23 +178,34 @@ impl MonitorTabState {
     }
 
     fn push_filter(&mut self, text: &str) {
-        let clean: String = text.chars().filter(|c| !c.is_control()).collect();
-        if clean.is_empty() {
-            return;
+        if self.filter.insert_filtered(text) {
+            self.filter_changed();
         }
-        self.filter.push_str(&clean);
-        self.filter_changed();
     }
 
     fn pop_filter(&mut self) {
-        if self.filter.pop().is_some() {
+        if self.filter.backspace() {
+            self.filter_changed();
+        }
+    }
+
+    fn delete_filter(&mut self) -> bool {
+        if self.filter.delete() {
+            self.filter_changed();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn delete_word_back_filter(&mut self) {
+        if self.filter.delete_word_back() {
             self.filter_changed();
         }
     }
 
     fn clear_filter(&mut self) {
-        if !self.filter.is_empty() {
-            self.filter.clear();
+        if self.filter.clear() {
             self.filter_changed();
         }
     }
@@ -330,7 +343,7 @@ enum DockerFormMode {
 
 struct DockerFormState {
     mode: DockerFormMode,
-    dir_input: String,
+    dir_input: TextInput,
     error: Option<String>,
 }
 
@@ -800,8 +813,11 @@ impl TerminalApp {
         if self.docker.open {
             if let Some(ref mut form) = self.docker.form {
                 let clean = text.replace(['\r', '\n'], "");
-                form.dir_input.push_str(&clean);
-                form.error = None;
+                if form.dir_input.insert_filtered(&clean) {
+                    form.error = None;
+                }
+                self.last_input = Instant::now();
+                self.cursor_blink_on = true;
                 self.request_redraw();
             }
             return;
@@ -1169,7 +1185,7 @@ impl TerminalApp {
             .unwrap_or_else(|| "~".to_string());
         self.docker.form = Some(DockerFormState {
             mode: DockerFormMode::Add,
-            dir_input: dir,
+            dir_input: TextInput::from_string(dir),
             error: None,
         });
         self.last_input = Instant::now();
@@ -1188,7 +1204,7 @@ impl TerminalApp {
         };
         self.docker.form = Some(DockerFormState {
             mode: DockerFormMode::Edit(id),
-            dir_input: dir,
+            dir_input: TextInput::from_string(dir),
             error: None,
         });
         self.last_input = Instant::now();
@@ -1200,7 +1216,7 @@ impl TerminalApp {
         let Some(ref mut form) = self.docker.form else {
             return;
         };
-        let raw = form.dir_input.trim().to_string();
+        let raw = form.dir_input.as_str().trim().to_string();
         let resolved = expand_directory(&raw);
         if raw.is_empty() || !resolved.is_dir() {
             form.error = Some(format!("Directory does not exist: {}", resolved.display()));
@@ -1972,8 +1988,8 @@ impl TerminalApp {
                 }
                 Key::Named(NamedKey::Tab) => {
                     if let Some(ref mut form) = self.docker.form {
-                        if let Some(completed) = complete_directory(&form.dir_input) {
-                            form.dir_input = completed;
+                        if let Some(completed) = complete_directory(form.dir_input.as_str()) {
+                            form.dir_input.set(completed);
                             form.error = None;
                         }
                     }
@@ -1984,10 +2000,69 @@ impl TerminalApp {
                 Key::Named(NamedKey::Enter) => {
                     self.submit_docker_form();
                 }
-                Key::Named(NamedKey::Backspace) => {
+                Key::Named(NamedKey::ArrowLeft) => {
                     if let Some(ref mut form) = self.docker.form {
-                        form.dir_input.pop();
-                        form.error = None;
+                        if ctrl || alt {
+                            form.dir_input.move_word_left();
+                        } else {
+                            form.dir_input.move_left();
+                        }
+                    }
+                    self.last_input = Instant::now();
+                    self.cursor_blink_on = true;
+                    self.request_redraw();
+                }
+                Key::Named(NamedKey::ArrowRight) => {
+                    if let Some(ref mut form) = self.docker.form {
+                        if ctrl || alt {
+                            form.dir_input.move_word_right();
+                        } else {
+                            form.dir_input.move_right();
+                        }
+                    }
+                    self.last_input = Instant::now();
+                    self.cursor_blink_on = true;
+                    self.request_redraw();
+                }
+                Key::Named(NamedKey::Home) => {
+                    if let Some(ref mut form) = self.docker.form {
+                        form.dir_input.move_home();
+                    }
+                    self.last_input = Instant::now();
+                    self.cursor_blink_on = true;
+                    self.request_redraw();
+                }
+                Key::Named(NamedKey::End) => {
+                    if let Some(ref mut form) = self.docker.form {
+                        form.dir_input.move_end();
+                    }
+                    self.last_input = Instant::now();
+                    self.cursor_blink_on = true;
+                    self.request_redraw();
+                }
+                Key::Named(NamedKey::Backspace) => {
+                    let super_held = self.super_held();
+                    if let Some(ref mut form) = self.docker.form {
+                        let changed = if super_held {
+                            form.dir_input.clear()
+                        } else if ctrl || alt {
+                            form.dir_input.delete_word_back()
+                        } else {
+                            form.dir_input.backspace()
+                        };
+                        if changed {
+                            form.error = None;
+                        }
+                    }
+                    self.last_input = Instant::now();
+                    self.cursor_blink_on = true;
+                    self.request_redraw();
+                }
+                Key::Named(NamedKey::Delete) => {
+                    if let Some(ref mut form) = self.docker.form {
+                        if form.dir_input.delete() {
+                            form.error = None;
+                        }
                     }
                     self.last_input = Instant::now();
                     self.cursor_blink_on = true;
@@ -1995,7 +2070,7 @@ impl TerminalApp {
                 }
                 Key::Named(NamedKey::Space) => {
                     if let Some(ref mut form) = self.docker.form {
-                        form.dir_input.push(' ');
+                        form.dir_input.insert_char(' ');
                         form.error = None;
                     }
                     self.last_input = Instant::now();
@@ -2008,22 +2083,71 @@ impl TerminalApp {
                 {
                     self.paste_clipboard();
                 }
-                Key::Character(c) if ctrl && c.eq_ignore_ascii_case("u") => {
-                    if let Some(ref mut form) = self.docker.form {
-                        form.dir_input.clear();
-                        form.error = None;
+                Key::Character(c) if ctrl && !alt => match c.to_ascii_lowercase().as_str() {
+                    "u" => {
+                        if let Some(ref mut form) = self.docker.form {
+                            if !form.dir_input.delete_to_start() {
+                                form.dir_input.clear();
+                            }
+                            form.error = None;
+                        }
+                        self.last_input = Instant::now();
+                        self.cursor_blink_on = true;
+                        self.request_redraw();
                     }
-                    self.request_redraw();
-                }
+                    "k" => {
+                        if let Some(ref mut form) = self.docker.form {
+                            if form.dir_input.delete_to_end() {
+                                form.error = None;
+                            }
+                        }
+                        self.last_input = Instant::now();
+                        self.cursor_blink_on = true;
+                        self.request_redraw();
+                    }
+                    "w" => {
+                        if let Some(ref mut form) = self.docker.form {
+                            if form.dir_input.delete_word_back() {
+                                form.error = None;
+                            }
+                        }
+                        self.last_input = Instant::now();
+                        self.cursor_blink_on = true;
+                        self.request_redraw();
+                    }
+                    "a" => {
+                        if let Some(ref mut form) = self.docker.form {
+                            form.dir_input.move_home();
+                        }
+                        self.last_input = Instant::now();
+                        self.cursor_blink_on = true;
+                        self.request_redraw();
+                    }
+                    "e" => {
+                        if let Some(ref mut form) = self.docker.form {
+                            form.dir_input.move_end();
+                        }
+                        self.last_input = Instant::now();
+                        self.cursor_blink_on = true;
+                        self.request_redraw();
+                    }
+                    _ => {}
+                },
                 _ => {
                     if !ctrl && !alt && !self.super_held() {
                         if let Some(t) = text {
-                            let filtered: String = t.chars().filter(|c| !c.is_control()).collect();
-                            if !filtered.is_empty() {
-                                if let Some(ref mut form) = self.docker.form {
-                                    form.dir_input.push_str(&filtered);
-                                    form.error = None;
-                                }
+                            let inserted = self
+                                .docker
+                                .form
+                                .as_mut()
+                                .is_some_and(|form| {
+                                    let changed = form.dir_input.insert_filtered(t);
+                                    if changed {
+                                        form.error = None;
+                                    }
+                                    changed
+                                });
+                            if inserted {
                                 self.last_input = Instant::now();
                                 self.cursor_blink_on = true;
                                 self.request_redraw();
@@ -2280,8 +2404,42 @@ impl TerminalApp {
                 self.cycle_theme();
             }
             Key::Named(NamedKey::Backspace) => {
-                self.monitor.pop_filter();
+                if ctrl || alt {
+                    self.monitor.delete_word_back_filter();
+                } else {
+                    self.monitor.pop_filter();
+                }
                 self.request_redraw();
+            }
+            Key::Named(NamedKey::ArrowLeft) => {
+                let moved = if ctrl || alt {
+                    self.monitor.filter.move_word_left()
+                } else {
+                    self.monitor.filter.move_left()
+                };
+                if moved {
+                    self.request_redraw();
+                }
+            }
+            Key::Named(NamedKey::ArrowRight) => {
+                let moved = if ctrl || alt {
+                    self.monitor.filter.move_word_right()
+                } else {
+                    self.monitor.filter.move_right()
+                };
+                if moved {
+                    self.request_redraw();
+                }
+            }
+            Key::Named(NamedKey::Home) => {
+                if self.monitor.filter.move_home() {
+                    self.request_redraw();
+                }
+            }
+            Key::Named(NamedKey::End) => {
+                if self.monitor.filter.move_end() {
+                    self.request_redraw();
+                }
             }
             Key::Named(NamedKey::ArrowUp) => {
                 self.monitor.move_selection(-1);
@@ -2300,7 +2458,13 @@ impl TerminalApp {
                 self.request_redraw();
             }
             Key::Named(NamedKey::Delete) => {
-                self.kill_selected_process(libc::SIGTERM);
+                if !self.monitor.filter.cursor_at_end() {
+                    if self.monitor.delete_filter() {
+                        self.request_redraw();
+                    }
+                } else {
+                    self.kill_selected_process(libc::SIGTERM);
+                }
             }
             Key::Character(c) if self.tab_jump_mod() && c.chars().next().is_some_and(|ch| ch.is_ascii_digit()) => {
                 if let Some(d) = c.chars().next().and_then(|ch| ch.to_digit(10)) {
@@ -3143,7 +3307,8 @@ impl TerminalApp {
                 sort: self.monitor.sort,
                 selected: self.monitor.selected,
                 scroll: self.monitor.scroll,
-                filter: &self.monitor.filter,
+                filter: self.monitor.filter.as_str(),
+                filter_cursor: self.monitor.filter.cursor(),
                 visible: &self.monitor.visible,
             })
         } else {
@@ -3182,8 +3347,8 @@ impl TerminalApp {
             None
         };
         let docker_form_detected = self.docker.form.as_ref().map(|f| {
-            let p = expand_directory(&f.dir_input);
-            let exists = !f.dir_input.trim().is_empty() && p.is_dir();
+            let p = expand_directory(f.dir_input.as_str());
+            let exists = !f.dir_input.as_str().trim().is_empty() && p.is_dir();
             let file = if exists { find_compose_file(&p) } else { None };
             (exists, file)
         });
@@ -3200,7 +3365,8 @@ impl TerminalApp {
                         .unwrap_or((false, None));
                     DockerFormView {
                         is_edit: matches!(f.mode, DockerFormMode::Edit(_)),
-                        dir_input: &f.dir_input,
+                        dir_input: f.dir_input.as_str(),
+                        dir_cursor: f.dir_input.cursor(),
                         detected_file,
                         dir_exists,
                         error: f.error.as_deref(),
