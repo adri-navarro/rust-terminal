@@ -16,6 +16,8 @@ const MAX_LOG_LINES: usize = 200;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SavedCommand {
     pub id: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
     pub command: String,
     pub directory: String,
 }
@@ -63,6 +65,7 @@ impl CommandStatus {
 #[derive(Debug, Clone)]
 pub struct ManagedCommand {
     pub id: u64,
+    pub name: String,
     pub command: String,
     pub directory: String,
     pub status: CommandStatus,
@@ -73,9 +76,10 @@ pub struct ManagedCommand {
 }
 
 impl ManagedCommand {
-    fn new(id: u64, command: String, directory: String) -> Self {
+    fn new(id: u64, name: String, command: String, directory: String) -> Self {
         Self {
             id,
+            name,
             command,
             directory,
             status: CommandStatus::Idle,
@@ -84,6 +88,12 @@ impl ManagedCommand {
             last_error: None,
             logs: VecDeque::with_capacity(MAX_LOG_LINES),
         }
+    }
+
+    /// Label shown in the UI: the trimmed alias if set, otherwise the command.
+    pub fn display_name(&self) -> &str {
+        let name = self.name.trim();
+        if name.is_empty() { &self.command } else { name }
     }
 
     pub fn push_log(&mut self, line: String) {
@@ -141,7 +151,12 @@ impl CommandManager {
             if let Ok(parsed) = toml::from_str::<CommandsFile>(&content) {
                 for saved in parsed.commands {
                     max_id = max_id.max(saved.id);
-                    entries.push(ManagedCommand::new(saved.id, saved.command, saved.directory));
+                    entries.push(ManagedCommand::new(
+                        saved.id,
+                        saved.name,
+                        saved.command,
+                        saved.directory,
+                    ));
                 }
             }
         }
@@ -163,6 +178,7 @@ impl CommandManager {
                 .iter()
                 .map(|e| SavedCommand {
                     id: e.id,
+                    name: e.name.clone(),
                     command: e.command.clone(),
                     directory: e.directory.clone(),
                 })
@@ -185,18 +201,19 @@ impl CommandManager {
         self.entries.iter_mut().find(|e| e.id == id)
     }
 
-    pub fn add(&mut self, command: String, directory: String) -> u64 {
+    pub fn add(&mut self, name: String, command: String, directory: String) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
         let cmd = command.trim().to_string();
         let dir = directory.trim().to_string();
-        self.entries.push(ManagedCommand::new(id, cmd, dir));
+        self.entries.push(ManagedCommand::new(id, name.trim().to_string(), cmd, dir));
         let _ = self.save();
         id
     }
 
-    pub fn update(&mut self, id: u64, command: String, directory: String) -> bool {
+    pub fn update(&mut self, id: u64, name: String, command: String, directory: String) -> bool {
         if let Some(entry) = self.find_by_id_mut(id) {
+            entry.name = name.trim().to_string();
             entry.command = command.trim().to_string();
             entry.directory = directory.trim().to_string();
             let _ = self.save();

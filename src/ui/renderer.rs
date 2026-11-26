@@ -146,6 +146,7 @@ pub struct TabBarHitZones {
     pub cmd_add_btn: Option<Rect>,
     pub cmd_stop_all_btn: Option<Rect>,
     pub cmd_rows: Vec<CommandRowHitZone>,
+    pub cmd_form_name_field: Option<Rect>,
     pub cmd_form_cmd_field: Option<Rect>,
     pub cmd_form_dir_field: Option<Rect>,
     pub cmd_form_primary_btn: Option<Rect>,
@@ -251,6 +252,7 @@ impl TabBarHitZones {
             cmd_stop_all_btn: None,
             cmd_rows: Vec::new(),
             cmd_form_cmd_field: None,
+            cmd_form_name_field: None,
             cmd_form_dir_field: None,
             cmd_form_primary_btn: None,
             cmd_form_secondary_btn: None,
@@ -284,12 +286,14 @@ impl TabBarHitZones {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandFormField {
+    Name,
     Command,
     Directory,
 }
 
 pub struct CommandFormView<'a> {
     pub is_edit: bool,
+    pub name_input: &'a str,
     pub command_input: &'a str,
     pub directory_input: &'a str,
     pub active_field: CommandFormField,
@@ -3081,24 +3085,93 @@ fn render_commands_view(
             );
         }
 
-        // Two side-by-side input fields: Command (55%) | Directory (45%)
+        // Three side-by-side input fields: Name (22%) | Command (43%) | Directory (35%)
         let inner_x = content_x + 14;
         let inner_w = content_w - 28;
         let gap = 12i32;
-        let cmd_fw = (inner_w - gap) * 55 / 100;
-        let dir_fw = inner_w - gap - cmd_fw;
+        let avail_w = inner_w - 2 * gap;
+        let name_fw = avail_w * 22 / 100;
+        let cmd_fw = avail_w * 43 / 100;
+        let dir_fw = avail_w - name_fw - cmd_fw;
         let field_y = cur_y + sc(60);
         let field_h = sc(42).max(28);
 
+        // Name input
+        canvas.draw_text_clipped(
+            font,
+            "Name",
+            FontStyle::Bold,
+            fs(17.0),
+            inner_x,
+            field_y - 8,
+            inner_x + name_fw,
+            if form.active_field == CommandFormField::Name {
+                theme.accent
+            } else {
+                theme.fg_muted
+            },
+        );
+        let name_field_rect = Rect {
+            x: inner_x,
+            y: field_y,
+            w: name_fw,
+            h: field_h,
+        };
+        let name_focused = form.active_field == CommandFormField::Name;
+        canvas.fill_rounded_rect(name_field_rect.x, name_field_rect.y, name_field_rect.w, name_field_rect.h, 6, theme.bg, 255);
+        canvas.stroke_rounded_rect(
+            name_field_rect.x,
+            name_field_rect.y,
+            name_field_rect.w,
+            name_field_rect.h,
+            6,
+            if name_focused { theme.accent } else { theme.border },
+            255,
+        );
+        if form.name_input.is_empty() && !name_focused {
+            canvas.draw_text_clipped(
+                font,
+                "optional",
+                FontStyle::Italic,
+                fs(18.5),
+                name_field_rect.x + 10,
+                name_field_rect.y + sc(28).max(18),
+                name_field_rect.x + name_field_rect.w - 10,
+                theme.fg_muted,
+            );
+        } else {
+            let end_x = canvas.draw_text_clipped(
+                font,
+                form.name_input,
+                FontStyle::Regular,
+                fs(18.5),
+                name_field_rect.x + 10,
+                name_field_rect.y + sc(28).max(18),
+                name_field_rect.x + name_field_rect.w - 12,
+                theme.fg,
+            );
+            if name_focused && cv.cursor_blink_on {
+                canvas.fill_rect(
+                    (end_x + 1).min(name_field_rect.x + name_field_rect.w - 6),
+                    name_field_rect.y + 7,
+                    2,
+                    (field_h - 14).max(12),
+                    theme.accent,
+                );
+            }
+        }
+        hit_zones.cmd_form_name_field = Some(name_field_rect);
+
         // Command input
+        let cmd_x = inner_x + name_fw + gap;
         canvas.draw_text_clipped(
             font,
             "Command",
             FontStyle::Bold,
             fs(17.0),
-            inner_x,
+            cmd_x,
             field_y - 8,
-            inner_x + cmd_fw,
+            cmd_x + cmd_fw,
             if form.active_field == CommandFormField::Command {
                 theme.accent
             } else {
@@ -3106,7 +3179,7 @@ fn render_commands_view(
             },
         );
         let cmd_field_rect = Rect {
-            x: inner_x,
+            x: cmd_x,
             y: field_y,
             w: cmd_fw,
             h: field_h,
@@ -3157,7 +3230,7 @@ fn render_commands_view(
         hit_zones.cmd_form_cmd_field = Some(cmd_field_rect);
 
         // Directory input
-        let dir_x = inner_x + cmd_fw + gap;
+        let dir_x = cmd_x + cmd_fw + gap;
         canvas.draw_text_clipped(
             font,
             "Working Directory",
@@ -3514,7 +3587,7 @@ fn render_commands_view(
             let text_max_x = toggle_x - 12;
             canvas.draw_text_clipped(
                 font,
-                &entry.command,
+                entry.display_name(),
                 FontStyle::Bold,
                 fs(19.0),
                 text_x,
@@ -3568,7 +3641,7 @@ fn render_commands_view(
         canvas.stroke_rounded_rect(log_rect.x, log_rect.y, log_rect.w, log_rect.h, 10, theme.border, 220);
 
         if let Some(sel) = cv.entries.get(cv.selected) {
-            let title = format!("OUTPUT  ·  {}", sel.command);
+            let title = format!("OUTPUT  ·  {}", sel.display_name());
             canvas.draw_text_clipped(
                 font,
                 &title,

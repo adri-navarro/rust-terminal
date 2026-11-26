@@ -68,6 +68,7 @@ enum CommandFormMode {
 
 struct CommandFormState {
     mode: CommandFormMode,
+    name_input: String,
     command_input: String,
     directory_input: String,
     active_field: CommandFormField,
@@ -787,6 +788,7 @@ impl TerminalApp {
             if let Some(ref mut form) = self.commands.form {
                 let clean = text.replace(['\r', '\n'], " ");
                 match form.active_field {
+                    CommandFormField::Name => form.name_input.push_str(&clean),
                     CommandFormField::Command => form.command_input.push_str(&clean),
                     CommandFormField::Directory => form.directory_input.push_str(&clean),
                 }
@@ -1582,6 +1584,7 @@ impl TerminalApp {
             .unwrap_or_else(|| "~".to_string());
         self.commands.form = Some(CommandFormState {
             mode: CommandFormMode::Add,
+            name_input: String::new(),
             command_input: String::new(),
             directory_input: default_dir,
             active_field: CommandFormField::Command,
@@ -1596,6 +1599,7 @@ impl TerminalApp {
         if let Some(entry) = self.commands.manager.find_by_id(id) {
             self.commands.form = Some(CommandFormState {
                 mode: CommandFormMode::Edit(id),
+                name_input: entry.name.clone(),
                 command_input: entry.command.clone(),
                 directory_input: entry.directory.clone(),
                 active_field: CommandFormField::Command,
@@ -1611,6 +1615,7 @@ impl TerminalApp {
         let Some(ref mut form) = self.commands.form else {
             return;
         };
+        let name = form.name_input.trim().to_string();
         let cmd = form.command_input.trim().to_string();
         let dir = form.directory_input.trim().to_string();
         if cmd.is_empty() {
@@ -1635,16 +1640,17 @@ impl TerminalApp {
 
         let mode = form.mode;
         self.commands.form = None;
+        let label = if name.is_empty() { cmd.clone() } else { name.clone() };
         let cb = self.command_event_cb();
 
         match mode {
             CommandFormMode::Add => {
-                let id = self.commands.manager.add(cmd.clone(), dir);
+                let id = self.commands.manager.add(name.clone(), cmd.clone(), dir);
                 self.commands.selected = self.commands.manager.entries.len().saturating_sub(1);
                 self.commands.log_scroll = 0;
                 if run_after {
                     match self.commands.manager.start(id, cb) {
-                        Ok(()) => self.show_toast(format!("Launched: {cmd}")),
+                        Ok(()) => self.show_toast(format!("Launched: {label}")),
                         Err(e) => self.show_toast(e),
                     }
                 } else {
@@ -1661,7 +1667,7 @@ impl TerminalApp {
                 if run_after && was_running {
                     let _ = self.commands.manager.stop(id, cb.clone());
                 }
-                self.commands.manager.update(id, cmd.clone(), dir);
+                self.commands.manager.update(id, name.clone(), cmd.clone(), dir);
                 if run_after {
                     // If it was stopped or idle, launch immediately; if it was running, reset status and launch new command
                     if let Some(entry) = self.commands.manager.find_by_id_mut(id) {
@@ -1671,7 +1677,7 @@ impl TerminalApp {
                         }
                     }
                     match self.commands.manager.start(id, cb) {
-                        Ok(()) => self.show_toast(format!("Restarted: {cmd}")),
+                        Ok(()) => self.show_toast(format!("Restarted: {label}")),
                         Err(e) => self.show_toast(e),
                     }
                 } else if was_running {
@@ -1739,8 +1745,9 @@ impl TerminalApp {
                 | Key::Named(NamedKey::ArrowDown) => {
                     if let Some(ref mut form) = self.commands.form {
                         form.active_field = match form.active_field {
+                            CommandFormField::Name => CommandFormField::Command,
                             CommandFormField::Command => CommandFormField::Directory,
-                            CommandFormField::Directory => CommandFormField::Command,
+                            CommandFormField::Directory => CommandFormField::Name,
                         };
                     }
                     self.request_redraw();
@@ -1757,6 +1764,9 @@ impl TerminalApp {
                 Key::Named(NamedKey::Backspace) => {
                     if let Some(ref mut form) = self.commands.form {
                         match form.active_field {
+                            CommandFormField::Name => {
+                                form.name_input.pop();
+                            }
                             CommandFormField::Command => {
                                 form.command_input.pop();
                             }
@@ -1773,6 +1783,7 @@ impl TerminalApp {
                 Key::Named(NamedKey::Space) => {
                     if let Some(ref mut form) = self.commands.form {
                         match form.active_field {
+                            CommandFormField::Name => form.name_input.push(' '),
                             CommandFormField::Command => form.command_input.push(' '),
                             CommandFormField::Directory => form.directory_input.push(' '),
                         }
@@ -1788,6 +1799,7 @@ impl TerminalApp {
                 Key::Character(c) if ctrl && c.eq_ignore_ascii_case("u") => {
                     if let Some(ref mut form) = self.commands.form {
                         match form.active_field {
+                            CommandFormField::Name => form.name_input.clear(),
                             CommandFormField::Command => form.command_input.clear(),
                             CommandFormField::Directory => form.directory_input.clear(),
                         }
@@ -1802,6 +1814,7 @@ impl TerminalApp {
                             if !filtered.is_empty() {
                                 if let Some(ref mut form) = self.commands.form {
                                     match form.active_field {
+                                        CommandFormField::Name => form.name_input.push_str(&filtered),
                                         CommandFormField::Command => form.command_input.push_str(&filtered),
                                         CommandFormField::Directory => form.directory_input.push_str(&filtered),
                                     }
@@ -3146,6 +3159,7 @@ impl TerminalApp {
                 log_scroll: self.commands.log_scroll,
                 form: self.commands.form.as_ref().map(|f| CommandFormView {
                     is_edit: matches!(f.mode, CommandFormMode::Edit(_)),
+                    name_input: &f.name_input,
                     command_input: &f.command_input,
                     directory_input: &f.directory_input,
                     active_field: f.active_field,
@@ -3897,6 +3911,15 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
                                 }
                             }
                             if self.commands.form.is_some() {
+                                if let Some(r) = self.hit_zones.cmd_form_name_field {
+                                    if r.contains(px, py) {
+                                        if let Some(ref mut f) = self.commands.form {
+                                            f.active_field = CommandFormField::Name;
+                                        }
+                                        self.request_redraw();
+                                        return;
+                                    }
+                                }
                                 if let Some(r) = self.hit_zones.cmd_form_cmd_field {
                                     if r.contains(px, py) {
                                         if let Some(ref mut f) = self.commands.form {

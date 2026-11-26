@@ -365,13 +365,13 @@ fn test_commands_manager_persist_edit_run_stop_and_compose_detection() {
     let tmp_file = std::env::temp_dir().join("itsadri_test_commands.toml");
     let _ = std::fs::remove_file(&tmp_file);
 
-    let mut mgr = CommandManager::with_path(tmp_file.clone());
-    let id = mgr.add("echo hello_runner".to_string(), "/tmp".to_string());
+    let mut mgr = crate::commands::CommandManager::with_path(tmp_file.clone());
+    let id = mgr.add(String::new(), "echo hello_runner".to_string(), "/tmp".to_string());
     assert_eq!(mgr.entries.len(), 1);
-    assert!(mgr.update(id, "echo updated_runner".to_string(), "/tmp".to_string()));
+    assert!(mgr.update(id, String::new(), "echo updated_runner".to_string(), "/tmp".to_string()));
 
     // Reload from disk
-    let mut mgr2 = CommandManager::with_path(tmp_file.clone());
+    let mut mgr2 = crate::commands::CommandManager::with_path(tmp_file.clone());
     assert_eq!(mgr2.entries.len(), 1);
     assert_eq!(mgr2.entries[0].command, "echo updated_runner");
     assert_eq!(mgr2.entries[0].directory, "/tmp");
@@ -403,7 +403,7 @@ fn test_commands_manager_persist_edit_run_stop_and_compose_detection() {
     );
 
     // Detached compose exit 0 transitions to Detached status
-    let compose_id = mgr2.add("docker-compose up -d".to_string(), "/tmp".to_string());
+    let compose_id = mgr2.add(String::new(), "docker-compose up -d".to_string(), "/tmp".to_string());
     mgr2.apply_event(CommandEvent::Exited {
         id: compose_id,
         code: Some(0),
@@ -1014,4 +1014,37 @@ fn test_docker_reselect_keeps_container_by_id() {
     recreated.name = "b".into();
     let list = vec![c("a"), recreated, c("c")];
     assert_eq!(reselect(Some(("old-id", "b")), &list, 0), 1);
+}
+
+#[test]
+fn command_names_persist_and_fallback() {
+    let tmp = std::env::temp_dir().join("itsadri_test_command_names.toml");
+    let _ = std::fs::remove_file(&tmp);
+
+    let mut mgr = crate::commands::CommandManager::with_path(tmp.clone());
+    let id = mgr.add("build".into(), "echo a".into(), "/tmp".into());
+    let m = crate::commands::CommandManager::with_path(tmp.clone());
+    assert_eq!(m.entries[0].name, "build");
+    assert_eq!(m.entries[0].display_name(), "build");
+
+    assert!(mgr.update(id, "  ".into(), "echo a".into(), "/tmp".into()));
+    let m = crate::commands::CommandManager::with_path(tmp.clone());
+    assert_eq!(m.entries[0].name, "");
+    assert_eq!(m.entries[0].display_name(), "echo a");
+
+    assert!(mgr.update(id, "say \"hi\" #1".into(), "echo a".into(), "/tmp".into()));
+    let m = crate::commands::CommandManager::with_path(tmp.clone());
+    assert_eq!(m.entries[0].name, "say \"hi\" #1");
+
+    std::fs::write(
+        &tmp,
+        "[[commands]]\nid = 1\ncommand = \"echo legacy\"\ndirectory = \"/tmp\"\n",
+    )
+    .unwrap();
+    let m = crate::commands::CommandManager::with_path(tmp.clone());
+    assert_eq!(m.entries.len(), 1);
+    assert_eq!(m.entries[0].name, "");
+    assert_eq!(m.entries[0].display_name(), "echo legacy");
+
+    let _ = std::fs::remove_file(&tmp);
 }
