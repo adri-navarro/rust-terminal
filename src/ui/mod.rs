@@ -1,8 +1,12 @@
 pub mod boxdraw;
+pub mod canvas;
+pub mod chrome;
 pub mod docker_view;
 pub mod font;
 pub mod renderer;
 pub mod text_input;
+pub mod views;
+pub mod widgets;
 
 use crate::commands::{CommandEvent, CommandManager, CommandStatus, expand_directory};
 use crate::ui::text_input::TextInput;
