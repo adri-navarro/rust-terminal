@@ -823,6 +823,7 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
                     );
                     self.docker.container_scroll = self.docker.container_scroll.min(self.docker.container_selected);
                     self.docker.stopping.retain(|id| list.iter().any(|c| &c.id == id));
+                    self.docker.manager.sync_statuses_from_containers(list);
                 }
                 self.docker.containers = Some(res);
                 self.request_redraw();

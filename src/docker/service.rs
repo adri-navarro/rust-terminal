@@ -1,12 +1,19 @@
 //! Application service (`DockerManager`) for the `docker` bounded context.
 
 use super::domain::{
-    ComposeAction, ComposeDir, ComposeStatus, DockerError, DockerEvent, SavedComposeDir,
+    ComposeAction, ComposeDir, ComposeStatus, DockerError, DockerEvent, RunningContainer,
+    SavedComposeDir,
 };
 use super::infra::TomlDockerStore;
 use super::ports::DockerProjectStore;
 use crate::commands::expand_directory;
+use std::collections::HashSet;
 use std::path::PathBuf;
+
+fn normalize_dir(dir: &str) -> PathBuf {
+    let expanded = expand_directory(dir);
+    std::fs::canonicalize(&expanded).unwrap_or(expanded)
+}
 
 pub struct DockerManager {
     pub entries: Vec<ComposeDir>,
@@ -71,11 +78,38 @@ impl DockerManager {
     /// Id of the registered directory that resolves to the same path as `dir`
     /// (same comparison `add` uses to dedupe).
     pub fn find_id_by_directory(&self, dir: &str) -> Option<u64> {
-        let wanted = expand_directory(dir);
+        if dir.trim().is_empty() {
+            return None;
+        }
+        let wanted = normalize_dir(dir);
         self.entries
             .iter()
-            .find(|e| expand_directory(&e.directory) == wanted)
+            .find(|e| normalize_dir(&e.directory) == wanted)
             .map(|e| e.id)
+    }
+
+    /// Reconcile registered compose directory statuses against the engine's
+    /// currently running containers (`com.docker.compose.project.working_dir`).
+    /// Directories with an in-flight compose job are left untouched.
+    pub fn sync_statuses_from_containers(&mut self, containers: &[RunningContainer]) {
+        let running_dirs: HashSet<PathBuf> = containers
+            .iter()
+            .filter(|c| !c.working_dir.trim().is_empty())
+            .map(|c| normalize_dir(&c.working_dir))
+            .collect();
+
+        for entry in &mut self.entries {
+            if entry.jobs_running > 0
+                || matches!(entry.status, ComposeStatus::Starting | ComposeStatus::Stopping)
+            {
+                continue;
+            }
+            if running_dirs.contains(&normalize_dir(&entry.directory)) {
+                entry.status = ComposeStatus::Up;
+            } else if entry.status == ComposeStatus::Up {
+                entry.status = ComposeStatus::Down;
+            }
+        }
     }
 
     /// Add a directory (if its canonical/expanded path isn't already saved).
@@ -107,7 +141,12 @@ impl DockerManager {
             trimmed
         };
         if let Some(entry) = self.find_by_id_mut(id) {
-            entry.directory = dir;
+            if entry.directory != dir {
+                entry.directory = dir;
+                if entry.jobs_running == 0 {
+                    entry.status = ComposeStatus::Idle;
+                }
+            }
             if let Err(err) = self.save() {
                 tracing::warn!(id, error = %err, "Failed to persist updated docker directory");
             }
@@ -218,5 +257,60 @@ mod tests {
         });
         assert_eq!(toast.as_deref(), Some("compose up -d done"));
         assert_eq!(mgr.up_count(), 1);
+    }
+
+    fn container_in(working_dir: &str) -> RunningContainer {
+        RunningContainer {
+            id: "abc123".into(),
+            name: "app-web-1".into(),
+            image: "nginx".into(),
+            status: "Up 5 minutes".into(),
+            ports: String::new(),
+            project: if working_dir.is_empty() {
+                String::new()
+            } else {
+                "app".into()
+            },
+            working_dir: working_dir.into(),
+            config_files: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn sync_statuses_marks_running_dirs_up_and_stopped_dirs_down() {
+        let backing = Arc::new(Mutex::new(Vec::new()));
+        let mut mgr = DockerManager::with_store(Box::new(InMemoryDockerStore {
+            saved: backing,
+        }));
+        let (id_up, _) = mgr.add("/srv/running-app".into());
+        let (id_idle, _) = mgr.add("/srv/idle-app".into());
+        let (id_failed, _) = mgr.add("/srv/failed-app".into());
+        let (id_busy, _) = mgr.add("/srv/busy-app".into());
+
+        mgr.find_by_id_mut(id_failed).unwrap().status = ComposeStatus::Failed;
+        mgr.find_by_id_mut(id_busy).unwrap().status = ComposeStatus::Stopping;
+        mgr.find_by_id_mut(id_busy).unwrap().jobs_running = 1;
+
+        // Fresh load: running-app is Idle, but docker ps reports a running container for it.
+        // Trailing slash should still match; non-compose containers (empty working_dir) are ignored.
+        mgr.sync_statuses_from_containers(&[
+            container_in("/srv/running-app/"),
+            container_in("/srv/busy-app"),
+            container_in(""),
+        ]);
+
+        assert_eq!(mgr.find_by_id(id_up).unwrap().status, ComposeStatus::Up);
+        assert_eq!(mgr.find_by_id(id_idle).unwrap().status, ComposeStatus::Idle);
+        assert_eq!(mgr.find_by_id(id_failed).unwrap().status, ComposeStatus::Failed);
+        assert_eq!(mgr.find_by_id(id_busy).unwrap().status, ComposeStatus::Stopping);
+        assert_eq!(mgr.up_count(), 1);
+
+        // Once the container stops, Up transitions to Down while Idle/Failed remain unchanged.
+        mgr.sync_statuses_from_containers(&[]);
+        assert_eq!(mgr.find_by_id(id_up).unwrap().status, ComposeStatus::Down);
+        assert_eq!(mgr.find_by_id(id_idle).unwrap().status, ComposeStatus::Idle);
+        assert_eq!(mgr.find_by_id(id_failed).unwrap().status, ComposeStatus::Failed);
+        assert_eq!(mgr.find_by_id(id_busy).unwrap().status, ComposeStatus::Stopping);
+        assert_eq!(mgr.up_count(), 0);
     }
 }

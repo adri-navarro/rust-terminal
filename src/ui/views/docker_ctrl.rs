@@ -446,6 +446,9 @@ impl TerminalApp {
                 self.show_toast("Compose directory updated");
             }
         }
+        if let Some(Ok(list)) = &self.docker.containers {
+            self.docker.manager.sync_statuses_from_containers(list);
+        }
         self.request_redraw();
     }
 
