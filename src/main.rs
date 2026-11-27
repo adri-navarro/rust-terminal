@@ -1,20 +1,56 @@
-mod commands;
-mod completer;
-mod config;
-mod docker;
-mod history;
-mod monitor;
-mod shell;
-mod terminal;
-mod ui;
-mod usage;
-
-#[cfg(test)]
-mod tests;
-
+use itsadri_terminal::telemetry;
+use itsadri_terminal::ui::AppOptions;
 use std::env;
 use std::process;
-use ui::AppOptions;
+
+enum CliAction {
+    ShowHelp,
+    RunShell,
+    RunGui(AppOptions),
+}
+
+fn parse_args(args: &[String]) -> Result<CliAction, String> {
+    let mut shell_mode = false;
+    let mut shell_override = None;
+    let mut theme_override = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--shell" => {
+                shell_mode = true;
+            }
+            "--exec" | "-e" => {
+                if let Some(cmd) = args.get(i + 1) {
+                    shell_override = Some(cmd.clone());
+                    i += 1;
+                }
+            }
+            "--theme" => {
+                if let Some(t) = args.get(i + 1) {
+                    theme_override = Some(t.clone());
+                    i += 1;
+                }
+            }
+            "-h" | "--help" => {
+                return Ok(CliAction::ShowHelp);
+            }
+            other => {
+                return Err(format!("Unknown option: {other}\nRun with --help for usage."));
+            }
+        }
+        i += 1;
+    }
+
+    if shell_mode {
+        Ok(CliAction::RunShell)
+    } else {
+        Ok(CliAction::RunGui(AppOptions {
+            shell_override,
+            theme_override,
+        }))
+    }
+}
 
 fn print_help() {
     let help = String::from(
@@ -67,51 +103,25 @@ KEYBINDINGS:
 }
 
 fn main() {
-    let args: Vec<String> = env::args().skip(1).collect();
-    let mut shell_mode = false;
-    let mut shell_override = None;
-    let mut theme_override = None;
+    telemetry::init_subscriber();
 
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--shell" => {
-                shell_mode = true;
-            }
-            "--exec" | "-e" => {
-                if let Some(cmd) = args.get(i + 1) {
-                    shell_override = Some(cmd.clone());
-                    i += 1;
-                }
-            }
-            "--theme" => {
-                if let Some(t) = args.get(i + 1) {
-                    theme_override = Some(t.clone());
-                    i += 1;
-                }
-            }
-            "-h" | "--help" => {
-                print_help();
-                return;
-            }
-            other => {
-                eprintln!("Unknown option: {other}\nRun with --help for usage.");
-                process::exit(2);
+    let args: Vec<String> = env::args().skip(1).collect();
+    match parse_args(&args) {
+        Ok(CliAction::ShowHelp) => print_help(),
+        Ok(CliAction::RunShell) => {
+            let code = itsadri_terminal::shell::run_interactive_shell();
+            process::exit(code);
+        }
+        Ok(CliAction::RunGui(opts)) => {
+            if let Err(e) = itsadri_terminal::ui::run_gui(opts) {
+                tracing::error!(error = %e, "GUI exited with error");
+                eprintln!("itsadri-terminal error: {e}");
+                process::exit(1);
             }
         }
-        i += 1;
-    }
-
-    if shell_mode {
-        let code = shell::run_interactive_shell();
-        process::exit(code);
-    }
-
-    if let Err(e) = ui::run_gui(AppOptions {
-        shell_override,
-        theme_override,
-    }) {
-        eprintln!("itsadri-terminal error: {e}");
-        process::exit(1);
+        Err(msg) => {
+            eprintln!("{msg}");
+            process::exit(2);
+        }
     }
 }
