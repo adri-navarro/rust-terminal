@@ -2,33 +2,35 @@
 //! ps / vm_stat / sysctl / df and uses libc::getloadavg. Every failure degrades to
 //! zeros or empty lists.
 
+use super::super::domain::{DiskInfo, MemoryInfo, ProcessInfo};
+use super::super::ports::{RawSystemSample, SystemProbe};
 use std::collections::{HashMap, HashSet};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::{DiskInfo, MemoryInfo, ProcessInfo, SystemMonitor};
-
-fn run_cmd(program: &str, args: &[&str]) -> Option<String> {
-    let out = Command::new(program)
-        .args(args)
-        .env("LC_ALL", "C")
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+pub struct MacosProbe {
+    prev_proc_ticks: HashMap<i32, u64>,
+    last_cpu_total: f32,
+    clk_tck: f64,
+    num_cpus: usize,
 }
 
-impl SystemMonitor {
-    /// There are no per-core counters without Mach FFI, so the cores list is empty.
-    /// The total is computed by `read_processes` (which runs after this in `sample`),
-    /// so it lags by one sample.
-    pub(super) fn read_cpu(&mut self) -> (f32, Vec<f32>) {
-        (self.last_cpu_total, Vec::new())
+impl MacosProbe {
+    pub fn new() -> Self {
+        let clk_tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(100) as f64;
+        let num_cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+
+        Self {
+            prev_proc_ticks: HashMap::new(),
+            last_cpu_total: 0.0,
+            clk_tck,
+            num_cpus,
+        }
     }
 
-    pub(super) fn read_processes(
+    fn read_processes(
         &mut self,
         dt_secs: f64,
         total_mem_bytes: u64,
@@ -53,7 +55,6 @@ impl SystemMonitor {
 
             next_ticks.insert(p.pid, p.cpu_centis);
 
-            // cputime is in centiseconds, i.e. 100 ticks per second like clk_tck on macOS.
             let cpu_pct = if let Some(&prev) = self.prev_proc_ticks.get(&p.pid) {
                 let delta = p.cpu_centis.saturating_sub(prev) as f64;
                 let pct = ((delta / self.clk_tck) / dt_secs * 100.0) as f32;
@@ -88,6 +89,42 @@ impl SystemMonitor {
     }
 }
 
+impl SystemProbe for MacosProbe {
+    fn sample_raw(&mut self, dt_secs: f64) -> RawSystemSample {
+        let cpu_total_pct = self.last_cpu_total;
+        let memory = read_memory();
+        let disks = read_disks();
+        let load_avg = read_loadavg();
+        let uptime_secs = read_uptime();
+        let (processes, total_processes, running_processes) =
+            self.read_processes(dt_secs, memory.total_bytes);
+
+        RawSystemSample {
+            cpu_total_pct,
+            cpu_cores_pct: Vec::new(),
+            load_avg,
+            uptime_secs,
+            memory,
+            disks,
+            processes,
+            total_processes,
+            running_processes,
+        }
+    }
+}
+
+fn run_cmd(program: &str, args: &[&str]) -> Option<String> {
+    let out = Command::new(program)
+        .args(args)
+        .env("LC_ALL", "C")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 struct PsLine {
     pid: i32,
     state: char,
@@ -105,8 +142,6 @@ fn next_token(s: &str) -> Option<(&str, &str)> {
     Some((&s[..end], &s[end..]))
 }
 
-/// Parses one line of `ps -axo pid=,stat=,cputime=,rss=,comm=`. comm is last
-/// because it may contain spaces.
 fn parse_ps_line(line: &str) -> Option<PsLine> {
     let (pid, rest) = next_token(line)?;
     let (stat, rest) = next_token(rest)?;
@@ -129,7 +164,6 @@ fn parse_ps_line(line: &str) -> Option<PsLine> {
     })
 }
 
-/// Parses `[[dd-]hh:]mm:ss[.cc]` into centiseconds. Garbage parses as 0.
 fn parse_cputime(s: &str) -> u64 {
     let s = s.trim();
     let (days, rest) = match s.split_once('-') {
@@ -150,9 +184,6 @@ struct VmStat {
     cached_bytes: u64,
 }
 
-/// Parses `vm_stat` output. available = free + inactive + speculative + purgeable,
-/// cached = file-backed pages. The page size comes from the header line, falling
-/// back to `fallback_page_size`.
 fn parse_vm_stat(text: &str, fallback_page_size: u64) -> VmStat {
     let mut page = fallback_page_size;
     let (mut free, mut inactive, mut speculative, mut purgeable, mut file_backed) =
@@ -196,8 +227,6 @@ fn parse_vm_stat(text: &str, fallback_page_size: u64) -> VmStat {
     }
 }
 
-/// Parses `vm.swapusage` ("total = 2048.00M  used = 1024.00M  free = ...") into
-/// (total, used) bytes.
 fn parse_swapusage(text: &str) -> (u64, u64) {
     fn field(text: &str, key: &str) -> u64 {
         let needle = format!("{key} = ");
@@ -218,7 +247,7 @@ fn parse_swapusage(text: &str) -> (u64, u64) {
     (field(text, "total"), field(text, "used"))
 }
 
-pub(super) fn read_memory() -> MemoryInfo {
+fn read_memory() -> MemoryInfo {
     let total = run_cmd("/usr/sbin/sysctl", &["-n", "hw.memsize"])
         .and_then(|s| s.trim().parse::<u64>().ok())
         .unwrap_or(0);
@@ -255,11 +284,6 @@ pub(super) fn read_memory() -> MemoryInfo {
     }
 }
 
-/// Parses `df -kP`. Only /dev/ filesystems are kept, deduped by device. APFS volumes
-/// of one container share free space, so "/" (the sealed system snapshot, which only
-/// reports a few GB used) is dropped when /System/Volumes/Data is present: Data is the
-/// volume that holds the user's files and is ranked first like "/" on Linux. Total is
-/// used + available (not the container size) so that used_pct matches what df reports.
 fn parse_df(text: &str) -> Vec<DiskInfo> {
     const DATA: &str = "/System/Volumes/Data";
     let mut disks = Vec::new();
@@ -267,7 +291,6 @@ fn parse_df(text: &str) -> Vec<DiskInfo> {
 
     for line in text.lines() {
         let fields: Vec<&str> = line.split_whitespace().collect();
-        // Filesystem, 1024-blocks, Used, Available, Capacity, Mounted on...
         if fields.len() < 6 || !fields[0].starts_with("/dev/") {
             continue;
         }
@@ -311,7 +334,6 @@ fn parse_df(text: &str) -> Vec<DiskInfo> {
         disks.retain(|d| d.mount != "/");
     }
 
-    // Data (or "/") first, then "/home" (unlikely on macOS), then others by size desc.
     disks.sort_by(|a, b| {
         let rank = |m: &str| match m {
             "/" | DATA => 0,
@@ -325,13 +347,13 @@ fn parse_df(text: &str) -> Vec<DiskInfo> {
     disks
 }
 
-pub(super) fn read_disks() -> Vec<DiskInfo> {
+fn read_disks() -> Vec<DiskInfo> {
     run_cmd("/bin/df", &["-kP"])
         .map(|t| parse_df(&t))
         .unwrap_or_default()
 }
 
-pub(super) fn read_loadavg() -> (f32, f32, f32) {
+fn read_loadavg() -> (f32, f32, f32) {
     let mut avg = [0.0f64; 3];
     let n = unsafe { libc::getloadavg(avg.as_mut_ptr(), 3) };
     if n < 3 {
@@ -340,7 +362,6 @@ pub(super) fn read_loadavg() -> (f32, f32, f32) {
     (avg[0] as f32, avg[1] as f32, avg[2] as f32)
 }
 
-/// Parses `kern.boottime` ("{ sec = 1700000000, usec = 123 } Mon ...") into the boot epoch.
 fn parse_boottime(text: &str) -> Option<u64> {
     let idx = text.find("sec = ")?;
     let digits: String = text[idx + "sec = ".len()..]
@@ -350,7 +371,7 @@ fn parse_boottime(text: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
-pub(super) fn read_uptime() -> u64 {
+fn read_uptime() -> u64 {
     let Some(boot) = run_cmd("/usr/sbin/sysctl", &["-n", "kern.boottime"])
         .and_then(|t| parse_boottime(&t))
     else {
@@ -427,7 +448,6 @@ Pages occupied by compressor:              700.\n";
         assert_eq!(vm.available_bytes, (1000 + 2000 + 300 + 100) * 16384);
         assert_eq!(vm.cached_bytes, 1500 * 16384);
 
-        // Without a header the fallback page size applies.
         let vm = parse_vm_stat("Pages free: 10.\n", 4096);
         assert_eq!(vm.free_bytes, 10 * 4096);
     }
@@ -449,7 +469,6 @@ map auto_home            0         0         0   100%    /System/Volumes/Data/ho
         assert_eq!(disks[0].free_bytes, 307_330_772 * 1024);
         assert!((disks[1].used_pct - 50.0).abs() < 0.01);
 
-        // Without a Data volume, "/" is kept.
         let only_root = parse_df(
             "Filesystem 1024-blocks Used Available Capacity Mounted on\n\
 /dev/disk1s1 1000 250 750 25% /\n",

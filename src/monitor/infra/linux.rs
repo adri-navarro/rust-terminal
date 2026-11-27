@@ -1,130 +1,28 @@
-use std::collections::{HashMap, VecDeque};
-#[cfg(not(target_os = "macos"))]
-use std::collections::HashSet;
-#[cfg(not(target_os = "macos"))]
+//! Linux `/proc` system probe adapter.
+
+use super::super::domain::{DiskInfo, MemoryInfo, ProcessInfo};
+use super::super::ports::{RawSystemSample, SystemProbe};
+use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
-#[cfg(not(target_os = "macos"))]
 use std::fs;
-use std::time::Instant;
 
-#[cfg(target_os = "macos")]
-#[path = "monitor_macos.rs"]
-mod macos;
-#[cfg(target_os = "macos")]
-use macos::{read_disks, read_loadavg, read_memory, read_uptime};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProcessSort {
-    Cpu,
-    Memory,
-    Pid,
-    Name,
-}
-
-impl ProcessSort {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Cpu => "CPU",
-            Self::Memory => "MEM",
-            Self::Pid => "PID",
-            Self::Name => "NAME",
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct MemoryInfo {
-    pub total_bytes: u64,
-    pub used_bytes: u64,
-    pub free_bytes: u64,
-    pub available_bytes: u64,
-    pub cached_bytes: u64,
-    pub swap_total_bytes: u64,
-    pub swap_used_bytes: u64,
-    pub used_pct: f32,
-}
-
-#[derive(Debug, Clone)]
-pub struct DiskInfo {
-    pub mount: String,
-    pub fs_type: String,
-    pub total_bytes: u64,
-    pub used_bytes: u64,
-    pub free_bytes: u64,
-    pub used_pct: f32,
-}
-
-#[derive(Debug, Clone)]
-pub struct ProcessInfo {
-    pub pid: i32,
-    pub name: String,
-    pub state: char,
-    pub cpu_pct: f32,
-    pub mem_bytes: u64,
-    pub mem_pct: f32,
-    pub threads: u32,
-}
-
-/// Indices into `procs` (in their current order) matching the filter query:
-/// case-insensitive name substring, or a digit-only query contained in the pid.
-pub fn filter_process_indices(procs: &[ProcessInfo], query: &str) -> Vec<usize> {
-    let q = query.trim();
-    if q.is_empty() {
-        return (0..procs.len()).collect();
-    }
-    let q_lower = q.to_lowercase();
-    let digits = q.chars().all(|c| c.is_ascii_digit());
-    procs
-        .iter()
-        .enumerate()
-        .filter(|(_, p)| {
-            p.name.to_lowercase().contains(&q_lower) || (digits && p.pid.to_string().contains(q))
-        })
-        .map(|(i, _)| i)
-        .collect()
-}
-
-#[derive(Debug, Clone)]
-pub struct SystemSnapshot {
-    pub cpu_total_pct: f32,
-    pub cpu_cores_pct: Vec<f32>,
-    pub cpu_history: Vec<f32>,
-    pub load_avg: (f32, f32, f32),
-    pub uptime_secs: u64,
-    pub memory: MemoryInfo,
-    pub disks: Vec<DiskInfo>,
-    pub processes: Vec<ProcessInfo>,
-    pub total_processes: usize,
-    pub running_processes: usize,
-}
-
-#[cfg(not(target_os = "macos"))]
 #[derive(Debug, Clone, Copy, Default)]
 struct CpuTicks {
     total: u64,
     idle: u64,
 }
 
-pub struct SystemMonitor {
-    #[cfg(not(target_os = "macos"))]
+pub struct LinuxProcProbe {
     prev_total_cpu: Option<CpuTicks>,
-    #[cfg(not(target_os = "macos"))]
     prev_core_cpu: Vec<CpuTicks>,
     prev_proc_ticks: HashMap<i32, u64>,
-    prev_sample_time: Option<Instant>,
-    cpu_history: VecDeque<f32>,
-    #[cfg(not(target_os = "macos"))]
     page_size: u64,
-    /// Total CPU % computed by the previous `read_processes` (macOS has no cheap system-wide counter).
-    #[cfg(target_os = "macos")]
-    last_cpu_total: f32,
     clk_tck: f64,
     num_cpus: usize,
 }
 
-impl SystemMonitor {
+impl LinuxProcProbe {
     pub fn new() -> Self {
-        #[cfg(not(target_os = "macos"))]
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as u64;
         let clk_tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(100) as f64;
         let num_cpus = std::thread::available_parallelism()
@@ -132,63 +30,15 @@ impl SystemMonitor {
             .unwrap_or(1);
 
         Self {
-            #[cfg(not(target_os = "macos"))]
             prev_total_cpu: None,
-            #[cfg(not(target_os = "macos"))]
             prev_core_cpu: Vec::new(),
             prev_proc_ticks: HashMap::new(),
-            prev_sample_time: None,
-            cpu_history: VecDeque::with_capacity(48),
-            #[cfg(not(target_os = "macos"))]
             page_size,
-            #[cfg(target_os = "macos")]
-            last_cpu_total: 0.0,
             clk_tck,
             num_cpus,
         }
     }
 
-    pub fn sample(&mut self, sort: ProcessSort) -> SystemSnapshot {
-        let now = Instant::now();
-        let dt_secs = self
-            .prev_sample_time
-            .map(|t| now.duration_since(t).as_secs_f64().max(0.05))
-            .unwrap_or(1.0);
-        self.prev_sample_time = Some(now);
-
-        let (cpu_total_pct, cpu_cores_pct) = self.read_cpu();
-        let memory = read_memory();
-        let disks = read_disks();
-        let load_avg = read_loadavg();
-        let uptime_secs = read_uptime();
-
-        if self.cpu_history.len() >= 48 {
-            self.cpu_history.pop_front();
-        }
-        self.cpu_history.push_back(cpu_total_pct);
-
-        let (mut processes, total_processes, running_processes) =
-            self.read_processes(dt_secs, memory.total_bytes);
-
-        sort_processes(&mut processes, sort);
-
-        SystemSnapshot {
-            cpu_total_pct,
-            cpu_cores_pct,
-            cpu_history: self.cpu_history.iter().copied().collect(),
-            load_avg,
-            uptime_secs,
-            memory,
-            disks,
-            processes,
-            total_processes,
-            running_processes,
-        }
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-impl SystemMonitor {
     fn read_cpu(&mut self) -> (f32, Vec<f32>) {
         let Ok(content) = fs::read_to_string("/proc/stat") else {
             return (0.0, Vec::new());
@@ -229,7 +79,11 @@ impl SystemMonitor {
         (total_pct, cores_pct)
     }
 
-    fn read_processes(&mut self, dt_secs: f64, total_mem_bytes: u64) -> (Vec<ProcessInfo>, usize, usize) {
+    fn read_processes(
+        &mut self,
+        dt_secs: f64,
+        total_mem_bytes: u64,
+    ) -> (Vec<ProcessInfo>, usize, usize) {
         let mut procs = Vec::new();
         let mut next_ticks = HashMap::new();
         let mut total_count = 0usize;
@@ -256,7 +110,6 @@ impl SystemMonitor {
                 continue;
             };
 
-            // Format: pid (comm with possible spaces/parens) state ppid ... utime(14) stime(15) ... num_threads(20) ... rss(24)
             let Some(open_p) = stat_text.find('(') else {
                 continue;
             };
@@ -314,48 +167,30 @@ impl SystemMonitor {
     }
 }
 
-pub fn sort_processes(procs: &mut [ProcessInfo], sort: ProcessSort) {
-    match sort {
-        ProcessSort::Cpu => procs.sort_by(|a, b| {
-            b.cpu_pct
-                .partial_cmp(&a.cpu_pct)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| b.mem_bytes.cmp(&a.mem_bytes))
-                .then_with(|| a.pid.cmp(&b.pid))
-        }),
-        ProcessSort::Memory => procs.sort_by(|a, b| {
-            b.mem_bytes
-                .cmp(&a.mem_bytes)
-                .then_with(|| {
-                    b.cpu_pct
-                        .partial_cmp(&a.cpu_pct)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .then_with(|| a.pid.cmp(&b.pid))
-        }),
-        ProcessSort::Pid => procs.sort_by_key(|p| p.pid),
-        ProcessSort::Name => procs.sort_by(|a, b| {
-            a.name
-                .to_ascii_lowercase()
-                .cmp(&b.name.to_ascii_lowercase())
-                .then_with(|| a.pid.cmp(&b.pid))
-        }),
+impl SystemProbe for LinuxProcProbe {
+    fn sample_raw(&mut self, dt_secs: f64) -> RawSystemSample {
+        let (cpu_total_pct, cpu_cores_pct) = self.read_cpu();
+        let memory = read_memory();
+        let disks = read_disks();
+        let load_avg = read_loadavg();
+        let uptime_secs = read_uptime();
+        let (processes, total_processes, running_processes) =
+            self.read_processes(dt_secs, memory.total_bytes);
+
+        RawSystemSample {
+            cpu_total_pct,
+            cpu_cores_pct,
+            load_avg,
+            uptime_secs,
+            memory,
+            disks,
+            processes,
+            total_processes,
+            running_processes,
+        }
     }
 }
 
-pub fn send_process_signal(pid: i32, sig: i32) -> Result<(), String> {
-    if pid <= 1 {
-        return Err("Refusing to signal system PID <= 1".to_string());
-    }
-    let res = unsafe { libc::kill(pid, sig) };
-    if res == 0 {
-        Ok(())
-    } else {
-        Err(format!("kill({pid}) failed: {}", std::io::Error::last_os_error()))
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
 fn parse_cpu_ticks(rest: &str) -> CpuTicks {
     let nums: Vec<u64> = rest
         .split_whitespace()
@@ -366,7 +201,6 @@ fn parse_cpu_ticks(rest: &str) -> CpuTicks {
     CpuTicks { total, idle }
 }
 
-#[cfg(not(target_os = "macos"))]
 fn calc_cpu_pct(prev: CpuTicks, cur: CpuTicks) -> f32 {
     let dt = cur.total.saturating_sub(prev.total);
     if dt == 0 {
@@ -377,7 +211,6 @@ fn calc_cpu_pct(prev: CpuTicks, cur: CpuTicks) -> f32 {
     ((busy as f64 / dt as f64) * 100.0).clamp(0.0, 100.0) as f32
 }
 
-#[cfg(not(target_os = "macos"))]
 fn read_memory() -> MemoryInfo {
     let mut mem_total = 0u64;
     let mut mem_free = 0u64;
@@ -429,7 +262,6 @@ fn read_memory() -> MemoryInfo {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
 fn read_disks() -> Vec<DiskInfo> {
     let mut disks = Vec::new();
     let mut seen_devices = HashSet::new();
@@ -514,7 +346,6 @@ fn read_disks() -> Vec<DiskInfo> {
         });
     }
 
-    // Put "/" first, then "/home", then others sorted by total size desc
     disks.sort_by(|a, b| {
         let rank = |m: &str| match m {
             "/" => 0,
@@ -528,7 +359,6 @@ fn read_disks() -> Vec<DiskInfo> {
     disks
 }
 
-#[cfg(not(target_os = "macos"))]
 fn read_loadavg() -> (f32, f32, f32) {
     if let Ok(text) = fs::read_to_string("/proc/loadavg") {
         let mut parts = text.split_whitespace();
@@ -540,7 +370,6 @@ fn read_loadavg() -> (f32, f32, f32) {
     (0.0, 0.0, 0.0)
 }
 
-#[cfg(not(target_os = "macos"))]
 fn read_uptime() -> u64 {
     if let Ok(text) = fs::read_to_string("/proc/uptime") {
         if let Some(first) = text.split_whitespace().next() {
@@ -550,36 +379,4 @@ fn read_uptime() -> u64 {
         }
     }
     0
-}
-
-pub fn format_bytes(bytes: u64) -> String {
-    const KIB: f64 = 1024.0;
-    const MIB: f64 = KIB * 1024.0;
-    const GIB: f64 = MIB * 1024.0;
-    const TIB: f64 = GIB * 1024.0;
-    let b = bytes as f64;
-    if b >= TIB {
-        format!("{:.2} TiB", b / TIB)
-    } else if b >= GIB {
-        format!("{:.1} GiB", b / GIB)
-    } else if b >= MIB {
-        format!("{:.1} MiB", b / MIB)
-    } else if b >= KIB {
-        format!("{:.0} KiB", b / KIB)
-    } else {
-        format!("{bytes} B")
-    }
-}
-
-pub fn format_uptime(secs: u64) -> String {
-    let days = secs / 86_400;
-    let hours = (secs % 86_400) / 3600;
-    let mins = (secs % 3600) / 60;
-    if days > 0 {
-        format!("{days}d {hours}h {mins}m")
-    } else if hours > 0 {
-        format!("{hours}h {mins}m")
-    } else {
-        format!("{mins}m")
-    }
 }

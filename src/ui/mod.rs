@@ -2528,7 +2528,7 @@ impl TerminalApp {
                     self.show_toast(format!("Sent {sig_name} to {name} ({pid})"));
                 }
                 Err(e) => {
-                    self.show_toast(e);
+                    self.show_toast(e.to_string());
                 }
             }
         }
