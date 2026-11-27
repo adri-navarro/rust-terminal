@@ -1,6 +1,19 @@
+//! Pure domain model for application configuration, themes, and shortcuts.
+//!
+//! Contains zero filesystem or UI dependencies.
+
 use serde::{Deserialize, Serialize};
-use std::fs;
-use std::path::PathBuf;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum ConfigError {
+    #[error("Config storage error: {0}")]
+    Storage(String),
+    #[error("Config parse error: {0}")]
+    Parse(String),
+    #[error("Config serialize error: {0}")]
+    Serialize(String),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rgb {
@@ -123,22 +136,22 @@ impl Theme {
             danger: Rgb::from_hex(0xF38BA8),
             info: Rgb::from_hex(0x89B4FA),
             ansi: [
-                Rgb::from_hex(0x45475A), // black
-                Rgb::from_hex(0xF38BA8), // red
-                Rgb::from_hex(0xA6E3A1), // green
-                Rgb::from_hex(0xF9E2AF), // yellow
-                Rgb::from_hex(0x89B4FA), // blue
-                Rgb::from_hex(0xF5C2E7), // magenta
-                Rgb::from_hex(0x94E2D5), // cyan
-                Rgb::from_hex(0xBAC2DE), // white
-                Rgb::from_hex(0x585B70), // bright black
-                Rgb::from_hex(0xF38BA8), // bright red
-                Rgb::from_hex(0xA6E3A1), // bright green
-                Rgb::from_hex(0xF9E2AF), // bright yellow
-                Rgb::from_hex(0x89B4FA), // bright blue
-                Rgb::from_hex(0xF5C2E7), // bright magenta
-                Rgb::from_hex(0x94E2D5), // bright cyan
-                Rgb::from_hex(0xA6ADC8), // bright white
+                Rgb::from_hex(0x45475A),
+                Rgb::from_hex(0xF38BA8),
+                Rgb::from_hex(0xA6E3A1),
+                Rgb::from_hex(0xF9E2AF),
+                Rgb::from_hex(0x89B4FA),
+                Rgb::from_hex(0xF5C2E7),
+                Rgb::from_hex(0x94E2D5),
+                Rgb::from_hex(0xBAC2DE),
+                Rgb::from_hex(0x585B70),
+                Rgb::from_hex(0xF38BA8),
+                Rgb::from_hex(0xA6E3A1),
+                Rgb::from_hex(0xF9E2AF),
+                Rgb::from_hex(0x89B4FA),
+                Rgb::from_hex(0xF5C2E7),
+                Rgb::from_hex(0x94E2D5),
+                Rgb::from_hex(0xA6ADC8),
             ],
         }
     }
@@ -275,22 +288,22 @@ impl Theme {
             danger: Rgb::from_hex(0xF87171),
             info: Rgb::from_hex(0x60A5FA),
             ansi: [
-                Rgb::from_hex(0x1A1A1A), // black
-                Rgb::from_hex(0xF87171), // red
-                Rgb::from_hex(0x4ADE80), // green
-                Rgb::from_hex(0xFACC15), // yellow
-                Rgb::from_hex(0x60A5FA), // blue
-                Rgb::from_hex(0xC084FC), // magenta
-                Rgb::from_hex(0x5CE1E6), // cyan
-                Rgb::from_hex(0xE5E5E5), // white
-                Rgb::from_hex(0x525252), // bright black
-                Rgb::from_hex(0xFCA5A5), // bright red
-                Rgb::from_hex(0x86EFAC), // bright green
-                Rgb::from_hex(0xFDE047), // bright yellow
-                Rgb::from_hex(0x93C5FD), // bright blue
-                Rgb::from_hex(0xD8B4FE), // bright magenta
-                Rgb::from_hex(0x67E8F9), // bright cyan
-                Rgb::from_hex(0xFFFFFF), // bright white
+                Rgb::from_hex(0x1A1A1A),
+                Rgb::from_hex(0xF87171),
+                Rgb::from_hex(0x4ADE80),
+                Rgb::from_hex(0xFACC15),
+                Rgb::from_hex(0x60A5FA),
+                Rgb::from_hex(0xC084FC),
+                Rgb::from_hex(0x5CE1E6),
+                Rgb::from_hex(0xE5E5E5),
+                Rgb::from_hex(0x525252),
+                Rgb::from_hex(0xFCA5A5),
+                Rgb::from_hex(0x86EFAC),
+                Rgb::from_hex(0xFDE047),
+                Rgb::from_hex(0x93C5FD),
+                Rgb::from_hex(0xD8B4FE),
+                Rgb::from_hex(0x67E8F9),
+                Rgb::from_hex(0xFFFFFF),
             ],
         }
     }
@@ -506,34 +519,5 @@ impl Config {
     pub fn docker_shortcut(&self) -> Shortcut {
         Shortcut::parse(&self.shortcut_docker)
             .unwrap_or_else(|| Shortcut::parse(DEFAULT_SHORTCUT_DOCKER).unwrap())
-    }
-
-    pub fn config_path() -> PathBuf {
-        dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("itsadri-terminal")
-            .join("config.toml")
-    }
-
-    pub fn load() -> Self {
-        let path = Self::config_path();
-        if let Ok(content) = fs::read_to_string(&path) {
-            if let Ok(cfg) = toml::from_str::<Config>(&content) {
-                return cfg;
-            }
-        }
-        let cfg = Self::default();
-        let _ = cfg.save();
-        cfg
-    }
-
-    pub fn save(&self) -> Result<(), std::io::Error> {
-        let path = Self::config_path();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let header = "# itsadri-terminal configuration\n# Press Ctrl+Shift+R inside the terminal to reload live.\n# Available themes: catppuccin-mocha, tokyo-night, rose-pine, gruvbox-dark, pure-black\n# cursor_style: \"beam\", \"block\", or \"underline\"\n# shell: omit for built-in Rust shell, or set e.g. shell = \"/bin/bash\"\n\n";
-        let body = toml::to_string_pretty(self).unwrap_or_default();
-        fs::write(path, format!("{header}{body}"))
     }
 }
