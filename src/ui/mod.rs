@@ -1792,7 +1792,7 @@ impl TerminalApp {
                 if run_after {
                     match self.commands.manager.start(id, cb) {
                         Ok(()) => self.show_toast(format!("Launched: {label}")),
-                        Err(e) => self.show_toast(e),
+                        Err(e) => self.show_toast(e.to_string()),
                     }
                 } else {
                     self.show_toast("Command saved");
@@ -1819,7 +1819,7 @@ impl TerminalApp {
                     }
                     match self.commands.manager.start(id, cb) {
                         Ok(()) => self.show_toast(format!("Restarted: {label}")),
-                        Err(e) => self.show_toast(e),
+                        Err(e) => self.show_toast(e.to_string()),
                     }
                 } else if was_running {
                     self.show_toast("Saved (restart to apply changes)");
@@ -1842,12 +1842,12 @@ impl TerminalApp {
         if can_stop {
             match self.commands.manager.stop(id, cb) {
                 Ok(msg) => self.show_toast(msg),
-                Err(e) => self.show_toast(e),
+                Err(e) => self.show_toast(e.to_string()),
             }
         } else {
             match self.commands.manager.start(id, cb) {
                 Ok(()) => self.show_toast("Command started"),
-                Err(e) => self.show_toast(e),
+                Err(e) => self.show_toast(e.to_string()),
             }
         }
         self.request_redraw();
