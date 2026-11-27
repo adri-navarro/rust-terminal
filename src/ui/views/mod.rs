@@ -1,6 +1,13 @@
+pub mod commands_ctrl;
 pub mod commands_render;
+pub mod docker_ctrl;
+pub mod history_ctrl;
 pub mod history_render;
+pub mod monitor_ctrl;
 pub mod monitor_render;
+pub mod settings_ctrl;
 pub mod settings_render;
+pub mod terminal_ctrl;
 pub mod terminal_render;
+pub mod usage_ctrl;
 pub mod usage_render;

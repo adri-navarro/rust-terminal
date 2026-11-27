@@ -333,7 +333,7 @@ fn test_build_enriched_path_adds_user_bin_dirs_without_duplicates() {
 #[test]
 fn test_commands_manager_persist_edit_run_stop_and_compose_detection() {
     use crate::commands::{
-        CommandEvent, CommandManager, CommandStatus, derive_stop_command,
+        CommandEvent, CommandStatus, derive_stop_command,
         is_detached_compose_command,
     };
     use std::sync::{Arc, Mutex};
