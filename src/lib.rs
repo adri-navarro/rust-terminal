@@ -1,5 +1,4 @@
 pub mod commands;
-pub mod completer;
 pub mod config;
 pub mod docker;
 pub mod history;
@@ -9,6 +8,8 @@ pub mod telemetry;
 pub mod terminal;
 pub mod ui;
 pub mod usage;
+
+pub use shell::completer;
 
 #[cfg(test)]
 mod tests;

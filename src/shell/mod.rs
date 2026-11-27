@@ -1,52 +1,17 @@
+pub mod completer;
 pub mod executor;
 pub mod parser;
+pub mod tty;
 
-use crate::completer::{Completer, CompletionItem, longest_common_prefix};
+use crate::shell::completer::{Completer, CompletionItem, longest_common_prefix};
 use crate::shell::executor::{ShellState, execute_parsed};
 use crate::shell::parser::{LogicalOp, parse_command_line, split_statements};
+use crate::shell::tty::{RawModeGuard, RawStdin};
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, Read, Write};
 use std::os::fd::AsRawFd;
 use std::path::Path;
-
-struct RawModeGuard {
-    fd: i32,
-    orig: Option<libc::termios>,
-}
-
-impl RawModeGuard {
-    fn enter() -> Self {
-        let fd = io::stdin().as_raw_fd();
-        unsafe {
-            let mut orig: libc::termios = std::mem::zeroed();
-            if libc::tcgetattr(fd, &mut orig) != 0 {
-                return Self { fd, orig: None };
-            }
-            let mut raw = orig;
-            raw.c_iflag &= !(libc::ICRNL | libc::IXON | libc::BRKINT | libc::INPCK | libc::ISTRIP);
-            raw.c_cflag |= libc::CS8;
-            raw.c_lflag &= !(libc::ECHO | libc::ICANON | libc::IEXTEN | libc::ISIG);
-            raw.c_cc[libc::VMIN] = 1;
-            raw.c_cc[libc::VTIME] = 0;
-            libc::tcsetattr(fd, libc::TCSADRAIN, &raw);
-            Self {
-                fd,
-                orig: Some(orig),
-            }
-        }
-    }
-}
-
-impl Drop for RawModeGuard {
-    fn drop(&mut self) {
-        if let Some(orig) = self.orig {
-            unsafe {
-                libc::tcsetattr(self.fd, libc::TCSADRAIN, &orig);
-            }
-        }
-    }
-}
 
 struct CompletionPopupState {
     token_start: usize,
@@ -161,43 +126,6 @@ enum ReadResult {
     Line(String),
     Eof,
     Interrupted,
-}
-
-struct RawStdin {
-    fd: i32,
-}
-
-impl RawStdin {
-    fn new() -> Self {
-        Self {
-            fd: io::stdin().as_raw_fd(),
-        }
-    }
-
-    fn has_data(&self, timeout_ms: i32) -> bool {
-        let mut pfd = libc::pollfd {
-            fd: self.fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        unsafe { libc::poll(&mut pfd, 1, timeout_ms) > 0 }
-    }
-}
-
-impl Read for RawStdin {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        loop {
-            let n = unsafe { libc::read(self.fd, buf.as_mut_ptr().cast(), buf.len()) };
-            if n < 0 {
-                let err = io::Error::last_os_error();
-                if err.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(err);
-            }
-            return Ok(n as usize);
-        }
-    }
 }
 
 fn read_line(state: &mut ShellState, completer: &mut Completer, in_gui: bool) -> ReadResult {
