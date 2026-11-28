@@ -656,6 +656,8 @@ impl TerminalApp {
 
     /// Recompute the physical-pixel title bar insets; the traffic lights are hidden in fullscreen
     fn refresh_mac_chrome(&self) -> bool {
+        use crate::ui::renderer;
+
         let Some(window) = self.window.as_ref() else {
             return false;
         };
