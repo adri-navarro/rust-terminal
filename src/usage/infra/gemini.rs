@@ -10,9 +10,12 @@ use super::json_lite::{JsonVal, parse_json, parse_timestamp};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::Mutex;
-use std::time::{Instant, UNIX_EPOCH};
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, UNIX_EPOCH};
+
+const AGY_QUOTA_TTL_SECS: u64 = 120;
+const AGY_CMD_TIMEOUT: Duration = Duration::from_secs(4);
 
 pub struct GeminiProvider;
 
@@ -34,19 +37,20 @@ impl UsageProvider for GeminiProvider {
             out.detected_agents.insert("gemini");
             let mut files = Vec::new();
             collect_files_with_ext(&gemini_tmp, "json", 5, &mut files);
-            for path in files {
-                let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                if !fname.starts_with("session-") {
-                    continue;
-                }
-                out.files_scanned += 1;
-                cache.scan_file(&path, out, now, || parse_gemini_session_file(&path, now));
-            }
+            files.retain(|p| {
+                p.file_name()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|n| n.starts_with("session-"))
+            });
+            cache.scan_files_parallel(&files, out, now, parse_gemini_session_file);
         }
 
         scan_antigravity_transcripts(home, out, cache, now);
 
-        if let Some(live) = fetch_agy_usage(home, now, allow_network) {
+        if allow_network {
+            let _ = refresh_agy_usage_cache(home, now);
+        }
+        if let Some(live) = read_cached_agy_quota(home, now) {
             out.detected_agents.insert("gemini");
             out.live_quotas.insert("gemini", live);
         }
@@ -55,7 +59,7 @@ impl UsageProvider for GeminiProvider {
 
 fn parse_gemini_session_file(path: &Path, now: u64) -> Option<FileParse> {
     let fallback_ts = file_mtime_secs(path).unwrap_or(now);
-    let session_key = path.to_string_lossy().into_owned();
+    let session_key: Arc<str> = Arc::from(path.to_string_lossy().as_ref());
     let content = fs::read_to_string(path).ok()?;
     let mut events: Vec<UsageEvent> = Vec::new();
     let Some(root) = parse_json(&content) else {
@@ -66,6 +70,7 @@ fn parse_gemini_session_file(path: &Path, now: u64) -> Option<FileParse> {
         .or_else(|| root.get("startTime"))
         .and_then(parse_timestamp)
         .unwrap_or(fallback_ts);
+    let mut last_model: Option<Arc<str>> = None;
 
     if let Some(messages) = root.get("messages").and_then(JsonVal::as_array) {
         for msg in messages {
@@ -79,10 +84,15 @@ fn parse_gemini_session_file(path: &Path, now: u64) -> Option<FileParse> {
             if input == 0 && output == 0 && cached == 0 && thoughts == 0 {
                 continue;
             }
-            let model = msg
-                .get_str("model")
-                .unwrap_or("gemini-unknown")
-                .to_string();
+            let model_str = msg.get_str("model").unwrap_or("gemini-unknown");
+            let model = match &last_model {
+                Some(prev) if prev.as_ref() == model_str => Arc::clone(prev),
+                _ => {
+                    let arc: Arc<str> = Arc::from(model_str);
+                    last_model = Some(Arc::clone(&arc));
+                    arc
+                }
+            };
             let ts = msg
                 .get("timestamp")
                 .and_then(parse_timestamp)
@@ -91,7 +101,7 @@ fn parse_gemini_session_file(path: &Path, now: u64) -> Option<FileParse> {
                 agent_id: "gemini",
                 agent_name: "Gemini / Antigravity",
                 model,
-                session_key: session_key.clone(),
+                session_key: Arc::clone(&session_key),
                 timestamp: ts,
                 input_tokens: input,
                 output_tokens: output,
@@ -119,31 +129,29 @@ fn scan_antigravity_transcripts(
         home.join(".gemini").join("antigravity-cli").join("brain"),
         home.join(".gemini").join("antigravity").join("brain"),
     ];
+    let mut files = Vec::new();
     for root in &agy_roots {
         if !root.is_dir() {
             continue;
         }
         out.detected_agents.insert("gemini");
-        let mut files = Vec::new();
         collect_files_with_ext(root, "jsonl", 5, &mut files);
-        for path in files {
-            let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            if fname != "transcript.jsonl" {
-                continue;
-            }
-            out.files_scanned += 1;
-            cache.scan_file(&path, out, now, || parse_antigravity_transcript(&path, now));
-        }
     }
+    files.retain(|p| {
+        p.file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|n| n == "transcript.jsonl")
+    });
+    cache.scan_files_parallel(&files, out, now, parse_antigravity_transcript);
 }
 
 fn parse_antigravity_transcript(path: &Path, now: u64) -> Option<FileParse> {
     let fallback_ts = file_mtime_secs(path).unwrap_or(now);
-    let session_key = path.to_string_lossy().into_owned();
+    let session_key: Arc<str> = Arc::from(path.to_string_lossy().as_ref());
     let file = File::open(path).ok()?;
     let reader = BufReader::new(file);
     let mut events: Vec<UsageEvent> = Vec::new();
-    let mut session_model = "antigravity".to_string();
+    let mut session_model: Arc<str> = Arc::from("antigravity");
     let mut found_token_event = false;
     let mut assistant_turns = 0u64;
     let mut last_ts = fallback_ts;
@@ -172,8 +180,8 @@ fn parse_antigravity_transcript(path: &Path, now: u64) -> Option<FileParse> {
             .get_str("model")
             .or_else(|| val.get("metadata").and_then(|md| md.get_str("model")))
         {
-            if !m.is_empty() {
-                session_model = m.to_string();
+            if !m.is_empty() && session_model.as_ref() != m {
+                session_model = Arc::from(m);
             }
         }
         let typ = val.get_str("type").unwrap_or("");
@@ -217,8 +225,8 @@ fn parse_antigravity_transcript(path: &Path, now: u64) -> Option<FileParse> {
             events.push(UsageEvent {
                 agent_id: "gemini",
                 agent_name: "Gemini / Antigravity",
-                model: session_model.clone(),
-                session_key: session_key.clone(),
+                model: Arc::clone(&session_model),
+                session_key: Arc::clone(&session_key),
                 timestamp: last_ts,
                 input_tokens: input,
                 output_tokens: output,
@@ -253,51 +261,91 @@ fn parse_antigravity_transcript(path: &Path, now: u64) -> Option<FileParse> {
     })
 }
 
-fn fetch_agy_usage(home: &Path, now: u64, allow_network: bool) -> Option<LiveAgentQuotas> {
-    const CACHE_TTL_SECS: u64 = 120;
-    let cache_path = home.join(".cache").join("agy-usage.txt");
+pub(crate) fn agy_quota_needs_refresh(home: &Path, now: u64) -> bool {
+    if is_agy_cache_fresh(home, now) {
+        return false;
+    }
+    !agy_backoff_peek(AGY_QUOTA_TTL_SECS)
+}
 
-    let cached_text = fs::metadata(&cache_path)
+fn is_agy_cache_fresh(home: &Path, now: u64) -> bool {
+    let cache_path = home.join(".cache").join("agy-usage.txt");
+    fs::metadata(&cache_path)
         .ok()
         .and_then(|m| m.modified().ok())
         .and_then(|mt| mt.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .and_then(|mtime| {
-            if now.saturating_sub(mtime) < CACHE_TTL_SECS || !allow_network {
-                fs::read_to_string(&cache_path).ok()
-            } else {
-                None
-            }
-        });
+        .map(|d| now.saturating_sub(d.as_secs()) < AGY_QUOTA_TTL_SECS)
+        .unwrap_or(false)
+}
 
-    let text = if let Some(t) = cached_text {
-        t
-    } else if allow_network && agy_fetch_backoff_active(CACHE_TTL_SECS) {
-        fs::read_to_string(&cache_path).ok()?
-    } else if allow_network {
-        let agy_bin = find_agy_binary(home)?;
-        let output = Command::new(agy_bin)
-            .args(["-p", "/usage"])
-            .output()
-            .ok()?;
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        if output.status.success() && stdout.contains("Remaining") {
-            if let Some(parent) = cache_path.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
-            let _ = fs::write(&cache_path, &stdout);
-            stdout
-        } else {
-            fs::read_to_string(&cache_path).ok()?
-        }
-    } else {
-        return None;
+pub(crate) fn refresh_agy_usage_cache(home: &Path, now: u64) -> bool {
+    if is_agy_cache_fresh(home, now) {
+        return false;
+    }
+    if agy_fetch_backoff_active(AGY_QUOTA_TTL_SECS) {
+        return false;
+    }
+    let Some(agy_bin) = find_agy_binary(home) else {
+        return false;
     };
+    let mut cmd = Command::new(agy_bin);
+    cmd.args(["-p", "/usage"]);
+    let Some(output) = run_command_with_timeout(&mut cmd, AGY_CMD_TIMEOUT) else {
+        return false;
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    if !output.status.success() || !stdout.contains("Remaining") {
+        return false;
+    }
+    let cache_path = home.join(".cache").join("agy-usage.txt");
+    if let Some(parent) = cache_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    fs::write(&cache_path, &stdout).is_ok()
+}
 
+fn read_cached_agy_quota(home: &Path, now: u64) -> Option<LiveAgentQuotas> {
+    let cache_path = home.join(".cache").join("agy-usage.txt");
+    let text = fs::read_to_string(&cache_path).ok()?;
     parse_agy_usage_output(&text, now)
 }
 
+fn run_command_with_timeout(cmd: &mut Command, timeout: Duration) -> Option<std::process::Output> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
 static LAST_AGY_FETCH_ATTEMPT: Mutex<Option<Instant>> = Mutex::new(None);
+
+fn agy_backoff_peek(ttl_secs: u64) -> bool {
+    let last = LAST_AGY_FETCH_ATTEMPT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    last.is_some_and(|t| t.elapsed().as_secs() < ttl_secs)
+}
 
 fn agy_fetch_backoff_active(ttl_secs: u64) -> bool {
     let mut last = LAST_AGY_FETCH_ATTEMPT

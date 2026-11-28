@@ -1,6 +1,7 @@
 //! Pure domain model and aggregation logic for AI agent & model usage.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 pub const KNOWN_AGENTS: &[(&str, &str)] = &[
     ("claude", "Anthropic (Claude)"),
@@ -164,8 +165,8 @@ impl UsageReport {
 pub struct UsageEvent {
     pub agent_id: &'static str,
     pub agent_name: &'static str,
-    pub model: String,
-    pub session_key: String,
+    pub model: Arc<str>,
+    pub session_key: Arc<str>,
     pub timestamp: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -241,27 +242,216 @@ impl ScanCollector {
     }
 }
 
-pub fn build_snapshot(collector: &ScanCollector, range: TimeRange, now: u64) -> UsageSnapshot {
-    let cutoff = range.cutoff_secs(now);
+#[derive(Default)]
+struct WindowAcc {
+    used_tokens: u64,
+    requests: u64,
+    oldest_ts: Option<u64>,
+}
 
-    let mut total = TokenStats::default();
-    let mut total_sessions: HashSet<(&'static str, &str)> = HashSet::new();
+impl WindowAcc {
+    #[inline]
+    fn record(&mut self, toks: u64, requests: u64, timestamp: u64) {
+        self.used_tokens = self.used_tokens.saturating_add(toks);
+        self.requests = self.requests.saturating_add(requests);
+        if toks > 0 || requests > 0 {
+            self.oldest_ts = Some(match self.oldest_ts {
+                Some(prev) => prev.min(timestamp),
+                None => timestamp,
+            });
+        }
+    }
 
-    let mut agent_stats: HashMap<&'static str, TokenStats> = HashMap::new();
-    let mut agent_sessions: HashMap<&'static str, HashSet<&str>> = HashMap::new();
-    let mut agent_last: HashMap<&'static str, u64> = HashMap::new();
-    let mut agent_model_tokens: HashMap<&'static str, HashMap<&str, u64>> = HashMap::new();
+    fn finish(
+        &self,
+        agent_id: &str,
+        window_secs: u64,
+        now: u64,
+        is_five_hour: bool,
+        live_quotas: &HashMap<&'static str, LiveAgentQuotas>,
+    ) -> WindowQuota {
+        let mut reset_in_secs = self
+            .oldest_ts
+            .map(|ts| ts.saturating_add(window_secs).saturating_sub(now));
+        let mut live_used_pct = None;
 
-    let mut model_map: HashMap<(&'static str, &'static str, String), (TokenStats, HashSet<&str>, u64)> =
-        HashMap::new();
-
-    for ev in &collector.events {
-        if let Some(min_ts) = cutoff {
-            if ev.timestamp < min_ts {
-                continue;
+        if let Some(live) = live_quotas.get(agent_id) {
+            if is_five_hour {
+                if let Some(pct) = live.five_hour_pct {
+                    live_used_pct = Some(pct);
+                    reset_in_secs = live.five_hour_reset_secs;
+                }
+            } else if let Some(pct) = live.weekly_pct {
+                live_used_pct = Some(pct);
+                reset_in_secs = live.weekly_reset_secs;
             }
         }
 
+        WindowQuota {
+            used_tokens: self.used_tokens,
+            requests: self.requests,
+            reset_in_secs,
+            live_used_pct,
+        }
+    }
+}
+
+#[inline]
+fn agent_index(id: &str) -> Option<usize> {
+    match id {
+        "claude" => Some(0),
+        "gemini" => Some(1),
+        "codex" => Some(2),
+        "opencode" => Some(3),
+        _ => None,
+    }
+}
+
+struct RangeAcc<'a> {
+    total: TokenStats,
+    total_sessions: HashSet<(&'static str, &'a str)>,
+    agent_stats: [TokenStats; 4],
+    agent_sessions: [HashSet<&'a str>; 4],
+    agent_last: [Option<u64>; 4],
+    agent_model_tokens: [HashMap<&'a str, u64>; 4],
+    model_map: HashMap<(&'static str, &'static str, &'a str), (TokenStats, HashSet<&'a str>, u64)>,
+}
+
+impl<'a> RangeAcc<'a> {
+    fn new() -> Self {
+        Self {
+            total: TokenStats::default(),
+            total_sessions: HashSet::new(),
+            agent_stats: std::array::from_fn(|_| TokenStats::default()),
+            agent_sessions: std::array::from_fn(|_| HashSet::new()),
+            agent_last: [None; 4],
+            agent_model_tokens: std::array::from_fn(|_| HashMap::new()),
+            model_map: HashMap::new(),
+        }
+    }
+
+    #[inline]
+    fn record(&mut self, ev: &'a UsageEvent, s: &TokenStats, ev_toks: u64, ai: Option<usize>) {
+        let session = ev.session_key.as_ref();
+        let model = ev.model.as_ref();
+
+        self.total.add_assign(s);
+        self.total_sessions.insert((ev.agent_id, session));
+
+        if let Some(i) = ai {
+            self.agent_stats[i].add_assign(s);
+            self.agent_sessions[i].insert(session);
+            self.agent_last[i] = Some(match self.agent_last[i] {
+                Some(prev) => prev.max(ev.timestamp),
+                None => ev.timestamp,
+            });
+            *self.agent_model_tokens[i].entry(model).or_insert(0) += ev_toks;
+        }
+
+        let entry = self
+            .model_map
+            .entry((ev.agent_id, ev.agent_name, model))
+            .or_insert_with(|| (TokenStats::default(), HashSet::new(), 0));
+        entry.0.add_assign(s);
+        entry.1.insert(session);
+        entry.2 = entry.2.max(ev.timestamp);
+    }
+
+    fn finish(
+        mut self,
+        detected_agents: &HashSet<&'static str>,
+        quotas_5h: &[WindowQuota; 4],
+        quotas_7d: &[WindowQuota; 4],
+    ) -> UsageSnapshot {
+        self.total.sessions = self.total_sessions.len() as u64;
+
+        let mut agents: Vec<AgentUsage> = KNOWN_AGENTS
+            .iter()
+            .enumerate()
+            .map(|(i, &(id, name))| {
+                let mut stats = std::mem::take(&mut self.agent_stats[i]);
+                stats.sessions = self.agent_sessions[i].len() as u64;
+                let top_model = self.agent_model_tokens[i]
+                    .iter()
+                    .max_by_key(|(_, v)| **v)
+                    .map(|(k, _)| (*k).to_string());
+                AgentUsage {
+                    id,
+                    name,
+                    detected: detected_agents.contains(id),
+                    stats,
+                    top_model,
+                    last_active: self.agent_last[i],
+                    quota_5h: quotas_5h[i].clone(),
+                    quota_weekly: quotas_7d[i].clone(),
+                }
+            })
+            .collect();
+
+        agents.sort_by(|a, b| {
+            b.stats
+                .total_tokens()
+                .cmp(&a.stats.total_tokens())
+                .then_with(|| b.stats.requests.cmp(&a.stats.requests))
+                .then_with(|| b.detected.cmp(&a.detected))
+        });
+
+        let mut models: Vec<ModelUsage> = self
+            .model_map
+            .into_iter()
+            .map(|((agent_id, agent_name, model), (mut stats, sess, _last))| {
+                stats.sessions = sess.len() as u64;
+                ModelUsage {
+                    model: model.to_string(),
+                    agent_id,
+                    agent_name,
+                    stats,
+                }
+            })
+            .collect();
+
+        models.sort_by(|a, b| {
+            b.stats
+                .total_tokens()
+                .cmp(&a.stats.total_tokens())
+                .then_with(|| b.stats.requests.cmp(&a.stats.requests))
+                .then_with(|| a.model.cmp(&b.model))
+        });
+
+        UsageSnapshot {
+            total: self.total,
+            agents,
+            models,
+        }
+    }
+}
+
+/// Builds all 5 `TimeRange` snapshots plus per-agent 5h/7d quotas in a single pass over events.
+pub fn build_all_snapshots(
+    collector: &ScanCollector,
+    now: u64,
+) -> (
+    UsageSnapshot,
+    UsageSnapshot,
+    UsageSnapshot,
+    UsageSnapshot,
+    UsageSnapshot,
+) {
+    let c_5h = now.saturating_sub(5 * 3600);
+    let c_24h = now.saturating_sub(24 * 3600);
+    let c_7d = now.saturating_sub(7 * 24 * 3600);
+    let c_30d = now.saturating_sub(30 * 24 * 3600);
+
+    let mut q5h: [WindowAcc; 4] = std::array::from_fn(|_| WindowAcc::default());
+    let mut q7d: [WindowAcc; 4] = std::array::from_fn(|_| WindowAcc::default());
+
+    let mut r_5h = RangeAcc::new();
+    let mut r_24h = RangeAcc::new();
+    let mut r_7d = RangeAcc::new();
+    let mut r_30d = RangeAcc::new();
+    let mut r_all = RangeAcc::new();
+
+    for ev in &collector.events {
         let s = TokenStats {
             input_tokens: ev.input_tokens,
             output_tokens: ev.output_tokens,
@@ -272,149 +462,65 @@ pub fn build_snapshot(collector: &ScanCollector, range: TimeRange, now: u64) -> 
             sessions: 0,
             estimated_cost_usd: ev.cost_usd,
         };
+        let toks = s.total_tokens();
+        let ev_toks = toks.max(ev.requests);
+        let ai = agent_index(ev.agent_id);
 
-        total.add_assign(&s);
-        total_sessions.insert((ev.agent_id, ev.session_key.as_str()));
+        if let Some(i) = ai {
+            if ev.timestamp >= c_7d {
+                q7d[i].record(toks, ev.requests, ev.timestamp);
+                if ev.timestamp >= c_5h {
+                    q5h[i].record(toks, ev.requests, ev.timestamp);
+                }
+            }
+        }
 
-        let a_stat = agent_stats.entry(ev.agent_id).or_default();
-        a_stat.add_assign(&s);
-        agent_sessions
-            .entry(ev.agent_id)
-            .or_default()
-            .insert(ev.session_key.as_str());
-        agent_last
-            .entry(ev.agent_id)
-            .and_modify(|t| *t = (*t).max(ev.timestamp))
-            .or_insert(ev.timestamp);
-
-        let ev_toks = s.total_tokens().max(ev.requests);
-        *agent_model_tokens
-            .entry(ev.agent_id)
-            .or_default()
-            .entry(ev.model.as_str())
-            .or_insert(0) += ev_toks;
-
-        let entry = model_map
-            .entry((ev.agent_id, ev.agent_name, ev.model.clone()))
-            .or_insert_with(|| (TokenStats::default(), HashSet::new(), 0));
-        entry.0.add_assign(&s);
-        entry.1.insert(ev.session_key.as_str());
-        entry.2 = entry.2.max(ev.timestamp);
+        r_all.record(ev, &s, ev_toks, ai);
+        if ev.timestamp >= c_30d {
+            r_30d.record(ev, &s, ev_toks, ai);
+            if ev.timestamp >= c_7d {
+                r_7d.record(ev, &s, ev_toks, ai);
+                if ev.timestamp >= c_24h {
+                    r_24h.record(ev, &s, ev_toks, ai);
+                    if ev.timestamp >= c_5h {
+                        r_5h.record(ev, &s, ev_toks, ai);
+                    }
+                }
+            }
+        }
     }
 
-    total.sessions = total_sessions.len() as u64;
-
-    let mut agents: Vec<AgentUsage> = KNOWN_AGENTS
-        .iter()
-        .map(|&(id, name)| {
-            let mut stats = agent_stats.remove(id).unwrap_or_default();
-            stats.sessions = agent_sessions.get(id).map(|s| s.len() as u64).unwrap_or(0);
-            let top_model = agent_model_tokens.get(id).and_then(|m| {
-                m.iter()
-                    .max_by_key(|(_, v)| **v)
-                    .map(|(k, _)| (*k).to_string())
-            });
-            AgentUsage {
-                id,
-                name,
-                detected: collector.detected_agents.contains(id),
-                stats,
-                top_model,
-                last_active: agent_last.get(id).copied(),
-                quota_5h: compute_agent_window_quota(collector, id, 5 * 3600, now, true),
-                quota_weekly: compute_agent_window_quota(collector, id, 7 * 24 * 3600, now, false),
-            }
-        })
-        .collect();
-
-    agents.sort_by(|a, b| {
-        b.stats
-            .total_tokens()
-            .cmp(&a.stats.total_tokens())
-            .then_with(|| b.stats.requests.cmp(&a.stats.requests))
-            .then_with(|| b.detected.cmp(&a.detected))
+    let quotas_5h: [WindowQuota; 4] = std::array::from_fn(|i| {
+        q5h[i].finish(KNOWN_AGENTS[i].0, 5 * 3600, now, true, &collector.live_quotas)
+    });
+    let quotas_7d: [WindowQuota; 4] = std::array::from_fn(|i| {
+        q7d[i].finish(
+            KNOWN_AGENTS[i].0,
+            7 * 24 * 3600,
+            now,
+            false,
+            &collector.live_quotas,
+        )
     });
 
-    let mut models: Vec<ModelUsage> = model_map
-        .into_iter()
-        .map(|((agent_id, agent_name, model), (mut stats, sess, _last))| {
-            stats.sessions = sess.len() as u64;
-            ModelUsage {
-                model,
-                agent_id,
-                agent_name,
-                stats,
-            }
-        })
-        .collect();
-
-    models.sort_by(|a, b| {
-        b.stats
-            .total_tokens()
-            .cmp(&a.stats.total_tokens())
-            .then_with(|| b.stats.requests.cmp(&a.stats.requests))
-            .then_with(|| a.model.cmp(&b.model))
-    });
-
-    UsageSnapshot {
-        total,
-        agents,
-        models,
-    }
+    (
+        r_5h.finish(&collector.detected_agents, &quotas_5h, &quotas_7d),
+        r_24h.finish(&collector.detected_agents, &quotas_5h, &quotas_7d),
+        r_7d.finish(&collector.detected_agents, &quotas_5h, &quotas_7d),
+        r_30d.finish(&collector.detected_agents, &quotas_5h, &quotas_7d),
+        r_all.finish(&collector.detected_agents, &quotas_5h, &quotas_7d),
+    )
 }
 
-fn compute_agent_window_quota(
-    collector: &ScanCollector,
-    agent_id: &str,
-    window_secs: u64,
-    now: u64,
-    is_five_hour: bool,
-) -> WindowQuota {
-    let cutoff = now.saturating_sub(window_secs);
-    let mut used_tokens = 0u64;
-    let mut requests = 0u64;
-    let mut oldest_ts: Option<u64> = None;
-
-    for ev in &collector.events {
-        if ev.agent_id != agent_id || ev.timestamp < cutoff {
-            continue;
-        }
-        let toks = ev
-            .input_tokens
-            .saturating_add(ev.output_tokens)
-            .saturating_add(ev.cache_read_tokens)
-            .saturating_add(ev.cache_write_tokens)
-            .saturating_add(ev.reasoning_tokens);
-        used_tokens = used_tokens.saturating_add(toks);
-        requests = requests.saturating_add(ev.requests);
-        if toks > 0 || ev.requests > 0 {
-            oldest_ts = Some(match oldest_ts {
-                Some(prev) => prev.min(ev.timestamp),
-                None => ev.timestamp,
-            });
-        }
-    }
-
-    let mut reset_in_secs = oldest_ts.map(|ts| ts.saturating_add(window_secs).saturating_sub(now));
-    let mut live_used_pct = None;
-
-    if let Some(live) = collector.live_quotas.get(agent_id) {
-        if is_five_hour {
-            if let Some(pct) = live.five_hour_pct {
-                live_used_pct = Some(pct);
-                reset_in_secs = live.five_hour_reset_secs;
-            }
-        } else if let Some(pct) = live.weekly_pct {
-            live_used_pct = Some(pct);
-            reset_in_secs = live.weekly_reset_secs;
-        }
-    }
-
-    WindowQuota {
-        used_tokens,
-        requests,
-        reset_in_secs,
-        live_used_pct,
+#[allow(dead_code)]
+pub fn build_snapshot(collector: &ScanCollector, range: TimeRange, now: u64) -> UsageSnapshot {
+    let (five_hours, today, week, month, all) = build_all_snapshots(collector, now);
+    match range {
+        TimeRange::FiveHours => five_hours,
+        TimeRange::Today => today,
+        TimeRange::Week => week,
+        TimeRange::Month => month,
+        TimeRange::All => all,
     }
 }
 

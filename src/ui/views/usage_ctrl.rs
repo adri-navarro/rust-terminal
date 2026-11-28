@@ -1,7 +1,7 @@
 //! AI Usage tab state & keyboard controller.
 
 use crate::ui::app::{TerminalApp, UserEvent};
-use crate::usage::{TimeRange, UsageReport, scan_local_usage};
+use crate::usage::{TimeRange, UsageReport, refresh_live_quotas_async, scan_local_usage};
 use std::time::Instant;
 use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{Key, NamedKey, PhysicalKey};
@@ -39,6 +39,12 @@ impl TerminalApp {
         std::thread::spawn(move || {
             let report = scan_local_usage();
             let _ = proxy.send_event(UserEvent::UsageUpdated(report));
+
+            let proxy_live = proxy.clone();
+            refresh_live_quotas_async(move || {
+                let updated = scan_local_usage();
+                let _ = proxy_live.send_event(UserEvent::UsageUpdated(updated));
+            });
         });
         self.request_redraw();
     }

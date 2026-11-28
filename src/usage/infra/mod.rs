@@ -1,3 +1,4 @@
+pub mod cache_store;
 pub mod claude;
 pub mod codex;
 pub mod fs_helpers;

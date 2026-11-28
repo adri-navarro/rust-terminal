@@ -10,8 +10,10 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Instant, UNIX_EPOCH};
+
+const CLAUDE_QUOTA_TTL_SECS: u64 = 120;
 
 pub struct ClaudeProvider;
 
@@ -40,12 +42,12 @@ impl UsageProvider for ClaudeProvider {
             }
         }
 
-        for path in files {
-            out.files_scanned += 1;
-            cache.scan_file(&path, out, now, || parse_claude_file(&path, now));
-        }
+        cache.scan_files_parallel(&files, out, now, parse_claude_file);
 
-        if let Some(live) = fetch_claude_oauth_usage(home, now, allow_network) {
+        if allow_network {
+            let _ = refresh_claude_oauth_cache(home, now);
+        }
+        if let Some(live) = read_cached_claude_quota(home, now) {
             out.detected_agents.insert("claude");
             out.live_quotas.insert("claude", live);
         }
@@ -54,14 +56,15 @@ impl UsageProvider for ClaudeProvider {
 
 fn parse_claude_file(path: &Path, now: u64) -> Option<FileParse> {
     let fallback_ts = file_mtime_secs(path).unwrap_or(now);
-    let session_key = path.to_string_lossy().into_owned();
+    let session_key: Arc<str> = Arc::from(path.to_string_lossy().as_ref());
     let file = File::open(path).ok()?;
     let reader = BufReader::new(file);
     let mut by_msg_id: HashMap<String, UsageEvent> = HashMap::new();
     let mut anon_events: Vec<UsageEvent> = Vec::new();
+    let mut last_model: Option<Arc<str>> = None;
 
     for line in reader.lines().map_while(Result::ok) {
-        if !line.contains("usage") && !line.contains("tokens") {
+        if !line.contains("\"usage\"") {
             continue;
         }
         let Some(val) = parse_json(&line) else {
@@ -83,14 +86,21 @@ fn parse_claude_file(path: &Path, now: u64) -> Option<FileParse> {
             continue;
         }
 
-        let model = msg
+        let model_str = msg
             .and_then(|m| m.get_str("model"))
             .or_else(|| val.get_str("model"))
-            .unwrap_or("claude-unknown")
-            .to_string();
-        if model == "<synthetic>" {
+            .unwrap_or("claude-unknown");
+        if model_str == "<synthetic>" {
             continue;
         }
+        let model = match &last_model {
+            Some(prev) if prev.as_ref() == model_str => Arc::clone(prev),
+            _ => {
+                let arc: Arc<str> = Arc::from(model_str);
+                last_model = Some(Arc::clone(&arc));
+                arc
+            }
+        };
 
         let ts = val
             .get("timestamp")
@@ -105,7 +115,7 @@ fn parse_claude_file(path: &Path, now: u64) -> Option<FileParse> {
             agent_id: "claude",
             agent_name: "Claude Code",
             model,
-            session_key: session_key.clone(),
+            session_key: Arc::clone(&session_key),
             timestamp: ts,
             input_tokens: input,
             output_tokens: output,
@@ -141,75 +151,92 @@ fn parse_claude_file(path: &Path, now: u64) -> Option<FileParse> {
     })
 }
 
-fn fetch_claude_oauth_usage(home: &Path, now: u64, allow_network: bool) -> Option<LiveAgentQuotas> {
-    const CACHE_TTL_SECS: u64 = 120;
-    let cache_path = home.join(".cache").join("claude-usage.json");
+pub(crate) fn claude_quota_needs_refresh(home: &Path, now: u64) -> bool {
+    if is_claude_cache_fresh(home, now) {
+        return false;
+    }
+    if claude_backoff_peek(CLAUDE_QUOTA_TTL_SECS) {
+        return false;
+    }
+    home.join(".claude").join(".credentials.json").is_file() || cfg!(target_os = "macos")
+}
 
-    let cached_val = fs::metadata(&cache_path)
+fn is_claude_cache_fresh(home: &Path, now: u64) -> bool {
+    let cache_path = home.join(".cache").join("claude-usage.json");
+    fs::metadata(&cache_path)
         .ok()
         .and_then(|m| m.modified().ok())
         .and_then(|mt| mt.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .and_then(|mtime| {
-            if now.saturating_sub(mtime) < CACHE_TTL_SECS || !allow_network {
-                fs::read_to_string(&cache_path).ok().and_then(|s| parse_json(&s))
-            } else {
-                None
-            }
-        });
+        .map(|d| now.saturating_sub(d.as_secs()) < CLAUDE_QUOTA_TTL_SECS)
+        .unwrap_or(false)
+}
 
-    let data = if let Some(v) = cached_val {
-        v
-    } else if allow_network && claude_fetch_backoff_active(CACHE_TTL_SECS) {
-        let stale = fs::read_to_string(&cache_path).ok()?;
-        parse_json(&stale)?
-    } else if allow_network {
-        let creds_str = read_claude_credentials_json(home)?;
-        let creds = parse_json(&creds_str)?;
-        let oauth = creds.get("claudeAiOauth")?;
-        let token = oauth.get_str("accessToken")?;
-        let expires_at_ms = oauth.get_f64("expiresAt").unwrap_or(0.0);
-        if expires_at_ms > 0.0 && (expires_at_ms / 1000.0) < now as f64 {
-            let stale = fs::read_to_string(&cache_path).ok()?;
-            parse_json(&stale)?
-        } else {
-            let auth_header = format!("Authorization: Bearer {token}");
-            let output = Command::new("curl")
-                .args([
-                    "-sS",
-                    "--max-time",
-                    "8",
-                    "-H",
-                    &auth_header,
-                    "-H",
-                    "anthropic-beta: oauth-2025-04-20",
-                    "-H",
-                    "User-Agent: itsadri-terminal-usage",
-                    "https://api.anthropic.com/api/oauth/usage",
-                ])
-                .output()
-                .ok()?;
-            if !output.status.success() {
-                let stale = fs::read_to_string(&cache_path).ok()?;
-                parse_json(&stale)?
-            } else {
-                let body = String::from_utf8(output.stdout).ok()?;
-                let parsed = parse_json(&body)?;
-                if parsed.get("five_hour").is_some() || parsed.get("seven_day").is_some() {
-                    if let Some(parent) = cache_path.parent() {
-                        let _ = fs::create_dir_all(parent);
-                    }
-                    let _ = fs::write(&cache_path, &body);
-                    parsed
-                } else {
-                    let stale = fs::read_to_string(&cache_path).ok()?;
-                    parse_json(&stale)?
-                }
-            }
-        }
-    } else {
-        return None;
+pub(crate) fn refresh_claude_oauth_cache(home: &Path, now: u64) -> bool {
+    if is_claude_cache_fresh(home, now) {
+        return false;
+    }
+    if claude_fetch_backoff_active(CLAUDE_QUOTA_TTL_SECS) {
+        return false;
+    }
+    let Some(creds_str) = read_claude_credentials_json(home) else {
+        return false;
     };
+    let Some(creds) = parse_json(&creds_str) else {
+        return false;
+    };
+    let Some(oauth) = creds.get("claudeAiOauth") else {
+        return false;
+    };
+    let Some(token) = oauth.get_str("accessToken") else {
+        return false;
+    };
+    let expires_at_ms = oauth.get_f64("expiresAt").unwrap_or(0.0);
+    if expires_at_ms > 0.0 && (expires_at_ms / 1000.0) < now as f64 {
+        return false;
+    }
+
+    let auth_header = format!("Authorization: Bearer {token}");
+    let Ok(output) = Command::new("curl")
+        .args([
+            "-sS",
+            "--max-time",
+            "4",
+            "-H",
+            &auth_header,
+            "-H",
+            "anthropic-beta: oauth-2025-04-20",
+            "-H",
+            "User-Agent: itsadri-terminal-usage",
+            "https://api.anthropic.com/api/oauth/usage",
+        ])
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let Ok(body) = String::from_utf8(output.stdout) else {
+        return false;
+    };
+    let Some(parsed) = parse_json(&body) else {
+        return false;
+    };
+    if parsed.get("five_hour").is_none() && parsed.get("seven_day").is_none() {
+        return false;
+    }
+
+    let cache_path = home.join(".cache").join("claude-usage.json");
+    if let Some(parent) = cache_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    fs::write(&cache_path, &body).is_ok()
+}
+
+fn read_cached_claude_quota(home: &Path, now: u64) -> Option<LiveAgentQuotas> {
+    let cache_path = home.join(".cache").join("claude-usage.json");
+    let raw = fs::read_to_string(&cache_path).ok()?;
+    let data = parse_json(&raw)?;
 
     let five = data.get("five_hour");
     let week = data.get("seven_day");
@@ -237,6 +264,13 @@ fn fetch_claude_oauth_usage(home: &Path, now: u64, allow_network: bool) -> Optio
 }
 
 static LAST_CLAUDE_FETCH_ATTEMPT: Mutex<Option<Instant>> = Mutex::new(None);
+
+fn claude_backoff_peek(ttl_secs: u64) -> bool {
+    let last = LAST_CLAUDE_FETCH_ATTEMPT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    last.is_some_and(|t| t.elapsed().as_secs() < ttl_secs)
+}
 
 fn claude_fetch_backoff_active(ttl_secs: u64) -> bool {
     let mut last = LAST_CLAUDE_FETCH_ATTEMPT

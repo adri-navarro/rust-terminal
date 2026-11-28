@@ -173,6 +173,42 @@ fn test_usage_scan_cache_reuses_updates_and_evicts() {
 }
 
 #[test]
+fn test_usage_scan_cache_persists_to_disk_and_handles_parallel_batch() {
+    let tmp = std::env::temp_dir().join("itsadri_test_usage_disk_cache");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let claude_dir = tmp.join(".claude/projects/demo");
+    std::fs::create_dir_all(&claude_dir).unwrap();
+
+    // Create 6 files to exercise the parallel work-stealing path (> 2 misses).
+    for i in 0..6 {
+        let line = format!(
+            "{{\"timestamp\":\"2026-11-23T19:0{i}:00Z\",\"message\":{{\"id\":\"msg_{i}\",\"model\":\"claude-sonnet-4-20250514\",\"usage\":{{\"input_tokens\":100,\"output_tokens\":50}}}}}}\n"
+        );
+        std::fs::write(claude_dir.join(format!("sess_{i}.jsonl")), line).unwrap();
+    }
+
+    let cache_file = tmp.join("usage-cache.bin");
+    let mut cache = ScanCache::default();
+    let first = scan_usage_from_home_cached(&tmp, &mut cache);
+    assert_eq!(cache.cached_files(), 6);
+    assert_eq!(first.snapshot(TimeRange::All).total.requests, 6);
+    assert_eq!(first.snapshot(TimeRange::All).total.total_tokens(), 900);
+
+    cache.save_to_disk(&cache_file);
+    assert!(cache_file.is_file());
+
+    // Reload into a brand-new ScanCache and verify identical results from disk cache.
+    let mut reloaded = ScanCache::load_from_disk(&cache_file);
+    assert_eq!(reloaded.cached_files(), 6);
+    let second = scan_usage_from_home_cached(&tmp, &mut reloaded);
+    assert_eq!(second.files_scanned, 6);
+    assert_eq!(second.snapshot(TimeRange::All).total.requests, 6);
+    assert_eq!(second.snapshot(TimeRange::All).total.total_tokens(), 900);
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
 fn test_usage_scanner_detects_all_four_agents() {
     let tmp = std::env::temp_dir().join("itsadri_test_usage_home");
     let _ = std::fs::remove_dir_all(&tmp);

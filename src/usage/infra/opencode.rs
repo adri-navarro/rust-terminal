@@ -7,6 +7,7 @@ use super::fs_helpers::{collect_files_with_ext, file_mtime_secs};
 use super::json_lite::{parse_json, parse_timestamp};
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
 pub struct OpenCodeProvider;
 
@@ -39,10 +40,7 @@ impl UsageProvider for OpenCodeProvider {
             }
         }
 
-        for path in files {
-            out.files_scanned += 1;
-            cache.scan_file(&path, out, now, || parse_opencode_file(&path, now));
-        }
+        cache.scan_files_parallel(&files, out, now, parse_opencode_file);
     }
 }
 
@@ -74,19 +72,19 @@ fn parse_opencode_file(path: &Path, now: u64) -> Option<FileParse> {
         return Some(FileParse::default());
     }
 
-    let model = val
-        .get_str("modelID")
-        .or_else(|| val.get_str("model"))
-        .unwrap_or("opencode-unknown")
-        .to_string();
-    let session_key = val
-        .get_str("sessionID")
-        .map(str::to_string)
-        .unwrap_or_else(|| {
+    let model: Arc<str> = Arc::from(
+        val.get_str("modelID")
+            .or_else(|| val.get_str("model"))
+            .unwrap_or("opencode-unknown"),
+    );
+    let session_key: Arc<str> = match val.get_str("sessionID") {
+        Some(s) => Arc::from(s),
+        None => Arc::from(
             path.parent()
                 .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        });
+                .unwrap_or_default(),
+        ),
+    };
     let ts = val
         .get("time")
         .and_then(|t| t.get("completed").or_else(|| t.get("created")))

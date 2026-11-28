@@ -114,6 +114,15 @@ impl TerminalApp {
         let history = HistoryStore::load();
         let clipboard = Clipboard::new().ok();
 
+        // Pre-warm the Usage cache in the background shortly after startup so opening the
+        // Usage tab is instantaneous even on the first visit.
+        let prewarm_proxy = proxy.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(250));
+            let report = crate::usage::scan_local_usage();
+            let _ = prewarm_proxy.send_event(UserEvent::UsageUpdated(report));
+        });
+
         Ok(Self {
             proxy,
             cfg,
@@ -762,7 +771,9 @@ impl ApplicationHandler<UserEvent> for TerminalApp {
                 self.usage.scanning = false;
                 self.usage.report = Some(report);
                 self.usage.last_scan = Some(Instant::now());
-                self.request_redraw();
+                if self.usage.open {
+                    self.request_redraw();
+                }
             }
             UserEvent::CommandEvent(ev) => {
                 self.commands.manager.apply_event(ev);

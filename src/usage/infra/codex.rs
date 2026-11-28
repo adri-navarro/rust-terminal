@@ -8,6 +8,7 @@ use super::json_lite::{parse_json, parse_timestamp};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
+use std::sync::Arc;
 
 pub struct CodexProvider;
 
@@ -32,29 +33,25 @@ impl UsageProvider for CodexProvider {
         let mut files = Vec::new();
         collect_files_with_ext(&root, "jsonl", 6, &mut files);
 
-        for path in files {
-            out.files_scanned += 1;
-            cache.scan_file(&path, out, now, || parse_codex_file(&path, now));
-        }
+        cache.scan_files_parallel(&files, out, now, parse_codex_file);
     }
 }
 
 fn parse_codex_file(path: &Path, now: u64) -> Option<FileParse> {
     let fallback_ts = file_mtime_secs(path).unwrap_or(now);
-    let session_key = path.to_string_lossy().into_owned();
+    let session_key: Arc<str> = Arc::from(path.to_string_lossy().as_ref());
     let file = File::open(path).ok()?;
     let reader = BufReader::new(file);
     let mut events: Vec<UsageEvent> = Vec::new();
     let mut quota: Option<RawQuota> = None;
-    let mut current_model = "codex-unknown".to_string();
+    let mut current_model: Arc<str> = Arc::from("codex-unknown");
     let mut had_per_turn = false;
-    let mut max_total: Option<(u64, u64, u64, u64, u64, String)> = None;
+    let mut max_total: Option<(u64, u64, u64, u64, u64, Arc<str>)> = None;
 
     for line in reader.lines().map_while(Result::ok) {
         if !line.contains("token_count")
             && !line.contains("turn_context")
             && !line.contains("session_meta")
-            && !line.contains("model")
         {
             continue;
         }
@@ -69,8 +66,8 @@ fn parse_codex_file(path: &Path, now: u64) -> Option<FileParse> {
                 .and_then(|p| p.get_str("model"))
                 .or_else(|| val.get_str("model"))
             {
-                if !m.is_empty() {
-                    current_model = m.to_string();
+                if !m.is_empty() && current_model.as_ref() != m {
+                    current_model = Arc::from(m);
                 }
             }
             continue;
@@ -119,8 +116,8 @@ fn parse_codex_file(path: &Path, now: u64) -> Option<FileParse> {
                     events.push(UsageEvent {
                         agent_id: "codex",
                         agent_name: "Codex",
-                        model: current_model.clone(),
-                        session_key: session_key.clone(),
+                        model: Arc::clone(&current_model),
+                        session_key: Arc::clone(&session_key),
                         timestamp: ts,
                         input_tokens: input.saturating_sub(cached),
                         output_tokens: output,
@@ -142,7 +139,14 @@ fn parse_codex_file(path: &Path, now: u64) -> Option<FileParse> {
                     .map(|t| t.0 + t.2 + t.3)
                     .unwrap_or(0);
                 if sum > prev_sum {
-                    max_total = Some((input, cached, output, reasoning, ts, current_model.clone()));
+                    max_total = Some((
+                        input,
+                        cached,
+                        output,
+                        reasoning,
+                        ts,
+                        Arc::clone(&current_model),
+                    ));
                 }
             }
         }
