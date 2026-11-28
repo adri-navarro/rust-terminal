@@ -7,7 +7,6 @@ use crate::history::HistoryStore;
 use crate::terminal::TerminalTab;
 use crate::ui::docker_view::{DockerFocus, DockerFormView, DockerViewState};
 use crate::ui::font::{FontEngine, FontPreset, available_font_presets};
-use crate::ui::renderer;
 use crate::ui::key_encoding::{encode_mouse_wheel, matches_configured_shortcut};
 use crate::ui::renderer::{
     CommandFormField, CommandFormView, CommandsViewState, HistoryPaletteView, MonitorViewState,
